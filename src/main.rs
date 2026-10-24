@@ -54,11 +54,7 @@ fn main() {
     if !tray::acquire_single_instance() {
         diag::log("[single] 检测到已有实例在运行 -> 本次启动退出");
         if alerts_enabled() {
-            util::error_msgbox(
-                "PixShot 已在运行，本次启动已退出。\n\n\
-                 请在任务栏托盘区查看 PixShot 图标（Windows 11 默认可能收在「^」溢出区），\
-                 或直接按快捷键开始截图。",
-            );
+            util::info_msgbox("PixShot已启动，无需再次执行。");
         }
         return;
     }

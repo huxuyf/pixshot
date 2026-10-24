@@ -23,7 +23,8 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetCursorPos, GetWindowTextW, KillTimer, LoadCursorW, MessageBoxW,
-    RegisterClassW, SetTimer, WindowFromPoint, HMENU, IDC_ARROW, IDC_CROSS, MB_ICONERROR, MB_OK,
+    RegisterClassW, SetTimer, WindowFromPoint, HMENU, IDC_ARROW, IDC_CROSS, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_OK,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_VISIBLE,
 };
 
@@ -258,6 +259,18 @@ pub fn error_msgbox(text: &str) {
             PCWSTR::from_raw(to_wide(text).as_ptr()),
             PCWSTR::from_raw(to_wide("PixShot").as_ptr()),
             MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+/// 弹出普通提示框（非错误场景，如图标/信息提示，不带错误图标）。
+pub fn info_msgbox(text: &str) {
+    unsafe {
+        let _ = MessageBoxW(
+            HWND::default(),
+            PCWSTR::from_raw(to_wide(text).as_ptr()),
+            PCWSTR::from_raw(to_wide("PixShot").as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
         );
     }
 }
