@@ -28,6 +28,7 @@ public class V2 {
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out R r);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out R r);
     [StructLayout(LayoutKind.Sequential)] public struct R { public int L, T, Rt, B; }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
@@ -147,12 +148,17 @@ try {
     Log ("贴图 rect=({0},{1})-({2},{3})" -f $pr.L, $pr.T, $pr.Rt, $pr.B)
 
     # ── C. 贴图验证（品红证据链；贴图内部=捕获时靶标影像，与靶标当前位置无关）──
-    $pinCorner = Px ($pr.L + 2) ($pr.T + 2)
-    $pinBorder = Px $pr.L ($pr.T + 300)
-    $pinInner = Px ($pr.L + 60) ($pr.T + 60)
-    Log "  贴图角(2,2) = $pinCorner  [品红(255,0,255)=DONOTROUND ✓ / 露底=被裁角 ✗]"
-    Log "  贴图左边(0,300) = $pinBorder  [≈(204,0,204)=描边 ✓]"
-    Log "  贴图内部(60,60) = $pinInner  [品红=图像保真 ✓]"
+    # 贴图窗口比图像四周各多一圈投影留白（16 逻辑像素 × DPI），下列探针以【图像左上角】为原点。
+    $pinDpi = [int][V2]::GetDpiForWindow($pin); if ($pinDpi -lt 96) { $pinDpi = 96 }
+    $pad = [int][Math]::Round(16 * $pinDpi / 96.0)
+    $ix = $pr.L + $pad; $iy = $pr.T + $pad   # 图像左上角（窗口 + 留白）
+    Log ("  贴图留白 {0}px → 图像左上角 = ({1},{2})，窗口 rect=({3},{4})-({5},{6})" -f $pad, $ix, $iy, $pr.L, $pr.T, $pr.Rt, $pr.B)
+    $pinCorner = Px ($ix + 2) ($iy + 2)
+    $pinInner = Px ($ix + 60) ($iy + 60)
+    $pinShadow = Px ($ix - [int]($pad / 2)) ($iy + 300)
+    Log "  图像角(2,2) = $pinCorner  [品红(255,0,255)=图像保真且不裁角 ✓ / 露底=被裁角 ✗]"
+    Log "  图像内(60,60) = $pinInner  [品红=图像保真 ✓]"
+    Log "  图像外 $([int]($pad/2))px = $pinShadow  [品红被压暗=四周投影 ✓ / 纯品红=无阴影 ✗]"
 
     # ── D. 结果窗口验证：靶标转为灰色衬底，非置顶，挪到结果窗口正后方 ──
     $rr = Get-Rect $ocrw

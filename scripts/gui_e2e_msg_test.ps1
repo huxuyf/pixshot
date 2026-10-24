@@ -406,9 +406,14 @@ try {
     if ($pin -eq [IntPtr]::Zero) { throw '贴图窗口未出现' }
     Check '「贴图」后工具条已关闭' (Wait-WindowGone $pid0 'PixShotToolbar')
     $r0 = Get-Rect $pin
-    Check '贴图位于原截图位置（初始 100% 缩放，同时校验选区）' `
-        (($r0.L -eq $SelX) -and ($r0.T -eq $SelY) -and (($r0.R - $r0.L) -eq $SelW) -and (($r0.B - $r0.T) -eq $SelH)) `
-        ("rect=({0},{1})-({2},{3})" -f $r0.L, $r0.T, $r0.R, $r0.B)
+    # 贴图窗口 = 图像 + 四周投影留白（SHADOW_MARGIN_LOGICAL=16 逻辑像素 × 显示器 DPI）：
+    # 图像内容仍严格落在原截图位置，窗口整体外扩一圈用于绘制柔和投影。
+    $pinDpi = [W]::GetDpiForWindow($pin)
+    if ($pinDpi -lt 96) { $pinDpi = 96 }
+    $pad = [int][Math]::Round(16 * $pinDpi / 96.0)
+    Check '贴图位于原截图位置（图像内容偏移一圈留白，同时校验选区）' `
+        (($r0.L -eq ($SelX - $pad)) -and ($r0.T -eq ($SelY - $pad)) -and (($r0.R - $r0.L) -eq ($SelW + 2 * $pad)) -and (($r0.B - $r0.T) -eq ($SelH + 2 * $pad))) `
+        ("rect=({0},{1})-({2},{3}) 图像应位于 ({4},{5}) {6}x{7}，投影留白 {8}px" -f $r0.L, $r0.T, $r0.R, $r0.B, $SelX, $SelY, $SelW, $SelH, $pad)
     $ex = [W]::GetWindowLongW($pin, -20)     # GWL_EXSTYLE
     Check '贴图窗口置顶（WS_EX_TOPMOST）' (($ex -band 8) -ne 0) ("exstyle=0x{0:X8}" -f $ex)
 
@@ -430,8 +435,18 @@ try {
         $bmp = New-Object System.Drawing.Bitmap(($SelW + 60), ($SelH + 60))
         $g = [System.Drawing.Graphics]::FromImage($bmp)
         $g.CopyFromScreen(($SelX - 30), ($SelY - 30), 0, 0, $bmp.Size)
-        $g.Dispose(); $bmp.Save((Join-Path $art 'pin_visible.png'), [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+        $g.Dispose(); $bmp.Save((Join-Path $art 'pin_visible.png'), [System.Drawing.Imaging.ImageFormat]::Png)
         Write-Host '  [存档] pin_visible.png'
+        # 投影观感采样（仅诊断输出）：图像外 pad/2 处应有灰阶投影，窗口更外侧应回到背景色。
+        # 注：非 DPI 感知进程的 CopyFromScreen 取物理像素，而 GetWindowRect 为逻辑像素，
+        # 在 125%/150% 缩放下两者存在偏移，故这里只打印数值供人工核对，不做断言。
+        try {
+            $midY = [int](30 + $SelH / 2)
+            $near = $bmp.GetPixel([Math]::Max(1, 30 - [int]($pad / 2)), $midY)
+            $far = $bmp.GetPixel(2, $midY)
+            Write-Host ("  [阴影采样] 贴图像素外 {0}px=(R{1},G{2},B{3}) / 窗口外 2px=(R{4},G{5},B{6})" -f [int]($pad / 2), $near.R, $near.G, $near.B, $far.R, $far.G, $far.B)
+        } catch { Write-Host "  [阴影采样] 跳过：$($_.Exception.Message)" }
+        $bmp.Dispose()
     } catch { Write-Host "  [跳过] 截屏存档不可用：$($_.Exception.Message)" }
 
     # ── 滚轮缩放贴图（WM_MOUSEWHEEL，delta=+120 ×2 → 约 1.21 倍）──
