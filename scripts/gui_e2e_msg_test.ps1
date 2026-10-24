@@ -47,6 +47,7 @@ public class W {
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
@@ -272,16 +273,15 @@ try {
     function Test-CaptureValid([IntPtr]$Tb) {
         if ($Tb -eq [IntPtr]::Zero) { return $false }
         $r = Get-Rect $Tb
-        $scale = ($r.B - $r.T) / 104.0
-        if ($scale -le 0) { return $false }
-        $gap = [int][Math]::Round(8 * $scale)
+        $dpi = [W]::GetDpiForWindow($Tb)
+        if ($dpi -lt 96) { $dpi = 96 }
+        $gap = [int][Math]::Round(8 * $dpi / 96.0)
         return (([Math]::Abs($r.L - $SelX) -le 1) -and ([Math]::Abs($r.T - ($SelY + $SelH + $gap)) -le 2))
     }
 
-    # 关掉当前工具条（经标题栏 ✕），用于选区不符时重来
+    # 关掉当前工具条（工具条已无关闭按钮，直接发 WM_CLOSE），用于选区不符时重来
     function Close-Toolbar([IntPtr]$Tb) {
-        $x = Find-ChildById $Tb 5
-        if ($x -ne [IntPtr]::Zero) { [void][W]::SendMessageW($x, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero) }
+        [void][W]::PostMessageW($Tb, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
         [void](Wait-WindowGone $pid0 'PixShotToolbar' 4000)
     }
 
@@ -342,25 +342,36 @@ try {
         if (($r.R - $r.L) -lt 40 -or ($r.B - $r.T) -lt 20) { $layoutOk = $false }
         if ($r.L -lt $tbR.L -or $r.R -gt $tbR.R) { $layoutOk = $false }
         if ($i -gt 0) { if ($r.L -lt $btnRects[$i - 1].R) { $layoutOk = $false } }
+        # 按钮到顶部与到底部的距离必须一致（需求），允许 1px 取整误差
+        if ([Math]::Abs(($r.T - $tbR.T) - ($tbR.B - $r.B)) -gt 1) { $layoutOk = $false }
     }
-    Check '工具条含 贴图/复制/保存/OCR 按钮（且排布正确）' `
+    Check '工具条含 贴图/复制/保存/OCR 按钮（且排布正确、上下留白一致）' `
         ($btnPin -ne [IntPtr]::Zero -and $btnCopy -ne [IntPtr]::Zero -and $btnSave -ne [IntPtr]::Zero -and $btnOcr -ne [IntPtr]::Zero -and $layoutOk) `
-        ("按钮宽 {0}px、起点 x={1}" -f ($btnRects[0].R - $btnRects[0].L), $btnRects[0].L)
+        ("按钮宽 {0}px、起点 x={1}、上留白 {2}px/下留白 {3}px" -f ($btnRects[0].R - $btnRects[0].L), $btnRects[0].L, ($btnRects[0].T - $tbR.T), ($tbR.B - $btnRects[0].B))
     $statics = @(Get-StaticTexts $tb0)
     Check '工具条无其它文字（无标签/状态文本）' ($statics.Count -eq 0) ("STATIC 子控件数：{0}" -f $statics.Count)
     $hasClose = $false
     $cc = [W]::GetWindow($tb0, 5)
     while ($cc -ne [IntPtr]::Zero) {
-        if ((Get-ControlText $cc) -eq '关闭') { $hasClose = $true }
+        $cap = Get-ControlText $cc
+        if ($cap -eq '关闭' -or $cap -eq '✕') { $hasClose = $true }
         $cc = [W]::GetWindow($cc, 2)
     }
-    Check '工具条已移除「关闭」按钮' (-not $hasClose)
+    Check '工具条无任何关闭按钮（「关闭」与 ✕ 均已移除）' (-not $hasClose)
     # 存档工具条外观：工具条设了 WDA_EXCLUDEFROMCAPTURE（截图工具惯例），
     # 屏幕抓屏只会拍到它背后的内容，故这里只记录几何，不做像素存档。
     $tr0 = Get-Rect $tb0
     Write-Host ("  [调试] 工具条 rect=({0},{1})-({2},{3}) 尺寸 {4}x{5}" -f $tr0.L, $tr0.T, $tr0.R, $tr0.B, ($tr0.R - $tr0.L), ($tr0.B - $tr0.T))
 
+    # ── 工具条已无任何关闭按钮：按 Esc 应能"不执行操作"直接关闭（唯一取消入口）──
+    [void][W]::PostMessageW($tb0, $WM_KEYDOWN, [IntPtr]0x1B, [IntPtr]::Zero)
+    Check '工具条按 Esc 直接关闭（无关闭按钮时的取消退路）' (Wait-WindowGone $pid0 'PixShotToolbar' 4000)
+
     # ── 需求 3：点「复制」→ 写剪贴板（CF_DIB）并关闭工具条 ──
+    $tbC = Invoke-Capture
+    if ($tbC -eq [IntPtr]::Zero) { throw '「复制」场景截图未出现工具条' }
+    $btnCopy = Find-ChildById $tbC 2
+    if ($btnCopy -eq [IntPtr]::Zero) { throw '「复制」场景未找到复制按钮' }
     [void][W]::SendMessageW($btnCopy, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 500
     Check '「复制」写入剪贴板（CF_DIB 位图）' (Test-ClipDib)

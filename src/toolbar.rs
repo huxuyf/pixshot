@@ -27,20 +27,26 @@ const BTN_PIN: usize = 1;
 const BTN_COPY: usize = 2;
 const BTN_SAVE: usize = 3;
 const BTN_OCR: usize = 4;
-const BTN_CLOSE: usize = 5;
+/// VK_ESCAPE（工具条上按 Esc 直接关闭，不执行操作）
+const VK_ESCAPE: usize = 0x1B;
 
-/// 逻辑客户区尺寸（96 DPI 基准）。工具条只承载一行操作按钮，故比早期版本矮。
+/// 逻辑客户区尺寸（96 DPI 基准）。工具条只承载一行操作按钮，故很矮。
 const TB_W: i32 = 480;
-const TB_H: i32 = 104;
-/// 自绘标题栏高度（逻辑像素；无标题文字，仅作拖动区与 ✕ 的落点）。
-const TB_HEADER_H: i32 = 36;
+/// 高度 = 上内边距 + 按钮高 + 下内边距（上下一致，见 `layout`）。
+const TB_H: i32 = TB_PAD_V * 2 + TB_BTN_H;
+/// 按钮到底/到顶的内边距（逻辑像素）。
+const TB_PAD_V: i32 = 16;
+/// 按钮高（逻辑像素）。
+const TB_BTN_H: i32 = 38;
+/// 按钮到窗口左右边缘的内边距（逻辑像素）。
+const TB_PAD_H: i32 = 16;
+/// 圆角卡片相对窗口边缘的内缩（逻辑像素）。
+const TB_CARD_INSET: i32 = 8;
 
 struct ToolbarData {
     image: Arc<CapturedImage>,
     /// 四个操作按钮：贴图 / 复制 / 保存 / OCR 识别
     buttons: [HWND; 4],
-    /// 标题栏关闭 ✕ 按钮（CloseGlyph 样式判定用）
-    close_btn: HWND,
     /// 工具栏皮肤：固定深色
     skin: theme::Theme,
     /// Mica 背景是否启用（工具栏固定深色为纯色面，恒为 false）
@@ -77,7 +83,6 @@ unsafe fn run_impl(image: Arc<CapturedImage>) -> Result<()> {
     let data = Box::into_raw(Box::new(ToolbarData {
         image,
         buttons: [HWND::default(); 4],
-        close_btn: HWND::default(),
         skin: theme::toolbar_skin(),
         backdrop: false,
         fx: util::HoverFx::new(),
@@ -122,26 +127,24 @@ unsafe fn layout(hwnd: HWND) {
     let (cw, ch) = (cr.right, cr.bottom);
     let dpi = util::dpi_of(hwnd);
     let s = |v: i32| util::scaled(v, dpi);
-    if cw < s(240) || ch < s(80) {
+    if cw < s(240) || ch < s(48) {
         return;
     }
 
-    let pad = s(16);
-    let header_h = s(TB_HEADER_H);
-    let btn_h = s(38);
+    let pad_h = s(TB_PAD_H);
+    let btn_h = s(TB_BTN_H);
     let gap = s(8);
     let n = d.buttons.len() as i32;
-    let total = cw - pad * 2;
+    let total = cw - pad_h * 2;
     let btn_w = ((total - gap * (n - 1)) / n).max(s(56));
 
-    let by = header_h + s(10);
+    // 垂直居中：按钮上缘到窗口顶部、下缘到底部的距离相等（均为 pad）。
+    // 直接由客户区高算，避免"常量求和"在某个 DPI 下因四舍五入而不对称。
+    let by = ((ch - btn_h) / 2).max(0);
     for (i, b) in d.buttons.iter().enumerate() {
-        let bx = pad + i as i32 * (btn_w + gap);
+        let bx = pad_h + i as i32 * (btn_w + gap);
         let _ = MoveWindow(*b, bx, by, btn_w, btn_h, BOOL(1));
     }
-
-    // 标题栏 ✕（右对齐；工具条唯一保留的"取消"入口）
-    let _ = MoveWindow(d.close_btn, cw - s(46), s(2), s(40), s(32), BOOL(1));
 }
 
 /// 工具栏自绘：深色基底 + 圆角内容卡片。
@@ -155,7 +158,7 @@ unsafe fn paint(hwnd: HWND) {
     let _ = GetClientRect(hwnd, &mut cr);
     let (cw, ch) = (cr.right, cr.bottom);
     let dpi = util::dpi_of(hwnd);
-    let header_h = util::scaled(TB_HEADER_H, dpi);
+    let inset = util::scaled(TB_CARD_INSET, dpi);
 
     // 1. 基底
     let base = if d.backdrop { COLORREF(0) } else { t.bg };
@@ -183,15 +186,7 @@ unsafe fn paint(hwnd: HWND) {
     let ob = SelectObject(hdc, brush);
     let op = SelectObject(hdc, pen);
     let r = util::scaled(16, dpi);
-    let _ = RoundRect(
-        hdc,
-        util::scaled(12, dpi),
-        header_h,
-        cw - util::scaled(12, dpi),
-        ch - util::scaled(12, dpi),
-        r,
-        r,
-    );
+    let _ = RoundRect(hdc, inset, inset, cw - inset, ch - inset, r, r);
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
     let _ = DeleteObject(brush);
@@ -205,17 +200,24 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         WM_NCCALCSIZE => LRESULT(0), // 去边框：客户区 == 外框
 
         WM_NCHITTEST => {
-            // 无边框：标题栏区域可拖动；其余（含按钮，由子窗口自行命中）为客户区
+            // 无边框：按钮行以外的区域（含上下内边距、按钮之间的间隙两侧）整块可拖动；
+            // 按钮行内返回 HTCLIENT，让子控件（按钮）正常接收鼠标。
             let mut r = RECT::default();
-            if GetWindowRect(hwnd, &mut r).is_err() {
+            let mut cr = RECT::default();
+            if GetWindowRect(hwnd, &mut r).is_err() || GetClientRect(hwnd, &mut cr).is_err() {
                 return LRESULT(HTCLIENT as isize);
             }
-            let header_h = util::scaled(TB_HEADER_H, util::dpi_of(hwnd));
-            let y = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 - r.top;
-            LRESULT(if y >= 0 && y < header_h {
-                HTCAPTION as isize
-            } else {
+            let dpi = util::dpi_of(hwnd);
+            let pad_h = util::scaled(TB_PAD_H, dpi);
+            let btn_h = util::scaled(TB_BTN_H, dpi);
+            let x = (((lp.0 & 0xFFFF) as u16 as i16 as i32) - r.left).max(0);
+            let y = (((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 - r.top).max(0);
+            let by = ((cr.bottom - btn_h) / 2).max(0);
+            let in_button_band = y >= by && y < by + btn_h && x >= pad_h && x < cr.right - pad_h;
+            LRESULT(if in_button_band {
                 HTCLIENT as isize
+            } else {
+                HTCAPTION as isize
             })
         }
 
@@ -233,17 +235,15 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             d.skin = theme::toolbar_skin();
             d.backdrop = theme::apply_frame(hwnd, d.skin, false);
 
-            // 工具条只放操作按钮：不再创建标题/状态标签（除按钮外不显示文字）。
+            // 工具条只放操作按钮：不创建任何标签文字，也不再有标题栏关闭按钮。
             // 先以占位尺寸创建，再由 layout 统一定位（DPI 变化时同一函数复用）。
             d.buttons[0] = add_button(hwnd, "贴图", 0, 0, 10, 10, BTN_PIN);
             d.buttons[1] = add_button(hwnd, "复制", 0, 0, 10, 10, BTN_COPY);
             d.buttons[2] = add_button(hwnd, "保存", 0, 0, 10, 10, BTN_SAVE);
             d.buttons[3] = add_button(hwnd, "OCR 识别", 0, 0, 10, 10, BTN_OCR);
-            d.close_btn = add_button(hwnd, "✕", 0, 0, 10, 10, BTN_CLOSE);
             for b in d.buttons {
                 d.fx.register(b);
             }
-            d.fx.register(d.close_btn);
             layout(hwnd);
             LRESULT(0)
         }
@@ -259,9 +259,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let dis = lp.0 as *const DRAWITEMSTRUCT;
             if !dis.is_null() {
                 if let Some(d) = data_of(hwnd) {
-                    let style = if (*dis).hwndItem == d.close_btn {
-                        util::BtnStyle::CloseGlyph
-                    } else if (wp.0 & 0xFFFF) as usize == BTN_PIN {
+                    let style = if (wp.0 & 0xFFFF) as usize == BTN_PIN {
                         util::BtnStyle::Accent
                     } else {
                         util::BtnStyle::Subtle
@@ -326,6 +324,14 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         WM_COMMAND => {
             let id = (wp.0 & 0xFFFF) as usize;
             handle_command(hwnd, id);
+            LRESULT(0)
+        }
+        // Esc = 不执行任何操作直接关闭。工具条已无任何关闭按钮，留一条键盘退路，
+        // 避免误触截图后只能"随便选一个操作"。
+        WM_KEYDOWN => {
+            if wp.0 == VK_ESCAPE {
+                close_bar(hwnd);
+            }
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -427,7 +433,6 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             });
             close_bar(hwnd);
         }
-        BTN_CLOSE => close_bar(hwnd),
         _ => {}
     }
 }
