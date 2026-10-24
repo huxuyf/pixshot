@@ -252,16 +252,23 @@ pub(crate) fn screenshot_flow() {
 }
 
 unsafe fn flow_impl() -> error::Result<()> {
-    // 1. 框选屏幕区域（模态）。返回「整屏快照 + 选区」
-    let Some((shot, region)) = overlay::select_region() else {
+    // 1. 框选屏幕区域（模态）。返回「整屏快照 + 选区 + 仍在显示的红框」。
+    //    红框窗口在工具条关闭前一直保留，用户操作期间能看到自己框选的范围。
+    let Some(sel) = overlay::select_region() else {
         return Ok(()); // 用户取消
     };
     // 2. 从同一帧快照裁剪成品：
     //    - 不再重新截屏（消除"用户所见"与"最终图像"不一致的窗口）；
-    //    - 不再需要 sleep 等待遮罩消失（遮罩与工具栏都设了 WDA_EXCLUDEFROMCAPTURE，
-    //      且根本不会再次捕获屏幕）。
-    let image = Arc::new(shot.crop(region.x, region.y, region.width, region.height));
-    // 3. 操作工具栏：贴图 / 复制 / 保存 / OCR
+    //    - 也不等待遮罩消失（遮罩与工具栏都设了 WDA_EXCLUDEFROMCAPTURE）。
+    let image = Arc::new(sel.image.crop(
+        sel.region.x,
+        sel.region.y,
+        sel.region.width,
+        sel.region.height,
+    ));
+    // 3. 操作工具栏：贴图 / 复制 / 保存 / OCR。
+    //    工具条一旦关闭（点任一图标 / Esc / 关闭按钮），`sel` 在函数返回时析构，
+    //    红框随之消失。
     toolbar::run(image)
 }
 

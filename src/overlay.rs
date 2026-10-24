@@ -14,8 +14,13 @@
 //! 由于红框是画在分层窗口上、成品是从快照裁剪的，**红框不会出现在截图里**。
 //!
 //! 状态存放：`GWLP_USERDATA` 持有 `Box<State>` 指针（与 pin/results 同一模式），
-//! 不再使用 `static mut`；`State` 由 `run()` 在消息循环结束后释放，因此
-//! 窗口销毁后仍能读回选区结果。
+//! 不再使用 `static mut`。
+//!
+//! **红框保留**：拖动确认后窗口**不销毁**，红框继续显示在屏幕上，直到用户点击
+//! 工具条任一图标或关闭截图。此时 `run()` 结束模态循环但保留窗口与 `State`，
+//! 交由 [`Selection`] 持有；`Selection` 析构（或显式 [`Selection::dismiss`]）
+//! 时才真正拆窗、释放 GDI 资源。为了让保留期间不挡住桌面操作，确认后窗口转为
+//! 鼠标穿透（`WS_EX_TRANSPARENT`），只作视觉提示。
 
 use std::sync::Arc;
 
@@ -41,6 +46,48 @@ pub struct SelectedRegion {
     pub height: i32,
 }
 
+/// 已确认的选区：成品快照 + 选区矩形 + **仍然在屏幕上显示的红框窗口**。
+///
+/// 拖动确认后红框窗口不销毁，而是继续显示（鼠标穿透，纯视觉），这样用户在
+/// 操作工具条期间仍能看到自己框选的范围。窗口在 [`Selection`] 被析构或显式
+/// 调用 [`Selection::dismiss`] 时拆掉 —— 也就是用户点击工具条任一图标、
+/// 或关闭截图的那一刻。
+pub struct Selection {
+    /// 进入框选时截取的整屏快照（与红框同一帧）。
+    pub image: Arc<CapturedImage>,
+    /// 用户在快照中框出的区域（虚拟屏幕物理像素）。
+    pub region: SelectedRegion,
+    /// 红框窗口；`dismiss()` 后置空。
+    hwnd: HWND,
+    /// 红框窗口的 `State`（`GWLP_USERDATA` 指向同一块内存）。
+    state: *mut State,
+}
+
+impl Selection {
+    /// 收掉红框窗口并释放其 GDI 资源。幂等（`Drop` 会再调一次也无害）。
+    pub fn dismiss(&mut self) {
+        if self.hwnd.is_invalid() {
+            return;
+        }
+        unsafe {
+            // 抑制 WM_DESTROY 里的 PostQuitMessage：此时已不在框选的消息循环内，
+            // 漏出去会让主消息循环误以为要退出程序。
+            (*self.state).quiet_destroy = true;
+            let _ = DestroyWindow(self.hwnd);
+            let s = Box::from_raw(self.state);
+            cleanup(&s);
+        }
+        self.hwnd = HWND::default();
+        self.state = std::ptr::null_mut();
+    }
+}
+
+impl Drop for Selection {
+    fn drop(&mut self) {
+        self.dismiss();
+    }
+}
+
 const VK_ESCAPE: usize = 0x1B;
 /// 小于该边长的拖动视为无效框选（忽略，继续等待用户框选）。
 const MIN_DRAG_LOGICAL: i32 = 3;
@@ -56,6 +103,10 @@ const FRAME_PX: u32 = 0xFFFF_0000;
 struct State {
     result: Option<SelectedRegion>,
     dragging: bool,
+    /// 选区已确认：红框保留显示中，忽略此后的一切框选交互（窗口已鼠标穿透）。
+    locked: bool,
+    /// 由 `Selection` 主动拆窗：「是」则在 `WM_DESTROY` 里跳过 `PostQuitMessage`。
+    quiet_destroy: bool,
     start: POINT, // 屏幕坐标
     cur: POINT,   // 屏幕坐标
     vx: i32,
@@ -77,12 +128,12 @@ struct State {
 
 
 /// 进入框选模式（模态，阻塞直到用户确认/取消）。
-/// 确认时返回「整屏快照 + 选区」；取消返回 None。
-pub fn select_region() -> Option<(Arc<CapturedImage>, SelectedRegion)> {
+/// 确认时返回「整屏快照 + 选区 + 仍在显示的红框」；取消返回 None。
+pub fn select_region() -> Option<Selection> {
     unsafe { run() }
 }
 
-unsafe fn run() -> Option<(Arc<CapturedImage>, SelectedRegion)> {
+unsafe fn run() -> Option<Selection> {
     let (vx, vy, vw, vh) = capture::virtual_screen_rect();
     if vw <= 0 || vh <= 0 {
         return None;
@@ -125,6 +176,8 @@ unsafe fn run() -> Option<(Arc<CapturedImage>, SelectedRegion)> {
     let state = Box::into_raw(Box::new(State {
         result: None,
         dragging: false,
+        locked: false,
+        quiet_destroy: false,
         start: POINT::default(),
         cur: POINT::default(),
         vx,
@@ -178,11 +231,26 @@ unsafe fn run() -> Option<(Arc<CapturedImage>, SelectedRegion)> {
         DispatchMessageW(&msg);
     }
 
-    // 窗口此时已销毁；state 指针仍有效（由本函数持有）
+    // 消息循环结束：
+    // - 取消（Esc）→ 窗口已销毁、无选区，释放资源后返回 None；
+    // - 确认选区 → 窗口**保留**（红框继续显示），把 `State` 交还调用方，
+    //   直到调用方 dismiss（点工具条图标 / 关闭截图）才拆窗。
     let s = Box::from_raw(state);
-    let result = s.result;
-    cleanup(&s);
-    result.map(|r| (shot, r))
+    match s.result {
+        Some(region) => {
+            let state = Box::into_raw(s);
+            Some(Selection {
+                image: shot,
+                region,
+                hwnd,
+                state,
+            })
+        }
+        None => {
+            cleanup(&s);
+            None
+        }
+    }
 }
 
 /// 整屏 32bpp 自上而下的 BITMAPINFO（供 `CreateDIBSection` 建绘制表面）。
@@ -280,6 +348,9 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 
         WM_LBUTTONDOWN => {
             if let Some(s) = state_of(hwnd) {
+                if s.locked {
+                    return LRESULT(0);
+                }
                 SetCapture(hwnd);
                 s.dragging = true;
                 s.start = point_from_lparam(lp, s.vx, s.vy);
@@ -291,7 +362,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 
         WM_MOUSEMOVE => {
             if let Some(s) = state_of(hwnd) {
-                if s.dragging {
+                if s.dragging && !s.locked {
                     s.cur = point_from_lparam(lp, s.vx, s.vy);
                     repaint_frame(hwnd, s);
                 }
@@ -300,21 +371,41 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         }
 
         WM_LBUTTONUP => {
-            finish_selection(hwnd, lp);
+            if !state_of(hwnd).map(|s| s.locked).unwrap_or(true) {
+                finish_selection(hwnd, lp);
+            }
             LRESULT(0)
         }
 
         WM_KEYDOWN => {
             if wp.0 == VK_ESCAPE {
+                // 选区确认后窗口只是保留显示的视觉层，Esc 已归工具条管；
+                // 此时若仍响应会拆掉红框并让 run() 误判为"已确认"。
+                if !state_of(hwnd).map(|s| s.locked).unwrap_or(true) {
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
+            LRESULT(0)
+        }
+
+        // 确认后保留的窗口不接受关闭请求（否则红框提前消失、run() 误判为已确认）；
+        // 它的生命周期由调用方持有的 Selection 决定。
+        WM_CLOSE => {
+            if !state_of(hwnd).map(|s| s.locked).unwrap_or(true) {
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
         }
 
         WM_DESTROY => {
-            // State 由 run() 释放（需要读回选区结果），这里只断开引用
+            // State 由 run()/Selection 释放（需要读回选区结果），这里只断开引用。
+            // 注意：由 Selection 主动拆窗时不能再 PostQuitMessage —— 那时已不在
+            // 框选消息循环内，多出来的 WM_QUIT 会被主循环当成"退出程序"。
+            let quiet = state_of(hwnd).map(|s| s.quiet_destroy).unwrap_or(false);
             let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            PostQuitMessage(0);
+            if !quiet {
+                PostQuitMessage(0);
+            }
             LRESULT(0)
         }
 
@@ -322,7 +413,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     }
 }
 
-/// 鼠标松开：拖动够大则取选区；过小（含单击）则擦掉框线，留在框选状态。
+/// 鼠标松开：拖动够大则取选区并**保留红框**；过小（含单击）则擦掉框线，留在框选状态。
 unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
     let Some(s) = state_of(hwnd) else { return };
     if !s.dragging {
@@ -335,7 +426,21 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
     let min_side = util::scaled(MIN_DRAG_LOGICAL, overlay_dpi());
     if r.2 >= min_side && r.3 >= min_side {
         s.result = Some(clamp_region(r, s.vx, s.vy, s.vw, s.vh));
-        let _ = DestroyWindow(hwnd);
+        s.locked = true;
+        // 红框保留显示：窗口转为鼠标穿透（纯视觉提示），不再接收框选交互；
+        // 结束模态循环但**不拆窗**，由调用方持有的 Selection 负责后续关闭。
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        PostQuitMessage(0);
         return;
     }
 
