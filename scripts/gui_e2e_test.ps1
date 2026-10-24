@@ -79,6 +79,7 @@ public class Win32 {
     // 剪贴板（直接 Win32 读取，避免 PowerShell Get-Clipboard 在 MTA/占用时的不稳定）
     [DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool CloseClipboard();
+    [DllImport("user32.dll")] public static extern bool EmptyClipboard();
     [DllImport("user32.dll")] public static extern bool IsClipboardFormatAvailable(uint fmt);
     [DllImport("user32.dll")] public static extern IntPtr GetClipboardData(uint fmt);
     [DllImport("kernel32.dll")] public static extern IntPtr GlobalLock(IntPtr hmem);
@@ -244,6 +245,13 @@ function Get-MenuItemCenter([IntPtr]$Menu, [int]$Index) {
         [int]($r.T + [math]::Round($centerY * $s))
     )
 }
+# 只呼出贴图右键菜单（不点击任何项）；返回菜单句柄（失败为 0）
+function Open-PinMenu([IntPtr]$Pin) {
+    $c = Get-Center $Pin
+    if (-not [Win32]::IsWindow($Pin)) { return [IntPtr]::Zero }
+    RightClick-At $c[0] $c[1]
+    return (Wait-Window 'PixShotMenu' 2500)
+}
 # 点开贴图右键菜单并点击指定项；返回是否成功点中
 function Select-PinMenuItem([IntPtr]$Pin, [int]$Index) {
     $c = Get-Center $Pin
@@ -314,8 +322,19 @@ try {
     Drag-Mouse $SelX $SelY ($SelX + $SelW) ($SelY + $SelH)
     Write-Host ("  [操作] 框选区域 ({0},{1}) {2}x{3}" -f $SelX, $SelY, $SelW, $SelH)
 
-    # ── 3. 操作工具栏弹出，点击「贴图」按钮（控件 ID=1）──
+    # ── 3. 操作工具栏弹出 ──
+    # 注入鼠标的框选偶发失手（起始点落在别的窗口上、拖动被吃掉等），
+    # 这里重试整段截图流程；Esc 先收掉可能残留的遮罩。
     $tb = Wait-Window 'PixShotToolbar' 6000
+    for ($try = 1; $try -le 3 -and $tb -eq [IntPtr]::Zero; $try++) {
+        Write-Host ("  [重试] 第 {0} 次框选未产生工具条，重新截图" -f $try)
+        $stray = [Win32]::FindWindowClass('PixShotOverlay', [IntPtr]::Zero)
+        if ($stray -ne [IntPtr]::Zero) {
+            [void][Win32]::PostMessageW($stray, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)  # WM_KEYDOWN Esc
+            Start-Sleep -Milliseconds 400
+        }
+        $tb = Invoke-Capture
+    }
     Check '框选完成 -> 操作工具栏弹出' ($tb -ne [IntPtr]::Zero)
     if ($tb -eq [IntPtr]::Zero) { throw '工具栏未出现（框选可能失败）' }
     $btnPin = Find-ChildById $tb 1
@@ -340,7 +359,7 @@ try {
         $tipText = if ($tipH -ne [IntPtr]::Zero) { Get-Text $tipH } else { '' }
         # 气泡文案 = 说明文字 + 快捷键（Ctrl+S 见 src/toolbar.rs 的 SHORTCUTS）
         Check '悬停图标弹出提示气泡（真实光标 + 文案含快捷键）' `
-            ($tipH -ne [IntPtr]::Zero -and $tipText -eq '保存图像  Ctrl+S') ("PixShotTip 文本='{0}'" -f $tipText)
+            ($tipH -ne [IntPtr]::Zero -and $tipText -eq '保存图像（Ctrl+S）') ("PixShotTip 文本='{0}'" -f $tipText)
     }
 
     # ── 3.2 快捷键 Ctrl+C = 复制并关闭：写剪贴板 CF_DIB 并收起工具条 ──
@@ -440,7 +459,31 @@ try {
         Check '截图可复制到剪贴板（CF_DIB 位图）' $false '右键菜单未打开'
     }
 
-    # ── 10. 最终存档：全屏（贴图 + 剪贴板 OCR 结果）──
+    # ── 10. 贴图菜单快捷键：展开菜单后按 Ctrl+C 即触发「复制图像」──
+    # 上一步 OCR 写入剪贴板的是文本，这里断言快捷键把剪贴板换成了 DIB，
+    # 才能证明菜单项快捷键真的生效（而不是恰好残留的旧内容）。
+    [void][Win32]::SetWindowPos($pin, $HWND_TOPMOST, 1150, 100, 0, 0, $SWP_TOP)
+    Start-Sleep -Milliseconds 250
+    # 先清掉上一步的位图，避免"通过"来自残留内容
+    [void][Win32]::OpenClipboard([IntPtr]::Zero)
+    [void][Win32]::EmptyClipboard()
+    [void][Win32]::CloseClipboard()
+    $menu = [IntPtr]::Zero
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $menu = Open-PinMenu $pin
+        if ($menu -ne [IntPtr]::Zero) { break }
+        Start-Sleep -Milliseconds 350
+    }
+    Check '贴图菜单已展开（供快捷键测试）' ($menu -ne [IntPtr]::Zero)
+    # 菜单自身在弹出时已调用 SetForegroundWindow，注入按键即送到菜单窗口
+    Start-Sleep -Milliseconds 180
+    Write-Host '  [操作] 菜单展开中按 Ctrl+C（= 复制图像）'
+    Press-Ctrl 0x43
+    Start-Sleep -Milliseconds 500
+    Check '贴图菜单快捷键 Ctrl+C = 复制图像（CF_DIB）' (Test-ClipDib)
+    Check '贴图菜单快捷键触发后菜单收起' (Wait-WindowGone 'PixShotMenu' 2000)
+
+    # ── 11. 最终存档：全屏（贴图 + 剪贴板 OCR 结果）──
     Shot 0 0 $sw $sh (Join-Path $art 'final_state.png')
 } finally {
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }

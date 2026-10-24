@@ -27,8 +27,6 @@ const PAD_X: i32 = 10;
 const PAD_Y: i32 = 6;
 /// 气泡与所指向按钮的间距（逻辑像素）。
 const GAP: i32 = 8;
-/// 说明文字与快捷键之间的间距（逻辑像素）。
-const GAP_TEXT: i32 = 12;
 /// 文本最大宽度（逻辑像素），超出裁切。
 const MAX_W: i32 = 420;
 
@@ -36,8 +34,8 @@ const MAX_W: i32 = 420;
 struct TipData {
     /// 说明文字（如「贴图」）
     label: Vec<u16>,
-    /// 快捷键（如「Ctrl+T」），以次级文本色绘制在说明文字之后
-    shortcut: Vec<u16>,
+    /// 快捷键后缀（如「（Ctrl+T）」），以次级文本色**紧接**说明文字绘制
+    suffix: Vec<u16>,
     skin: theme::Theme,
 }
 
@@ -64,7 +62,7 @@ impl Tip {
         register_class_w(CLASS, tip_proc, false, false, false);
         let data = Box::into_raw(Box::new(TipData {
             label: Vec::new(),
-            shortcut: Vec::new(),
+            suffix: Vec::new(),
             skin: theme::toolbar_skin(),
         }));
         let hinst =
@@ -96,15 +94,15 @@ impl Tip {
     }
 
     /// 在 `anchor`（按钮屏幕矩形）附近显示提示：`label` 为说明文字，
-    /// `shortcut` 为快捷键（以次级文本色紧跟其后）。
+    /// `shortcut` 为快捷键，显示为 `贴图（Ctrl+T）` —— 括号部分用次级文本色、紧随标签。
     pub unsafe fn show(&mut self, label: &str, shortcut: &str, anchor: &RECT) {
         let Some(d) = data_of(self.hwnd) else { return };
         let dpi = util::dpi_of(self.hwnd);
         let s = |v: i32| util::scaled(v, dpi);
         d.label = util::to_wide(label);
-        d.shortcut = util::to_wide(shortcut);
-        // 窗口标题 = 说明文字 + 快捷键：可访问性/自动化可直接读到气泡文案（E2E 依赖）
-        let title = util::to_wide(&format!("{label}  {shortcut}"));
+        d.suffix = util::to_wide(&format!("（{shortcut}）"));
+        // 窗口标题 = 完整文案：可访问性/自动化可直接读到气泡内容（E2E 依赖）
+        let title = util::to_wide(&format!("{label}（{shortcut}）"));
         let _ = SetWindowTextW(self.hwnd, PCWSTR::from_raw(title.as_ptr()));
 
         // 量测两段文本（DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX）
@@ -128,12 +126,12 @@ impl Tip {
             ((tr.right - tr.left).max(1), (tr.bottom - tr.top).max(1))
         };
         let (lw, lh) = measure(&d.label);
-        let (sw, sh) = measure(&d.shortcut);
+        let (sw, sh) = measure(&d.suffix);
         SelectObject(hdc, old_font);
         let _ = ReleaseDC(self.hwnd, hdc);
 
-        let gap = s(GAP_TEXT);
-        let tw = lw + if sw > 1 { gap + sw } else { 0 };
+        // 括号后缀紧接标签（全角括号自带间隔，无需额外间距）
+        let tw = lw + sw;
         let th = lh.max(sh);
         let (w, h) = (
             (tw + s(PAD_X) * 2).min(s(MAX_W)),
@@ -263,7 +261,7 @@ unsafe fn paint_card(hwnd: HWND, hdc: HDC, cw: i32, ch: i32, d: &TipData) {
     let _ = DeleteObject(brush);
     let _ = DeleteObject(pen);
 
-    // 文本：说明文字（主文本色）+ 快捷键（次级文本色，紧随其后）
+    // 文本：说明文字「贴图」（主文本色）+ 后缀「（Ctrl+T）」（次级文本色，紧接其后）
     if !d.label.is_empty() {
         let font = util::gui_font(hwnd, 9, 400);
         let old_font = SelectObject(hdc, font);
@@ -285,7 +283,6 @@ unsafe fn paint_card(hwnd: HWND, hdc: HDC, cw: i32, ch: i32, d: &TipData) {
                 &mut tr,
                 0x20 | 0x800, // DT_SINGLELINE | DT_NOPREFIX
             );
-            (tr.right - tr.left) as i32
         };
         // 先量出说明文字宽度（画在同一 DC 上，字体已选入）
         let mut calc = RECT {
@@ -303,8 +300,9 @@ unsafe fn paint_card(hwnd: HWND, hdc: HDC, cw: i32, ch: i32, d: &TipData) {
         );
         let lw = (calc.right - calc.left).max(1);
         let _ = single(&d.label, pad_x, t.text);
-        if !d.shortcut.is_empty() {
-            let _ = single(&d.shortcut, pad_x + lw + util::scaled(GAP_TEXT, dpi), t.text2);
+        if !d.suffix.is_empty() {
+            // 紧接标签绘制「（Ctrl+T）」，次级文本色
+            let _ = single(&d.suffix, pad_x + lw, t.text2);
         }
         SelectObject(hdc, old_font);
     }

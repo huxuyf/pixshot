@@ -18,13 +18,40 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const CLASS: &str = "PixShotMenu";
 const VK_ESCAPE: usize = 0x1B;
+/// VK_CONTROL / VK_SHIFT / VK_MENU(Alt)
+const VK_CONTROL: i32 = 0x11;
+const VK_SHIFT: i32 = 0x10;
+const VK_MENU: i32 = 0x12;
 /// DT_VCENTER | DT_SINGLELINE
 const DT_MID_LEFT: u32 = 0x24;
+
+/// 把当前按键（连同 Ctrl/Shift/Alt 的物理状态）拼成 `Ctrl+C` 形式的组合键名；
+/// 非字母/数字键返回 `None`。用于与 [`Item::shortcut`] 上的文案精确比对。
+unsafe fn pressed_combo(vk: usize) -> Option<String> {
+    let ch = match vk {
+        0x30..=0x39 => (b'0' + (vk - 0x30) as u8) as char,
+        0x41..=0x5A => (b'A' + (vk - 0x41) as u8) as char,
+        _ => return None,
+    };
+    let down = |v: i32| (GetKeyState(v) as u16) & 0x8000 != 0;
+    let mut s = String::new();
+    if down(VK_CONTROL) {
+        s.push_str("Ctrl+");
+    }
+    if down(VK_SHIFT) {
+        s.push_str("Shift+");
+    }
+    if down(VK_MENU) {
+        s.push_str("Alt+");
+    }
+    s.push(ch);
+    Some(s)
+}
 
 /// 一个菜单项。
 pub struct Item {
@@ -32,6 +59,8 @@ pub struct Item {
     pub enabled: bool,
     /// 该项上方是否画一条分隔线（第一项忽略）。
     pub separator_before: bool,
+    /// 快捷键（如 `Ctrl+C`）：右对齐显示在条目右侧，且菜单打开时按下即触发该项。
+    pub shortcut: Option<String>,
 }
 
 impl Item {
@@ -40,6 +69,17 @@ impl Item {
             label: label.into(),
             enabled: true,
             separator_before: false,
+            shortcut: None,
+        }
+    }
+
+    /// 带快捷键的条目（快捷键右对齐显示，并在菜单展开时生效）。
+    pub fn accel(label: impl Into<String>, shortcut: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            enabled: true,
+            separator_before: false,
+            shortcut: Some(shortcut.into()),
         }
     }
 
@@ -48,6 +88,7 @@ impl Item {
             label: label.into(),
             enabled: true,
             separator_before: true,
+            shortcut: None,
         }
     }
 
@@ -58,6 +99,7 @@ impl Item {
             label: label.into(),
             enabled: false,
             separator_before: false,
+            shortcut: None,
         }
     }
 }
@@ -90,6 +132,7 @@ unsafe fn show_impl(x: i32, y: i32, items: &[Item]) -> Option<usize> {
             label: i.label.clone(),
             enabled: i.enabled,
             separator_before: i.separator_before,
+            shortcut: i.shortcut.clone(),
         })
         .collect();
     let data = Box::into_raw(Box::new(Data {
@@ -184,9 +227,8 @@ unsafe fn measure(hwnd: HWND, d: &mut Data) {
     let hdc = GetDC(hwnd);
     let font = util::gui_font(hwnd, 10, 400);
     let old = SelectObject(hdc, font);
-    let mut max_w = util::scaled(72, dpi);
-    for it in &d.items {
-        let w = util::to_wide(&it.label);
+    let text_w = |s: &str| {
+        let w = util::to_wide(s);
         let mut r = RECT::default();
         let _ = raw::DrawTextW(
             hdc.0 as isize,
@@ -195,13 +237,25 @@ unsafe fn measure(hwnd: HWND, d: &mut Data) {
             &mut r,
             0x0400 | 0x20, // DT_CALCRECT | DT_SINGLELINE
         );
-        max_w = max_w.max(r.right - r.left);
+        (r.right - r.left).max(1)
+    };
+    let mut max_w = util::scaled(72, dpi);
+    for it in &d.items {
+        // 标签 + （有快捷键时）标签与快捷键之间的最小间隔 + 快捷键
+        let mut w = text_w(&it.label);
+        if let Some(sc) = &it.shortcut {
+            w += util::scaled(ACCEL_GAP, dpi) + text_w(sc);
+        }
+        max_w = max_w.max(w);
     }
     SelectObject(hdc, old);
     let _ = ReleaseDC(hwnd, hdc);
 
     d.width = max_w + util::scaled(44, dpi);
 }
+
+/// 标签与右对齐快捷键之间的最小间隔（逻辑像素）。
+const ACCEL_GAP: i32 = 20;
 
 unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -258,7 +312,20 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_KEYDOWN => {
             if wp.0 == VK_ESCAPE {
+                // Esc = 取消菜单（与「关闭贴图 (Esc)」不是同一件事：那个是贴图窗口的 Esc）
                 let _ = DestroyWindow(hwnd);
+            } else if let Some(combo) = pressed_combo(wp.0) {
+                // 快捷键：与条目上显示的文案精确匹配（如 Ctrl+C）即触发该项
+                if let Some(d) = data_of(hwnd) {
+                    if let Some(i) = d
+                        .items
+                        .iter()
+                        .position(|it| it.enabled && it.shortcut.as_deref() == Some(combo.as_str()))
+                    {
+                        d.chosen = Some(i);
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -400,15 +467,46 @@ unsafe fn paint_into(hwnd: HWND, hdc: HDC, w: i32, h: i32, d: &Data, t: theme::T
         }
         // 文本
         let color = if it.enabled { t.text } else { COLORREF(0x0080_8080) };
+        let right = w - util::scaled(12, dpi);
         raw::SetTextColor(hdc.0 as isize, color);
         let tw = util::to_wide(&it.label);
         let mut tr = RECT {
             left: util::scaled(18, dpi),
             top,
-            right: w - util::scaled(12, dpi),
+            right,
             bottom: top + d.item_h,
         };
         let _ = raw::DrawTextW(hdc.0 as isize, PCWSTR::from_raw(tw.as_ptr()), -1, &mut tr, DT_MID_LEFT);
+        // 快捷键：右对齐、次级文本色（Win11 菜单惯例）
+        if let Some(sc) = &it.shortcut {
+            let sw = util::to_wide(sc);
+            let mut calc = RECT::default();
+            let _ = raw::DrawTextW(
+                hdc.0 as isize,
+                PCWSTR::from_raw(sw.as_ptr()),
+                -1,
+                &mut calc,
+                0x0400 | 0x20, // DT_CALCRECT | DT_SINGLELINE
+            );
+            let accel_w = (calc.right - calc.left).max(1);
+            raw::SetTextColor(
+                hdc.0 as isize,
+                if it.enabled { t.text2 } else { COLORREF(0x0080_8080) },
+            );
+            let mut sr = RECT {
+                left: right - accel_w,
+                top,
+                right,
+                bottom: top + d.item_h,
+            };
+            let _ = raw::DrawTextW(
+                hdc.0 as isize,
+                PCWSTR::from_raw(sw.as_ptr()),
+                -1,
+                &mut sr,
+                0x26, // DT_RIGHT | DT_VCENTER | DT_SINGLELINE
+            );
+        }
         top += d.item_h;
     }
 
@@ -434,9 +532,9 @@ mod preview {
             );
             // 与贴图右键菜单同构：5 项，第 2 项处于悬停态
             let items = vec![
-                Item::new("复制图像"),
-                Item::new("保存为 PNG…"),
-                Item::new("识别文字 (OCR)"),
+                Item::accel("复制图像", "Ctrl+C"),
+                Item::accel("保存为 PNG…", "Ctrl+S"),
+                Item::accel("识别文字 (OCR)", "Ctrl+O"),
                 Item::sep("重置缩放 (100%)"),
                 Item::sep("关闭贴图 (Esc)"),
             ];

@@ -373,7 +373,7 @@ try {
     $tipText = if ($tipH -ne [IntPtr]::Zero) { Get-Text $tipH } else { '' }
     # 气泡文案 = 说明文字 + 快捷键（Ctrl+C 见 src/toolbar.rs 的 SHORTCUTS）
     Check '悬停图标弹出提示气泡（延时 + 文案含快捷键）' `
-        ($tipH -ne [IntPtr]::Zero -and $tipText -eq '复制并关闭  Ctrl+C') ("PixShotTip 可见={0} 文本='{1}'" -f ($tipH -ne [IntPtr]::Zero), $tipText)
+        ($tipH -ne [IntPtr]::Zero -and $tipText -eq '复制并关闭（Ctrl+C）') ("PixShotTip 可见={0} 文本='{1}'" -f ($tipH -ne [IntPtr]::Zero), $tipText)
     # 鼠标离开按钮（WM_MOUSELEAVE）→ 气泡收起（窗口仍存在但不可见）
     [void][W]::SendMessageW($btnCopy, $WM_MOUSELEAVE, [IntPtr]::Zero, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 250

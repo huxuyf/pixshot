@@ -562,10 +562,11 @@ unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
     let Some(data) = data_of(hwnd) else { return };
     let cfg = config::get();
 
+    // 快捷键与工具条保持一致（Ctrl+C 复制 / Ctrl+S 保存 / Ctrl+O OCR）
     let items = [
-        Item::new("复制图像"),
-        Item::new(format!("保存为 {}…", cfg.format.label())),
-        Item::new("识别文字 (OCR)"),
+        Item::accel("复制图像", "Ctrl+C"),
+        Item::accel(format!("保存为 {}…", cfg.format.label()), "Ctrl+S"),
+        Item::accel("识别文字 (OCR)", "Ctrl+O"),
         Item::sep("重置缩放 (100%)"),
         Item::sep("关闭贴图 (Esc)"),
     ];
