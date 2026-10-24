@@ -8,6 +8,8 @@
 //!
 //! 本模块不含 GUI，可在任意后台线程调用（自行初始化 COM/MTA）。
 
+use std::sync::Arc;
+
 use crate::error::{AppError, Result};
 use windows::core::HSTRING;
 use windows::Globalization::Language;
@@ -15,6 +17,41 @@ use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
 use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+/// 后台识别 → 文字写入剪贴板 → 交主窗口弹 Toast（**不弹结果窗口**）。
+///
+/// 工具条「复制识别到的文字」与贴图右键菜单「识别文字 (OCR)」**共用同一条路径**，
+/// 两处 OCR 的功能与提示因此必然一致。
+/// 识别必须离开 GUI 线程（WinRT 异步调用不可阻塞消息循环），故开后台线程，
+/// 完成后用 `WM_APP_OCR_DONE` 把结果码投递回主窗口展示提示。
+pub fn recognize_to_clipboard_async(image: Arc<[u8]>, w: i32, h: i32) {
+    // HWND 非 Send：跨线程以地址（isize）传递，线程内还原
+    let main_addr = crate::tray::main_hwnd().0 as isize;
+    std::thread::spawn(move || {
+        let code = match recognize(&image, w, h) {
+            Ok(text) if !text.trim().is_empty() => {
+                if crate::clipboard::copy_text(&text).is_ok() {
+                    crate::tray::OCR_DONE_COPIED
+                } else {
+                    crate::tray::OCR_DONE_FAIL
+                }
+            }
+            Ok(_) => crate::tray::OCR_DONE_EMPTY,
+            Err(e) => {
+                crate::diag::log(&format!("[ocr] 识别失败: {e}"));
+                crate::tray::OCR_DONE_FAIL
+            }
+        };
+        if main_addr != 0 {
+            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+            use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+            unsafe {
+                let main = HWND(main_addr as *mut core::ffi::c_void);
+                let _ = PostMessageW(main, crate::tray::WM_APP_OCR_DONE, WPARAM(code), LPARAM(0));
+            }
+        }
+    });
+}
 
 /// 对 BGRA（自上而下）图像执行 OCR，返回识别文本。
 /// 须在非 GUI 线程调用（本函数自行初始化 COM）。

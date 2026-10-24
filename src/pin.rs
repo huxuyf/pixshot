@@ -24,7 +24,7 @@ use crate::config;
 use crate::error::{AppError, Result};
 use crate::imageio;
 use crate::menu::{self, Item};
-use crate::results;
+use crate::ocr;
 use crate::theme;
 use crate::util::{error_msgbox, register_class_w, to_wide};
 use windows::core::PCWSTR;
@@ -600,10 +600,9 @@ unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
             Ok(None) => {}
             Err(e) => error_msgbox(&format!("保存失败：{e}")),
         },
-        2 => match results::start_ocr(data.image.clone(), data.img_w, data.img_h) {
-            Ok(_) => crate::toast::show("正在识别文字…"),
-            Err(e) => error_msgbox(&format!("OCR 启动失败：{e}")),
-        },
+        // OCR：与工具条「复制识别到的文字」完全一致 —— 后台识别 → 写入剪贴板 →
+        // 主窗口弹 Toast，**不弹出结果窗口**（见 ocr::recognize_to_clipboard_async）。
+        2 => ocr::recognize_to_clipboard_async(data.image.clone(), data.img_w, data.img_h),
         3 => {
             // 重置缩放：图像左上角保持不动（窗口位置不变，只改尺寸）
             data.scale = 1.0;

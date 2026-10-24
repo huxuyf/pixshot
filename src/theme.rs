@@ -98,6 +98,10 @@ thread_local! {
 }
 
 /// 重新读取系统主题（WM_SETTINGCHANGE 时调用实现实时跟随）。
+///
+/// 当前无调用方（跟随系统的 OCR 结果窗口已移除；工具条为固定配色无需跟随），
+/// 保留以便后续窗口接入实时主题。
+#[allow(dead_code)]
 pub fn reload() {
     let t = load_theme();
     CACHE.with(|c| *c.borrow_mut() = Some(t));
@@ -114,12 +118,24 @@ pub fn current() -> Theme {
     })
 }
 
-/// 截图工具栏皮肤：**固定深色**，不随系统浅色主题变化。
-/// 理由：1) 截图遮罩本身为暗色，深色工具栏视觉连续；
-///      2) Mica 材质采样壁纸，浅色主题 + 白壁纸时浅色工具栏几乎隐形；
-///      3) Snipaste/ShareX 等同类截图工具的工具栏均为深色。
+/// 截图工具栏皮肤：**固定浅色**（纯白底 + 纯黑图标），不随系统深色主题变化。
+/// 理由：工具条按钮为深色线性图标，白底黑图标对比度最高、观感最干净；
+/// 固定配色可保证任何系统主题下外观一致。窗口自带 1px 浅灰描边与圆角，
+/// 白底不会与桌面内容糊在一起。
 pub fn toolbar_skin() -> Theme {
-    with_user_accent(DARK)
+    Theme {
+        dark: false,
+        bg: COLORREF(0x00FF_FFFF),     // 纯白底
+        card: COLORREF(0x00FF_FFFF),   // 整个窗口即卡片（不再内缩分区）
+        stroke: COLORREF(0x00E2_E2E2), // 浅灰描边
+        text: COLORREF(0x0000_0000),   // 纯黑图标
+        text2: COLORREF(0x0055_5555),
+        accent: LIGHT.accent,
+        accent_text: LIGHT.accent_text,
+        hover: COLORREF(0x00EC_ECEC),  // 悬停淡灰
+        press: COLORREF(0x00DC_DCDC),
+        close_hover: LIGHT.close_hover,
+    }
 }
 
 fn load_theme() -> Theme {

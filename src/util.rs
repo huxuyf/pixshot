@@ -22,10 +22,10 @@ use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetCursorPos, GetWindowTextW, KillTimer, LoadCursorW, MessageBoxW,
-    RegisterClassW, SetTimer, WindowFromPoint, HMENU, IDC_ARROW, IDC_CROSS, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_OK,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_VISIBLE,
+    CallWindowProcW, CreateWindowExW, DefWindowProcW, GetCursorPos, GetWindowTextW,
+    GWLP_WNDPROC, KillTimer, LoadCursorW, MessageBoxW, RegisterClassW, SetTimer, SetWindowLongPtrW,
+    WindowFromPoint, HMENU, IDC_ARROW, IDC_CROSS, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WNDPROC, WS_CHILD, WS_VISIBLE,
 };
 
 /// 全局「流程进行中」标志：防止遮罩/工具栏打开时被托盘/热键重复触发。
@@ -245,6 +245,10 @@ pub fn add_label(parent: HWND, text: &str, x: i32, y: i32, w: i32, h: i32) -> HW
 }
 
 /// WM_CTLCOLORSTATIC / WM_CTLCOLOREDIT：指定文本色 + 透明底（露出卡片）。
+///
+/// 当前无调用方（OCR 结果窗口移除后不再有 STATIC/EDIT 子控件）；
+/// 保留该处理与 [`add_label`] 配套，便于后续窗口复用。
+#[allow(dead_code)]
 pub unsafe fn ctlcolor_static(wp: WPARAM, text: COLORREF) -> LRESULT {
     raw::SetTextColor(wp.0 as isize, text);
     raw::SetBkMode(wp.0 as isize, 1); // TRANSPARENT
@@ -434,6 +438,12 @@ impl HoverFx {
 }
 
 /// 按钮视觉样式。
+///
+/// 当前只有工具条的图标按钮在用（`Icon` / `IconClose`）；`Accent` / `Subtle` /
+/// `CloseGlyph` 为通用 owner-draw 按钮样式（OCR 结果窗口移除后暂无调用方），
+/// 作为窗口控件的通用能力保留。
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub enum BtnStyle {
     /// 强调色实心（主操作）
     Accent,
@@ -441,10 +451,64 @@ pub enum BtnStyle {
     Subtle,
     /// 标题栏关闭 ✕（悬停变红）
     CloseGlyph,
+    /// 图标按钮：悬停时卡片淡入，**不绘制文本**（图标由调用方自绘）
+    Icon,
+    /// 图标按钮 + 关闭语义：悬停变红，不绘制文本
+    IconClose,
+}
+
+/// 按样式与悬停插值算出按钮（填充色, 前景色）。绘制与图标取色共用，避免两处发散。
+pub fn btn_colors(
+    style: BtnStyle,
+    t: crate::theme::Theme,
+    v: f32,
+    pressed: bool,
+) -> (COLORREF, COLORREF) {
+    match style {
+        BtnStyle::Accent => {
+            let f = if pressed {
+                crate::theme::lerp(t.accent, t.text2, 0.25)
+            } else {
+                t.accent
+            };
+            (f, t.accent_text)
+        }
+        BtnStyle::Subtle => {
+            let mut f = crate::theme::lerp(t.card, t.hover, v);
+            if pressed {
+                f = crate::theme::lerp(f, t.press, 0.9);
+            }
+            (f, t.text)
+        }
+        BtnStyle::CloseGlyph => {
+            let f = if pressed {
+                t.close_hover
+            } else {
+                crate::theme::lerp(t.card, t.close_hover, v)
+            };
+            (f, crate::theme::lerp(t.text, COLORREF(0x00FF_FFFF), v))
+        }
+        BtnStyle::Icon => {
+            let mut f = crate::theme::lerp(t.card, t.hover, v);
+            if pressed {
+                f = crate::theme::lerp(f, t.press, 0.9);
+            }
+            (f, t.text)
+        }
+        BtnStyle::IconClose => {
+            let f = if pressed {
+                t.close_hover
+            } else {
+                crate::theme::lerp(t.card, t.close_hover, v)
+            };
+            (f, crate::theme::lerp(t.text, COLORREF(0x00FF_FFFF), v))
+        }
+    }
 }
 
 /// WM_DRAWITEM 绘制：Win11 风格圆角按钮（含悬停过渡/按下态）。
 /// `t` 为该窗口的皮肤（支持每个窗口独立主题，如工具栏固定深色）。
+/// `Icon`/`IconClose` 只画底色、不画文本，供图标按钮在宿主里叠加矢量图标。
 pub unsafe fn draw_od_button(
     parent: HWND,
     dis: &DRAWITEMSTRUCT,
@@ -454,32 +518,11 @@ pub unsafe fn draw_od_button(
 ) {
     let v = fx.val(dis.hwndItem);
     let pressed = (dis.itemState.0 & ODS_SELECTED.0) != 0;
-
-    let (fill, txt, weight) = match style {
-        BtnStyle::Accent => {
-            let f = if pressed {
-                crate::theme::lerp(t.accent, t.text2, 0.25)
-            } else {
-                t.accent
-            };
-            (f, t.accent_text, 600)
-        }
-        BtnStyle::Subtle => {
-            let mut f = crate::theme::lerp(t.card, t.hover, v);
-            if pressed {
-                f = crate::theme::lerp(f, t.press, 0.9);
-            }
-            (f, t.text, 400)
-        }
-        BtnStyle::CloseGlyph => {
-            let f = if pressed {
-                t.close_hover
-            } else {
-                crate::theme::lerp(t.card, t.close_hover, v)
-            };
-            let glyph = crate::theme::lerp(t.text, COLORREF(0x00FF_FFFF), v);
-            (f, glyph, 400)
-        }
+    let (fill, txt) = btn_colors(style, t, v, pressed);
+    let weight = if matches!(style, BtnStyle::Accent) {
+        600
+    } else {
+        400
     };
 
     let hdc = dis.hDC;
@@ -500,6 +543,11 @@ pub unsafe fn draw_od_button(
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(brush);
     let _ = DeleteObject(pen);
+
+    // 图标按钮无文本（图标由调用方另绘）
+    if matches!(style, BtnStyle::Icon | BtnStyle::IconClose) {
+        return;
+    }
 
     // 文本（✕ 字形同样走窗口文本）
     let mut buf = [0u16; 128];
@@ -527,6 +575,44 @@ pub unsafe fn draw_od_button(
         );
         SelectObject(hdc, old_font);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 控件子类化：替换子控件窗口过程（工具条图标按钮的悬停提示用）
+// ─────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// (控件 HWND, 原窗口过程)：登记后供 [`call_orig`] 转发，控件销毁时用 [`unsubclass`] 注销。
+    static OLD_PROCS: RefCell<Vec<(isize, isize)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 用 `proc` 替换控件窗口过程，返回原过程；原过程内部登记，供 [`call_orig`] 转发。
+pub unsafe fn subclass(hwnd: HWND, proc: WndProc) -> isize {
+    let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc as usize as isize);
+    OLD_PROCS.with(|m| m.borrow_mut().push((hwnd.0 as isize, old)));
+    old
+}
+
+/// 注销 [`subclass`] 的登记（控件销毁前调用，避免同一句柄复用时命中原过程）。
+pub fn unsubclass(hwnd: HWND) {
+    OLD_PROCS.with(|m| m.borrow_mut().retain(|(h, _)| *h != hwnd.0 as isize));
+}
+
+/// 把消息转发到 [`subclass`] 替换前的原窗口过程（取不到时退回 `DefWindowProcW`）。
+pub unsafe fn call_orig(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let old = OLD_PROCS.with(|m| {
+        m.borrow()
+            .iter()
+            .rev()
+            .find(|(h, _)| *h == hwnd.0 as isize)
+            .map(|(_, p)| *p)
+            .unwrap_or(0)
+    });
+    if old == 0 {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    let f: WNDPROC = std::mem::transmute(old);
+    CallWindowProcW(f, hwnd, msg, wp, lp)
 }
 
 /// 少量签名不便的 GDI/User32 函数直接声明

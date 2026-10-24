@@ -47,6 +47,7 @@ public class W {
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
@@ -74,6 +75,7 @@ Set-Variable -Name 'WM_KEYDOWN' -Value 0x0100 -Option Constant
 Set-Variable -Name 'WM_CLOSE' -Value 0x0010 -Option Constant
 Set-Variable -Name 'WM_LBUTTONDOWN' -Value 0x0201 -Option Constant
 Set-Variable -Name 'WM_MOUSEMOVE' -Value 0x0200 -Option Constant
+Set-Variable -Name 'WM_MOUSELEAVE' -Value 0x02A3 -Option Constant   # 工具条图标按钮的悬停离开
 Set-Variable -Name 'WM_LBUTTONUP' -Value 0x0202 -Option Constant
 Set-Variable -Name 'WM_MOUSEWHEEL' -Value 0x020A -Option Constant
 Set-Variable -Name 'WM_CONTEXTMENU' -Value 0x007B -Option Constant
@@ -306,7 +308,7 @@ try {
             [void][W]::SendMessageW($o, $WM_LBUTTONUP, [IntPtr]0, (LP ($SelX + $SelW) ($SelY + $SelH)))
             $t = Wait-WindowByEnum $pid0 'PixShotToolbar' 6000
             if ($t -eq [IntPtr]::Zero) {
-                # 未得到工具条：可能是"单击选窗"未命中而退回框选，Esc 关掉遮罩再来
+                # 未得到工具条：框选未生效（如拖动过小），Esc 关掉遮罩再来
                 $o2 = Find-WindowByEnum $pid0 'PixShotOverlay'
                 if ($o2 -ne [IntPtr]::Zero) {
                     [void][W]::SendMessageW($o2, $WM_KEYDOWN, [IntPtr]0x1B, [IntPtr]::Zero)
@@ -327,45 +329,72 @@ try {
     if ($tb0 -eq [IntPtr]::Zero) { throw '截图流程未走通（遮罩或工具条未出现）' }
     Write-Host ("  [操作] 消息驱动框选 ({0},{1}) {2}x{3}" -f $SelX, $SelY, $SelW, $SelH)
 
-    # ── 需求 1/4：工具条只含按钮、无其它文字，且已移除「关闭」按钮 ──
-    $btnPin  = Find-ChildById $tb0 1     # BTN_PIN  = 1
-    $btnCopy = Find-ChildById $tb0 2     # BTN_COPY = 2
-    $btnSave = Find-ChildById $tb0 3     # BTN_SAVE = 3
-    $btnOcr  = Find-ChildById $tb0 4     # BTN_OCR  = 4
-    $btnRects = @($btnPin, $btnCopy, $btnSave, $btnOcr) | ForEach-Object { Get-Rect $_ }
+    # ── 需求 1/4：工具条为「纯图标」按钮，从左到右：贴图/保存/复制/OCR/关闭 ──
+    # 控件 ID 保持稳定：1=贴图 2=复制 3=保存 4=OCR 5=关闭（E2E 按 ID 查找，与图标顺序无关）
+    $btnPin  = Find-ChildById $tb0 1     # BTN_PIN   = 1
+    $btnCopy = Find-ChildById $tb0 2     # BTN_COPY  = 2
+    $btnSave = Find-ChildById $tb0 3     # BTN_SAVE  = 3
+    $btnOcr  = Find-ChildById $tb0 4     # BTN_OCR   = 4
+    $btnClose= Find-ChildById $tb0 5     # BTN_CLOSE = 5
+    # 窗口内从左到右的实际顺序 = 需求顺序
+    $btnRects = @($btnPin, $btnSave, $btnCopy, $btnOcr, $btnClose) | ForEach-Object { Get-Rect $_ }
     $tbR = Get-Rect $tb0
     $layoutOk = $true
     for ($i = 0; $i -lt $btnRects.Count; $i++) {
         $r = $btnRects[$i]
         # 每个按钮都要有实际尺寸、落在工具条内、且不与左侧按钮重叠
         # （防止 layout() 提前返回时全部控件堆在 (0,0) 10x10 而不被发现）
-        if (($r.R - $r.L) -lt 40 -or ($r.B - $r.T) -lt 20) { $layoutOk = $false }
+        # 工具条为紧凑图标条（按钮 32 逻辑像素方形），故下限设 24px 物理像素
+        if (($r.R - $r.L) -lt 24 -or ($r.B - $r.T) -lt 20) { $layoutOk = $false }
         if ($r.L -lt $tbR.L -or $r.R -gt $tbR.R) { $layoutOk = $false }
         if ($i -gt 0) { if ($r.L -lt $btnRects[$i - 1].R) { $layoutOk = $false } }
         # 按钮到顶部与到底部的距离必须一致（需求），允许 1px 取整误差
         if ([Math]::Abs(($r.T - $tbR.T) - ($tbR.B - $r.B)) -gt 1) { $layoutOk = $false }
     }
-    Check '工具条含 贴图/复制/保存/OCR 按钮（且排布正确、上下留白一致）' `
-        ($btnPin -ne [IntPtr]::Zero -and $btnCopy -ne [IntPtr]::Zero -and $btnSave -ne [IntPtr]::Zero -and $btnOcr -ne [IntPtr]::Zero -and $layoutOk) `
+    Check '工具条含 贴图/保存/复制/OCR/关闭 五个图标按钮（排布正确、上下留白一致）' `
+        ($btnPin -ne [IntPtr]::Zero -and $btnCopy -ne [IntPtr]::Zero -and $btnSave -ne [IntPtr]::Zero -and $btnOcr -ne [IntPtr]::Zero -and $btnClose -ne [IntPtr]::Zero -and $layoutOk) `
         ("按钮宽 {0}px、起点 x={1}、上留白 {2}px/下留白 {3}px" -f ($btnRects[0].R - $btnRects[0].L), $btnRects[0].L, ($btnRects[0].T - $tbR.T), ($tbR.B - $btnRects[0].B))
     $statics = @(Get-StaticTexts $tb0)
-    Check '工具条无其它文字（无标签/状态文本）' ($statics.Count -eq 0) ("STATIC 子控件数：{0}" -f $statics.Count)
-    $hasClose = $false
-    $cc = [W]::GetWindow($tb0, 5)
-    while ($cc -ne [IntPtr]::Zero) {
-        $cap = Get-ControlText $cc
-        if ($cap -eq '关闭' -or $cap -eq '✕') { $hasClose = $true }
-        $cc = [W]::GetWindow($cc, 2)
+    Check '工具条无标签/状态文本（按钮为纯图标）' ($statics.Count -eq 0) ("STATIC 子控件数：{0}" -f $statics.Count)
+    # 悬停提示文案即按钮窗口文本（`src/toolbar.rs` 的 TIP_TEXTS），按窗口顺序核对
+    $tips = @($btnPin, $btnSave, $btnCopy, $btnOcr, $btnClose) | ForEach-Object { Get-ControlText $_ }
+    Check '五个图标按钮的悬停提示文案正确' `
+        (($tips -join '|') -eq '贴图|保存图像|复制并关闭|复制识别到的文字|关闭') ("实际：{0}" -f ($tips -join ' / '))
+    # ── 悬停提示：向「复制」按钮发 WM_MOUSEMOVE，延时后应弹出 PixShotTip 气泡 ──
+    # 气泡自绘（非 comctl32），文案同步写入窗口标题（src/tooltip.rs SetWindowTextW），便于核对。
+    [void][W]::SendMessageW($btnCopy, $WM_MOUSEMOVE, [IntPtr]::Zero, (LP 5 5))
+    $tipH = [IntPtr]::Zero
+    $tipDeadline = [Environment]::TickCount + 3000
+    while ([Environment]::TickCount -lt $tipDeadline) {
+        $h = Find-WindowByEnum $pid0 'PixShotTip'
+        if ($h -ne [IntPtr]::Zero -and [W]::IsWindowVisible($h)) { $tipH = $h; break }
+        Start-Sleep -Milliseconds 50
     }
-    Check '工具条无任何关闭按钮（「关闭」与 ✕ 均已移除）' (-not $hasClose)
+    $tipText = if ($tipH -ne [IntPtr]::Zero) { Get-Text $tipH } else { '' }
+    # 气泡文案 = 说明文字 + 快捷键（Ctrl+C 见 src/toolbar.rs 的 SHORTCUTS）
+    Check '悬停图标弹出提示气泡（延时 + 文案含快捷键）' `
+        ($tipH -ne [IntPtr]::Zero -and $tipText -eq '复制并关闭  Ctrl+C') ("PixShotTip 可见={0} 文本='{1}'" -f ($tipH -ne [IntPtr]::Zero), $tipText)
+    # 鼠标离开按钮（WM_MOUSELEAVE）→ 气泡收起（窗口仍存在但不可见）
+    [void][W]::SendMessageW($btnCopy, $WM_MOUSELEAVE, [IntPtr]::Zero, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 250
+    $h2 = Find-WindowByEnum $pid0 'PixShotTip'
+    $tipGone = ($h2 -eq [IntPtr]::Zero) -or (-not [W]::IsWindowVisible($h2))
+    Check '移开鼠标后提示气泡收起' $tipGone
+
     # 存档工具条外观：工具条设了 WDA_EXCLUDEFROMCAPTURE（截图工具惯例），
     # 屏幕抓屏只会拍到它背后的内容，故这里只记录几何，不做像素存档。
     $tr0 = Get-Rect $tb0
     Write-Host ("  [调试] 工具条 rect=({0},{1})-({2},{3}) 尺寸 {4}x{5}" -f $tr0.L, $tr0.T, $tr0.R, $tr0.B, ($tr0.R - $tr0.L), ($tr0.B - $tr0.T))
 
-    # ── 工具条已无任何关闭按钮：按 Esc 应能"不执行操作"直接关闭（唯一取消入口）──
-    [void][W]::PostMessageW($tb0, $WM_KEYDOWN, [IntPtr]0x1B, [IntPtr]::Zero)
-    Check '工具条按 Esc 直接关闭（无关闭按钮时的取消退路）' (Wait-WindowGone $pid0 'PixShotToolbar' 4000)
+    # ── ✕ 关闭按钮：不执行任何操作，直接收起工具条 ──
+    [void][W]::SendMessageW($btnClose, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+    Check '点「✕ 关闭」收起工具条（不执行操作）' (Wait-WindowGone $pid0 'PixShotToolbar' 4000)
+
+    # ── Esc 同样是"不执行操作"的取消退路（与 ✕ 等价）──
+    $tbEsc = Invoke-Capture
+    if ($tbEsc -eq [IntPtr]::Zero) { throw 'Esc 场景截图未出现工具条' }
+    [void][W]::PostMessageW($tbEsc, $WM_KEYDOWN, [IntPtr]0x1B, [IntPtr]::Zero)
+    Check '工具条按 Esc 直接关闭' (Wait-WindowGone $pid0 'PixShotToolbar' 4000)
 
     # ── 需求 3：点「复制」→ 写剪贴板（CF_DIB）并关闭工具条 ──
     $tbC = Invoke-Capture

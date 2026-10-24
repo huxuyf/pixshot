@@ -3,7 +3,12 @@
 //! 从 `main.rs` 拆出（原本与托盘/热键/流程编排挤在同一文件，接近千行）。
 //! 皮肤固定深色（见 `theme::toolbar_skin`），布局按窗口 DPI 换算并在 `WM_DPICHANGED` 重排。
 //!
-//! 子控件 ID 与窗口文本保持原样（E2E 依赖「贴图 / 复制 / 保存 / OCR 识别 / 关闭」按钮文本）。
+//! 按钮为**纯图标**（矢量自绘，见 [`crate::icons`]），依次为
+//! 贴图 / 保存图像 / 复制并关闭 / 复制识别到的文字 / 关闭；
+//! 悬停延时后在图标上方弹出提示气泡（[`crate::tooltip`]）。
+//!
+//! 控件 ID 保持稳定（E2E 用 `Find-ChildById` 定位，见 `scripts/gui_e2e_*.ps1`）：
+//! 1=贴图 / 2=复制 / 3=保存 / 4=OCR / 5=关闭。
 
 use std::sync::Arc;
 
@@ -11,15 +16,18 @@ use crate::capture::{self, CapturedImage};
 use crate::config;
 use crate::error::{AppError, Result};
 use crate::theme;
-use crate::util::{self, add_button, raw, register_class_w};
-use crate::{clipboard, imageio, ocr, pin, tray};
+use crate::util::{self, add_button, raw, register_class_w, BtnStyle};
+use crate::{clipboard, icons, imageio, ocr, pin, tooltip};
 
-use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject,
-    RoundRect, SelectObject, NULL_BRUSH, PS_SOLID, Rectangle,
+    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, RoundRect,
+    SelectObject, PS_SOLID,
 };
-use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // 工具栏按钮 ID（与 E2E 的控件查找协议一致）
@@ -27,32 +35,57 @@ const BTN_PIN: usize = 1;
 const BTN_COPY: usize = 2;
 const BTN_SAVE: usize = 3;
 const BTN_OCR: usize = 4;
-/// VK_ESCAPE（工具条上按 Esc 直接关闭，不执行操作）
+const BTN_CLOSE: usize = 5;
+/// 按钮在窗口内的从左到右排列顺序（图标顺序 = 需求给定顺序）
+const BTN_ORDER: [usize; 5] = [BTN_PIN, BTN_SAVE, BTN_COPY, BTN_OCR, BTN_CLOSE];
+/// 各按钮的悬停提示文字（与 [`BTN_ORDER`] 一一对应）
+const TIP_TEXTS: [&str; 5] = ["贴图", "保存图像", "复制并关闭", "复制识别到的文字", "关闭"];
+/// 各按钮的快捷键（与 [`BTN_ORDER`] 一一对应，显示在提示文字之后）
+const SHORTCUTS: [&str; 5] = ["Ctrl+T", "Ctrl+S", "Ctrl+C", "Ctrl+O", "Esc"];
+/// 悬停后弹出提示气泡的延时（毫秒）
+const TIP_DELAY_MS: u32 = 450;
+/// 提示气泡定时器 ID
+const TIMER_TIP: usize = 779;
+/// VK_ESCAPE（关闭）/ VK_T / VK_S / VK_C / VK_O（配合 Ctrl 触发对应动作）
 const VK_ESCAPE: usize = 0x1B;
+const VK_T: usize = 0x54;
+const VK_S: usize = 0x53;
+const VK_C: usize = 0x43;
+const VK_O: usize = 0x4F;
+/// VK_CONTROL（GetKeyState 读物理按键状态）
+const VK_CONTROL: i32 = 0x11;
 
-/// 逻辑客户区尺寸（96 DPI 基准）。工具条只承载一行操作按钮，故很矮。
-const TB_W: i32 = 480;
-/// 高度 = 上内边距 + 按钮高 + 下内边距（上下一致，见 `layout`）。
-const TB_H: i32 = TB_PAD_V * 2 + TB_BTN_H;
-/// 按钮到底/到顶的内边距（逻辑像素）。
-const TB_PAD_V: i32 = 16;
-/// 按钮高（逻辑像素）。
-const TB_BTN_H: i32 = 38;
+/// 图标按钮边长（逻辑像素）——方形，紧凑。
+const TB_BTN_SZ: i32 = 32;
+/// 按钮之间的间隔（逻辑像素）。
+const TB_GAP: i32 = 2;
+/// 按钮到窗口上下边缘的内边距（逻辑像素，上下一致，见 `layout`）。
+const TB_PAD_V: i32 = 6;
 /// 按钮到窗口左右边缘的内边距（逻辑像素）。
-const TB_PAD_H: i32 = 16;
-/// 圆角卡片相对窗口边缘的内缩（逻辑像素）。
-const TB_CARD_INSET: i32 = 8;
+const TB_PAD_H: i32 = 6;
+/// 逻辑客户区尺寸（96 DPI 基准）：仅容纳一行方形图标按钮，力求紧凑。
+const TB_W: i32 = TB_BTN_SZ * 5 + TB_GAP * 4 + TB_PAD_H * 2; // 180
+/// 高度 = 上内边距 + 按钮 + 下内边距。
+const TB_H: i32 = TB_PAD_V * 2 + TB_BTN_SZ; // 44
+/// 窗口圆角半径（逻辑像素）。
+const TB_RADIUS: i32 = 8;
 
 struct ToolbarData {
     image: Arc<CapturedImage>,
-    /// 四个操作按钮：贴图 / 复制 / 保存 / OCR 识别
-    buttons: [HWND; 4],
+    /// 五个图标按钮，顺序见 [`BTN_ORDER`]
+    buttons: [HWND; 5],
     /// 工具栏皮肤：固定深色
     skin: theme::Theme,
     /// Mica 背景是否启用（工具栏固定深色为纯色面，恒为 false）
     backdrop: bool,
     /// 按钮悬停动画
     fx: util::HoverFx,
+    /// 悬停提示气泡窗口
+    tip: tooltip::Tip,
+    /// 已武装提示延时的按钮 ID（0 = 无）
+    tip_for: usize,
+    /// 提示气泡当前是否可见
+    tip_shown: bool,
 }
 
 unsafe fn data_of(hwnd: HWND) -> Option<&'static mut ToolbarData> {
@@ -82,10 +115,13 @@ unsafe fn run_impl(image: Arc<CapturedImage>) -> Result<()> {
 
     let data = Box::into_raw(Box::new(ToolbarData {
         image,
-        buttons: [HWND::default(); 4],
+        buttons: [HWND::default(); 5],
         skin: theme::toolbar_skin(),
         backdrop: false,
         fx: util::HoverFx::new(),
+        tip: tooltip::Tip::none(),
+        tip_for: 0,
+        tip_shown: false,
     }));
 
     // WS_THICKFRAME 供 DWM 绘制阴影；WM_NCCALCSIZE(0) 去除边框（全客户区）
@@ -119,7 +155,7 @@ unsafe fn run_impl(image: Arc<CapturedImage>) -> Result<()> {
     Ok(())
 }
 
-/// 按 DPI 与客户区尺寸重排控件（4 个按钮均分可用宽度，高 DPI 下不溢出）。
+/// 按 DPI 重排控件：5 个方形图标按钮横向等距排布（紧凑，不随窗口拉伸）。
 unsafe fn layout(hwnd: HWND) {
     let Some(d) = data_of(hwnd) else { return };
     let mut cr = RECT::default();
@@ -127,28 +163,28 @@ unsafe fn layout(hwnd: HWND) {
     let (cw, ch) = (cr.right, cr.bottom);
     let dpi = util::dpi_of(hwnd);
     let s = |v: i32| util::scaled(v, dpi);
-    if cw < s(240) || ch < s(48) {
+    // 窗口尚未成尺寸时先不动（避免控件堆在 (0,0)）
+    if cw < s(TB_BTN_SZ) || ch < s(TB_BTN_SZ) {
         return;
     }
 
-    let pad_h = s(TB_PAD_H);
-    let btn_h = s(TB_BTN_H);
-    let gap = s(8);
+    let btn = s(TB_BTN_SZ);
+    let gap = s(TB_GAP);
     let n = d.buttons.len() as i32;
-    let total = cw - pad_h * 2;
-    let btn_w = ((total - gap * (n - 1)) / n).max(s(56));
+    // 水平居中：两侧留白均分剩余空间（窗口即为按钮行量身定制，差值为取整误差）
+    let used = btn * n + gap * (n - 1);
+    let x0 = ((cw - used) / 2).max(0);
 
-    // 垂直居中：按钮上缘到窗口顶部、下缘到底部的距离相等（均为 pad）。
-    // 直接由客户区高算，避免"常量求和"在某个 DPI 下因四舍五入而不对称。
-    let by = ((ch - btn_h) / 2).max(0);
+    // 垂直居中：按钮上缘到顶部、下缘到底部的距离相等（均由客户区高算出）
+    let by = ((ch - btn) / 2).max(0);
     for (i, b) in d.buttons.iter().enumerate() {
-        let bx = pad_h + i as i32 * (btn_w + gap);
-        let _ = MoveWindow(*b, bx, by, btn_w, btn_h, BOOL(1));
+        let bx = x0 + i as i32 * (btn + gap);
+        let _ = MoveWindow(*b, bx, by, btn, btn, BOOL(1));
     }
 }
 
-/// 工具栏自绘：深色基底 + 圆角内容卡片。
-/// 除按钮自身文本外不绘制任何文字（标题/状态已移除）。
+/// 工具栏自绘：整窗即白底圆角卡片（1px 浅灰描边），按钮图标绘制其上。
+/// 除图标外不绘制任何文字。
 unsafe fn paint(hwnd: HWND) {
     let Some(d) = data_of(hwnd) else { return };
     let t = d.skin;
@@ -158,10 +194,9 @@ unsafe fn paint(hwnd: HWND) {
     let _ = GetClientRect(hwnd, &mut cr);
     let (cw, ch) = (cr.right, cr.bottom);
     let dpi = util::dpi_of(hwnd);
-    let inset = util::scaled(TB_CARD_INSET, dpi);
 
-    // 1. 基底
-    let base = if d.backdrop { COLORREF(0) } else { t.bg };
+    // 1. 白底铺满整个窗口
+    let base = if d.backdrop { COLORREF(0) } else { t.card };
     let base_brush = CreateSolidBrush(base);
     let rc = RECT {
         left: 0,
@@ -172,21 +207,13 @@ unsafe fn paint(hwnd: HWND) {
     FillRect(hdc, &rc, base_brush);
     let _ = DeleteObject(base_brush);
 
-    // 1.5 自绘 1px 窗口轮廓（不用 DWMWA_BORDER_COLOR，避免 DWM 框架带）
-    let pen = CreatePen(PS_SOLID, 1, theme::edge_line(t));
-    let op = SelectObject(hdc, pen);
-    let _ = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    let _ = Rectangle(hdc, 0, 0, cw, ch);
-    SelectObject(hdc, op);
-    let _ = DeleteObject(pen);
-
-    // 2. 圆角内容卡片（操作按钮绘制其上）
+    // 2. 圆角 + 1px 描边（内缩 1px，避免被窗口边缘裁掉半像素）
     let brush = CreateSolidBrush(t.card);
     let pen = CreatePen(PS_SOLID, 1, t.stroke);
     let ob = SelectObject(hdc, brush);
     let op = SelectObject(hdc, pen);
-    let r = util::scaled(16, dpi);
-    let _ = RoundRect(hdc, inset, inset, cw - inset, ch - inset, r, r);
+    let r = util::scaled(TB_RADIUS, dpi);
+    let _ = RoundRect(hdc, 0, 0, cw, ch, r, r);
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
     let _ = DeleteObject(brush);
@@ -208,12 +235,15 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 return LRESULT(HTCLIENT as isize);
             }
             let dpi = util::dpi_of(hwnd);
-            let pad_h = util::scaled(TB_PAD_H, dpi);
-            let btn_h = util::scaled(TB_BTN_H, dpi);
+            let btn = util::scaled(TB_BTN_SZ, dpi);
+            let gap = util::scaled(TB_GAP, dpi);
+            let n = BTN_ORDER.len() as i32;
+            let used = btn * n + gap * (n - 1);
+            let x0 = ((cr.right - used) / 2).max(0);
             let x = (((lp.0 & 0xFFFF) as u16 as i16 as i32) - r.left).max(0);
             let y = (((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 - r.top).max(0);
-            let by = ((cr.bottom - btn_h) / 2).max(0);
-            let in_button_band = y >= by && y < by + btn_h && x >= pad_h && x < cr.right - pad_h;
+            let by = ((cr.bottom - btn) / 2).max(0);
+            let in_button_band = y >= by && y < by + btn && x >= x0 && x < x0 + used;
             LRESULT(if in_button_band {
                 HTCLIENT as isize
             } else {
@@ -235,15 +265,17 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             d.skin = theme::toolbar_skin();
             d.backdrop = theme::apply_frame(hwnd, d.skin, false);
 
-            // 工具条只放操作按钮：不创建任何标签文字，也不再有标题栏关闭按钮。
-            // 先以占位尺寸创建，再由 layout 统一定位（DPI 变化时同一函数复用）。
-            d.buttons[0] = add_button(hwnd, "贴图", 0, 0, 10, 10, BTN_PIN);
-            d.buttons[1] = add_button(hwnd, "复制", 0, 0, 10, 10, BTN_COPY);
-            d.buttons[2] = add_button(hwnd, "保存", 0, 0, 10, 10, BTN_SAVE);
-            d.buttons[3] = add_button(hwnd, "OCR 识别", 0, 0, 10, 10, BTN_OCR);
+            // 图标按钮：按钮不带可见文本（图标自绘），窗口文本保留为提示文案
+            // （可访问性/自动化可读）。先以占位尺寸创建，再由 layout 统一定位。
+            for (i, &id) in BTN_ORDER.iter().enumerate() {
+                d.buttons[i] = add_button(hwnd, TIP_TEXTS[i], 0, 0, 10, 10, id);
+            }
             for b in d.buttons {
                 d.fx.register(b);
+                // 子类化以获取按钮自身的悬停/离开消息（父窗口收不到子控件上的鼠标消息）
+                util::subclass(b, btn_proc);
             }
+            d.tip = tooltip::Tip::new(hwnd);
             layout(hwnd);
             LRESULT(0)
         }
@@ -259,12 +291,18 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let dis = lp.0 as *const DRAWITEMSTRUCT;
             if !dis.is_null() {
                 if let Some(d) = data_of(hwnd) {
-                    let style = if (wp.0 & 0xFFFF) as usize == BTN_PIN {
-                        util::BtnStyle::Accent
+                    let id = (wp.0 & 0xFFFF) as usize;
+                    let style = if id == BTN_CLOSE {
+                        BtnStyle::IconClose
                     } else {
-                        util::BtnStyle::Subtle
+                        BtnStyle::Icon
                     };
+                    // 先画圆角底（不画文本），再叠加矢量图标
                     util::draw_od_button(hwnd, &*dis, &d.fx, style, d.skin);
+                    let v = d.fx.val((*dis).hwndItem);
+                    let pressed = ((*dis).itemState.0 & ODS_SELECTED.0) != 0;
+                    let (fill, ink) = util::btn_colors(style, d.skin, v, pressed);
+                    icons::draw((*dis).hDC, (*dis).rcItem, icon_of(id), ink, fill);
                 }
             }
             LRESULT(1)
@@ -287,7 +325,13 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         WM_TIMER => {
             let mut handled = false;
             if let Some(d) = data_of(hwnd) {
-                handled = d.fx.on_timer(hwnd, wp.0);
+                if wp.0 == TIMER_TIP {
+                    show_tip_for(d);
+                    let _ = KillTimer(hwnd, TIMER_TIP);
+                    handled = true;
+                } else {
+                    handled = d.fx.on_timer(hwnd, wp.0);
+                }
             }
             if handled {
                 LRESULT(0)
@@ -326,13 +370,18 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             handle_command(hwnd, id);
             LRESULT(0)
         }
-        // Esc = 不执行任何操作直接关闭。工具条已无任何关闭按钮，留一条键盘退路，
-        // 避免误触截图后只能"随便选一个操作"。
+        // 快捷键：Esc 关闭；Ctrl+T/S/C/O 分别对应贴图/保存/复制/OCR
         WM_KEYDOWN => {
-            if wp.0 == VK_ESCAPE {
-                close_bar(hwnd);
-            }
+            handle_shortcut(hwnd, wp.0);
             LRESULT(0)
+        }
+        // 拖动工具条（点在按钮行以外的 HTCAPTION 区）时立即收起气泡
+        WM_NCLBUTTONDOWN => {
+            if let Some(d) = data_of(hwnd) {
+                d.tip.hide();
+                d.tip_shown = false;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_CLOSE => {
             PostQuitMessage(0);
@@ -343,6 +392,11 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             if p != 0 {
                 let mut data = Box::from_raw(p as *mut ToolbarData);
                 data.fx.stop(hwnd);
+                data.tip.destroy();
+                // 按钮随父窗口销毁；先注销子类化登记（工具条每次截图都会重建）
+                for b in data.buttons {
+                    util::unsubclass(b);
+                }
             }
             LRESULT(0)
         }
@@ -351,14 +405,139 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 }
 
 /// 关闭工具条：隐藏后结束其模态消息循环，回到主循环。
-/// 贴图 / 复制 / 保存 / OCR 四个操作都走这里 —— 工具条是「一次性操作条」。
+/// 贴图 / 保存 / 复制 / OCR / 关闭五个动作都走这里 —— 工具条是「一次性操作条」。
 unsafe fn close_bar(hwnd: HWND) {
+    if let Some(d) = data_of(hwnd) {
+        d.tip.hide();
+    }
     let _ = ShowWindow(hwnd, SW_HIDE);
     PostQuitMessage(0);
 }
 
+/// Ctrl 是否按下（读物理按键状态，不依赖焦点/键序）。
+unsafe fn ctrl_down() -> bool {
+    (GetKeyState(VK_CONTROL) as u16) & 0x8000 != 0
+}
+
+/// 处理工具条快捷键。返回 true 表示已消费该按键。
+/// 映射见 [`SHORTCUTS`]：Esc=关闭，Ctrl+T=贴图，Ctrl+S=保存，Ctrl+C=复制，Ctrl+O=OCR。
+unsafe fn handle_shortcut(hwnd: HWND, vk: usize) -> bool {
+    let (id, need_ctrl) = match vk {
+        VK_ESCAPE => return {
+            close_bar(hwnd);
+            true
+        },
+        VK_T => (BTN_PIN, true),
+        VK_S => (BTN_SAVE, true),
+        VK_C => (BTN_COPY, true),
+        VK_O => (BTN_OCR, true),
+        _ => return false,
+    };
+    if need_ctrl && !ctrl_down() {
+        return false;
+    }
+    handle_command(hwnd, id);
+    true
+}
+
+/// 控件 ID → 图标。
+fn icon_of(id: usize) -> icons::Icon {
+    match id {
+        BTN_PIN => icons::Icon::Pin,
+        BTN_SAVE => icons::Icon::Save,
+        BTN_COPY => icons::Icon::Copy,
+        BTN_OCR => icons::Icon::Ocr,
+        _ => icons::Icon::Close,
+    }
+}
+
+/// 控件 ID → 在 [`BTN_ORDER`] 中的下标。
+fn index_of_id(id: usize) -> Option<usize> {
+    BTN_ORDER.iter().position(|&x| x == id)
+}
+
+/// 弹出 `d.tip_for` 对应按钮的提示气泡（延时到点后由其屏幕矩形定位）。
+unsafe fn show_tip_for(d: &mut ToolbarData) {
+    let Some(idx) = index_of_id(d.tip_for) else { return };
+    let btn = d.buttons[idx];
+    let mut r = RECT::default();
+    if GetWindowRect(btn, &mut r).is_err() {
+        return;
+    }
+    d.tip.show(TIP_TEXTS[idx], SHORTCUTS[idx], &r);
+    d.tip_shown = true;
+}
+
+/// 图标按钮的窗口过程：补齐父窗口收不到的按钮级鼠标消息（悬停提示 + 高亮）。
+/// 除这几条外全部转发给按钮原过程，保证点击/键盘等行为不变。
+unsafe extern "system" fn btn_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let parent = GetParent(hwnd).unwrap_or_default();
+    if !parent.is_invalid() {
+        let id = GetDlgCtrlID(hwnd) as usize;
+        match msg {
+            WM_MOUSEMOVE => {
+                if let Some(d) = data_of(parent) {
+                    // 悬停高亮：父窗口在按钮上方收不到 WM_MOUSEMOVE，这里代它驱动
+                    d.fx.on_mouse_move(parent);
+                    // 提示延时：仅首次进入某按钮时武装定时器；已显示则不动
+                    if !d.tip_shown && d.tip_for != id {
+                        d.tip_for = id;
+                        let _ = SetTimer(parent, TIMER_TIP, TIP_DELAY_MS, None);
+                    }
+                }
+                // 仅在**真实光标**落在按钮内时才武装离开跟踪。
+                // 若光标不在窗口内，TrackMouseEvent 会立刻回一个 WM_MOUSELEAVE，
+                // 把刚武装的提示延时一并取消（也让消息驱动的自动化测试无法验证提示）。
+                let mut pt = POINT::default();
+                let mut br = RECT::default();
+                if GetCursorPos(&mut pt).is_ok()
+                    && GetWindowRect(hwnd, &mut br).is_ok()
+                    && pt.x >= br.left
+                    && pt.x < br.right
+                    && pt.y >= br.top
+                    && pt.y < br.bottom
+                {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                }
+            }
+            util::WM_MOUSELEAVE => {
+                if let Some(d) = data_of(parent) {
+                    // 收尾高亮轮询（移到父窗口其它区域时会由父窗口的 WM_MOUSEMOVE 重新开启）
+                    d.fx.on_mouse_leave(parent);
+                    d.tip.hide();
+                    d.tip_shown = false;
+                    d.tip_for = 0;
+                }
+                let _ = KillTimer(parent, TIMER_TIP);
+            }
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+                if let Some(d) = data_of(parent) {
+                    d.tip.hide();
+                    d.tip_shown = false;
+                }
+            }
+            // 按钮持有焦点时快捷键同样生效（转发给工具条的统一处理）
+            WM_KEYDOWN => {
+                if handle_shortcut(parent, wp.0) {
+                    return LRESULT(0);
+                }
+            }
+            _ => {}
+        }
+    }
+    util::call_orig(hwnd, msg, wp, lp)
+}
+
 unsafe fn handle_command(hwnd: HWND, id: usize) {
     match id {
+        // 关闭：不执行任何操作，直接收起工具条（与按 Esc 等价）
+        BTN_CLOSE => close_bar(hwnd),
         BTN_PIN => {
             let Some(d) = data_of(hwnd) else { return };
             match pin::create(&d.image) {
@@ -402,35 +581,9 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         BTN_OCR => {
             let Some(d) = data_of(hwnd) else { return };
-            // 不再弹出结果窗口：后台识别 → 直接写剪贴板 → 由主窗口弹 Toast。
-            // 识别必须离开 GUI 线程（WinRT 异步调用不可阻塞消息循环），因此
-            // 用 WM_APP_OCR_DONE 把结果码投递回主窗口展示提示。
-            let image = Arc::clone(&d.image.data);
-            let (w, h) = (d.image.width, d.image.height);
-            // HWND 非 Send：跨线程以地址（isize）传递，线程内还原
-            let main_addr = tray::main_hwnd().0 as isize;
-            std::thread::spawn(move || {
-                let code = match ocr::recognize(&image, w, h) {
-                    Ok(text) if !text.trim().is_empty() => {
-                        if clipboard::copy_text(&text).is_ok() {
-                            tray::OCR_DONE_COPIED
-                        } else {
-                            tray::OCR_DONE_FAIL
-                        }
-                    }
-                    Ok(_) => tray::OCR_DONE_EMPTY,
-                    Err(e) => {
-                        crate::diag::log(&format!("[ocr] 工具条识别失败: {e}"));
-                        tray::OCR_DONE_FAIL
-                    }
-                };
-                if main_addr != 0 {
-                    unsafe {
-                        let main = HWND(main_addr as *mut core::ffi::c_void);
-                        let _ = PostMessageW(main, tray::WM_APP_OCR_DONE, WPARAM(code), LPARAM(0));
-                    }
-                }
-            });
+            // 后台识别 → 直接写剪贴板 → 由主窗口弹 Toast（不弹结果窗口）。
+            // 与贴图右键菜单的「识别文字 (OCR)」共用 ocr::recognize_to_clipboard_async。
+            ocr::recognize_to_clipboard_async(Arc::clone(&d.image.data), d.image.width, d.image.height);
             close_bar(hwnd);
         }
         _ => {}

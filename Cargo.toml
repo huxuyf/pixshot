@@ -9,6 +9,8 @@ description = "PixPin 风格的 Windows 桌面工具：框选截图 / 贴图置�
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    # 工具条图标用 GDI+ 抗锯齿描边（纯 GDI 画斜线/圆弧会有锯齿）
+    "Win32_Graphics_GdiPlus",
     "Win32_Graphics_Imaging",
     "Win32_Storage_FileSystem",
     "Win32_UI_WindowsAndMessaging",

@@ -2,7 +2,8 @@
 PixShot GUI 端到端自动化测试
 ============================
 在真实桌面上自动化跑通完整流程：
-  框选截图 → 贴图置顶（位置/置顶/拖动/滚轮缩放验证）→ 右键菜单 OCR → 识别结果查看/复制。
+  框选截图 → 工具条（悬停提示 + 快捷键 Ctrl+C / Ctrl+T）→ 贴图置顶
+  （位置/置顶/拖动/滚轮缩放验证）→ 右键菜单 OCR（文字进剪贴板，与工具条一致）。
 
 前置条件：
   - 已执行 cargo build（默认使用 target\debug\pixshot.exe）
@@ -186,6 +187,31 @@ function Press-Key([byte]$Vk) {
     [Win32]::keybd_event($Vk, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 40
     [Win32]::keybd_event($Vk, 0, 2, [UIntPtr]::Zero); Start-Sleep -Milliseconds 90
 }
+# Ctrl+<键>（工具条快捷键必须用**真实** Ctrl 状态，程序侧读 GetKeyState）
+function Press-Ctrl([byte]$Vk) {
+    [Win32]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 40   # Ctrl down
+    [Win32]::keybd_event($Vk, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 50
+    [Win32]::keybd_event($Vk, 0, 2, [UIntPtr]::Zero); Start-Sleep -Milliseconds 40
+    [Win32]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero); Start-Sleep -Milliseconds 150  # Ctrl up
+}
+function Wait-WindowGone([string]$Class, [int]$TimeoutMs = 4000) {
+    $deadline = [Environment]::TickCount + $TimeoutMs
+    while ([Environment]::TickCount -lt $deadline) {
+        if ([Win32]::FindWindowClass($Class, [IntPtr]::Zero) -eq [IntPtr]::Zero) { return $true }
+        Start-Sleep -Milliseconds 80
+    }
+    ([Win32]::FindWindowClass($Class, [IntPtr]::Zero) -eq [IntPtr]::Zero)
+}
+# 触发一次全新截图：F1 → 框选 (SelX,SelY,SelW,SelH) → 返回工具条句柄
+function Invoke-Capture {
+    Press-Key 0x70
+    Start-Sleep -Milliseconds 600
+    $o = Wait-Window 'PixShotOverlay' 12000
+    if ($o -eq [IntPtr]::Zero) { return [IntPtr]::Zero }
+    Start-Sleep -Milliseconds 500
+    Drag-Mouse $SelX $SelY ($SelX + $SelW) ($SelY + $SelH)
+    return (Wait-Window 'PixShotToolbar' 6000)
+}
 function Find-ChildById([IntPtr]$Parent, [int]$Id) {
     $c = [Win32]::GetWindow($Parent, 5)          # GW_CHILD
     while ($c -ne [IntPtr]::Zero) {
@@ -294,10 +320,44 @@ try {
     if ($tb -eq [IntPtr]::Zero) { throw '工具栏未出现（框选可能失败）' }
     $btnPin = Find-ChildById $tb 1
     if ($btnPin -eq [IntPtr]::Zero) { throw '工具栏上未找到「贴图」按钮' }
-    $br = Get-Rect $btnPin
-    $bx = [int](($br.L + $br.R) / 2); $by = [int](($br.T + $br.B) / 2)
-    Write-Host ("  [操作] 点击「贴图」按钮 @ ({0},{1})" -f $bx, $by)
-    Click-At $bx $by
+
+    # ── 3.1 悬停提示（真实光标）：移到「保存」图标上，延时后应弹出 PixShotTip 气泡 ──
+    # 气泡是自绘窗口（非 comctl32），文案同步为窗口标题；它随工具条一同创建（初始隐藏），
+    # 故这里必须校验 IsWindowVisible，不能只按类名查找。
+    $btnSaveT = Find-ChildById $tb 3
+    if ($btnSaveT -ne [IntPtr]::Zero) {
+        $sr = Get-Rect $btnSaveT
+        $sx = [int](($sr.L + $sr.R) / 2); $sy = [int](($sr.T + $sr.B) / 2)
+        [void][Win32]::SetCursorPos($sx, $sy); Start-Sleep -Milliseconds 250
+        [void][Win32]::SetCursorPos($sx + 1, $sy)   # 再动一下，确保按钮收到 WM_MOUSEMOVE
+        $tipH = [IntPtr]::Zero
+        $tipDeadline = [Environment]::TickCount + 2500
+        while ([Environment]::TickCount -lt $tipDeadline) {
+            $h = [Win32]::FindWindowClass('PixShotTip', [IntPtr]::Zero)
+            if ($h -ne [IntPtr]::Zero -and [Win32]::IsWindowVisible($h)) { $tipH = $h; break }
+            Start-Sleep -Milliseconds 50
+        }
+        $tipText = if ($tipH -ne [IntPtr]::Zero) { Get-Text $tipH } else { '' }
+        # 气泡文案 = 说明文字 + 快捷键（Ctrl+S 见 src/toolbar.rs 的 SHORTCUTS）
+        Check '悬停图标弹出提示气泡（真实光标 + 文案含快捷键）' `
+            ($tipH -ne [IntPtr]::Zero -and $tipText -eq '保存图像  Ctrl+S') ("PixShotTip 文本='{0}'" -f $tipText)
+    }
+
+    # ── 3.2 快捷键 Ctrl+C = 复制并关闭：写剪贴板 CF_DIB 并收起工具条 ──
+    Write-Host '  [操作] 按 Ctrl+C（工具条快捷键：复制并关闭）'
+    Press-Ctrl 0x43
+    Start-Sleep -Milliseconds 700
+    Check '快捷键 Ctrl+C 复制图像到剪贴板（CF_DIB）' (Test-ClipDib)
+    Check '快捷键 Ctrl+C 后工具条自动关闭' (Wait-WindowGone 'PixShotToolbar' 4000)
+
+    # ── 3.3 快捷键 Ctrl+T = 贴图：创建贴图窗口并收起工具条 ──
+    $tb2 = Invoke-Capture
+    Check '再次框选 -> 工具条弹出' ($tb2 -ne [IntPtr]::Zero)
+    if ($tb2 -eq [IntPtr]::Zero) { throw '第二次框选未出现工具条' }
+    Write-Host '  [操作] 按 Ctrl+T（工具条快捷键：贴图）'
+    Press-Ctrl 0x54
+    Start-Sleep -Milliseconds 700
+    Check '快捷键 Ctrl+T 后工具条自动关闭' (Wait-WindowGone 'PixShotToolbar' 4000)
 
     # ── 4. 贴图窗口：位置 / 尺寸 / 置顶 ──
     $pin = Wait-Window 'PixShotPin' 6000
@@ -333,83 +393,42 @@ try {
     $gh = ($r2.B - $r2.T) - ($r1.B - $r1.T)
     Check '滚轮缩放贴图（两次放大）' (($gw -gt [int]($SelW * 0.15)) -and ($gh -gt [int]($SelH * 0.15))) ("尺寸 +${gw}x+${gh}px")
 
-    # ── 7. 右键菜单 → 「识别文字 (OCR)」 ──
-    # 菜单已统一为自绘窗口 PixShotMenu（类名 #32768 的系统菜单不再出现），
-    # 且它只处理 Esc、不处理方向键/回车 —— 必须用鼠标点击菜单项。
+    # ── 7. 右键菜单 → 「识别文字 (OCR)」：与工具条 OCR **行为完全一致** ──
+    # 即：后台识别 → 文字写入剪贴板 → 主窗口 Toast；**不再弹出 OCR 结果窗口**。
+    # 菜单是自绘窗口 PixShotMenu，只处理 Esc，必须用鼠标点击菜单项。
     # 贴图菜单第 3 项（0 基索引 2）即「识别文字 (OCR)」。
-    $ocrw = [IntPtr]::Zero
+    $clipBefore = Get-ClipText
     $menuOk = $false
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
         $menuOk = Select-PinMenuItem $pin 2
-        if (-not $menuOk) {
-            Write-Host ("  [重试] 第 {0} 次未等到贴图右键菜单弹出" -f $attempt)
-            Start-Sleep -Milliseconds 400
-            continue
-        }
-        $ocrw = Wait-Window 'PixShotOcrResult' 3000
-        if ($ocrw -ne [IntPtr]::Zero) { break }
-        Write-Host ("  [重试] 第 {0} 次点击「识别文字 (OCR)」未弹出结果窗口" -f $attempt)
+        if ($menuOk) { break }
+        Write-Host ("  [重试] 第 {0} 次未等到贴图右键菜单弹出" -f $attempt)
         Start-Sleep -Milliseconds 400
     }
-    $menuDetail = if ($menuOk) { '自绘菜单已弹出，已点击第 3 项' } else { '右键菜单未弹出' }
-    Check '右键菜单选择「识别文字 (OCR)」' ($ocrw -ne [IntPtr]::Zero) $menuDetail
-    if ($ocrw -eq [IntPtr]::Zero) { throw 'OCR 结果窗口未出现' }
+    Check '右键菜单选择「识别文字 (OCR)」' $menuOk '自绘菜单已弹出，已点击第 3 项'
 
-    # ── 8. 等待识别完成，读取结果文本 ──
-    $title = ''
+    # ── 8. 等待识别完成：文字进入剪贴板（CF_UNICODETEXT）──
+    $ocrText = ''
     $deadline = [Environment]::TickCount + 25000
     while ([Environment]::TickCount -lt $deadline) {
-        $title = Get-Text $ocrw
-        if ($title -match '识别结果' -or $title -match '识别失败') { break }
+        $t = Get-ClipText
+        if ($t.Trim().Length -gt 0 -and $t -ne $clipBefore) { $ocrText = $t; break }
         Start-Sleep -Milliseconds 250
     }
-    Check 'OCR 后台识别完成' ($title -match '识别结果') $title
-    $edit = [Win32]::FindChildClass($ocrw, [IntPtr]::Zero, 'EDIT', [IntPtr]::Zero)
-    $text = ''
-    if ($edit -ne [IntPtr]::Zero) { $text = Get-ControlText $edit }
-    Check '识别文本可在结果窗口查看' ($text.Trim().Length -gt 0) "共 $($text.Length) 字符"
-    if ($text) {
-        $prev = if ($text.Length -gt 200) { $text.Substring(0, 200) + '...' } else { $text }
+    Check '右键菜单 OCR 把文字写入剪贴板（与工具条一致）' ($ocrText.Trim().Length -gt 0) ("共 $($ocrText.Length) 字符")
+    Check '右键菜单 OCR 不再弹出结果窗口' ((Wait-Window 'PixShotOcrResult' 800) -eq [IntPtr]::Zero)
+    if ($ocrText) {
+        $prev = if ($ocrText.Length -gt 200) { $ocrText.Substring(0, 200) + '...' } else { $ocrText }
         $oneline = ($prev -replace "[\r\n]+", " | ")
         Write-Host ("  [OCR 文本预览] {0}" -f $oneline)
     }
 
-    # ── 9. 「复制文本」→ 验证剪贴板 ──
-    # 贴图是置顶窗口，先把它移到屏幕右侧、结果窗口移到左侧，避免互相遮挡按钮。
-    # 关键：OCR 结果窗口必须一并置顶（HWND_TOPMOST）。它本身是普通顶层窗口，
-    # 若只移动不改 Z 序（SWP_NOZORDER），会被最大化的编辑器盖住 ——
-    # 此时 GetWindowRect / 找子控件仍能成功，但注入的点击会落到下面那个窗口上，
-    # 表现为「点得到按钮却没有复制」（实测踩过）。
-    $SWP_TOP = 0x0001 -bor 0x0010               # NOSIZE | NOACTIVATE
-    $HWND_TOPMOST = [IntPtr](-1)
-    [void][Win32]::SetWindowPos($pin, $HWND_TOPMOST, 1150, 100, 0, 0, $SWP_TOP)
-    [void][Win32]::SetWindowPos($ocrw, $HWND_TOPMOST, 60, 80, 0, 0, $SWP_TOP)
-    Start-Sleep -Milliseconds 350
-    $pr = Get-Rect $pin
-    $orr = Get-Rect $ocrw
-    Write-Host ("  [调试] pin alive={0} rect=({1},{2})-({3},{4})" -f [Win32]::IsWindow($pin), $pr.L, $pr.T, $pr.R, $pr.B)
-    Write-Host ("  [调试] ocr alive={0} rect=({1},{2})-({3},{4})" -f [Win32]::IsWindow($ocrw), $orr.L, $orr.T, $orr.R, $orr.B)
-    $btnCopy = Find-ChildById $ocrw 100          # ID_COPY = 100
-    Check '结果窗口含「复制文本」按钮' ($btnCopy -ne [IntPtr]::Zero)
-    if ($btnCopy -ne [IntPtr]::Zero) {
-        $cr = Get-Rect $btnCopy
-        $tx = [int](($cr.L + $cr.R) / 2)
-        $ty = [int](($cr.T + $cr.B) / 2)
-        Write-Host ("  [调试] btnCopy rect=({0},{1})-({2},{3}) 点击=({4},{5})" -f $cr.L, $cr.T, $cr.R, $cr.B, $tx, $ty)
-        Click-At $tx $ty
-        # 复制成功的提示已改为非模态 Toast（PixShotToast），不再有 #32770 消息框，
-        # 因此这里不再等待/关闭对话框，直接留出动画时间后校验剪贴板。
-        Start-Sleep -Milliseconds 500
-        Write-Host ("  [调试] 点击后 ocr alive={0} pin alive={1}" -f [Win32]::IsWindow($ocrw), [Win32]::IsWindow($pin))
-        $clipS = Get-ClipText
-        Check '识别结果可复制到剪贴板' ($clipS.Trim() -eq $text.Trim()) `
-            ("剪贴板 $($clipS.Length) 字符 / 窗口 $($text.Length) 字符")
-    }
-
-    # ── 10. 贴图菜单「复制图像」→ 验证剪贴板位图（截图复制功能）──
+    # ── 9. 贴图菜单「复制图像」→ 验证剪贴板位图（截图复制功能）──
     # 第 1 项（0 基索引 0）即「复制图像」；同样走自绘菜单 + 鼠标点击。
     # 先把贴图重新提到 TOPMOST 层顶部：环境里可能有其他置顶浮窗（如取色器）
     # 恰好压在贴图中心，右键会被它吃掉，导致菜单弹不出来。
+    $SWP_TOP = 0x0001 -bor 0x0010               # NOSIZE | NOACTIVATE
+    $HWND_TOPMOST = [IntPtr](-1)
     [void][Win32]::SetWindowPos($pin, $HWND_TOPMOST, 1150, 100, 0, 0, $SWP_TOP)
     Start-Sleep -Milliseconds 250
     $clicked = Select-PinMenuItem $pin 0
@@ -421,7 +440,7 @@ try {
         Check '截图可复制到剪贴板（CF_DIB 位图）' $false '右键菜单未打开'
     }
 
-    # ── 11. 最终存档：全屏（贴图 + OCR 结果同屏）──
+    # ── 10. 最终存档：全屏（贴图 + 剪贴板 OCR 结果）──
     Shot 0 0 $sw $sh (Join-Path $art 'final_state.png')
 } finally {
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }

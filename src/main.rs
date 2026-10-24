@@ -8,7 +8,7 @@
 //! - `tray`    托盘图标 / 全局热键 / 单实例 / 主窗口消息过程
 //! - `toolbar` 截图操作工具栏
 //! - `overlay` 框选遮罩（唯一一次全屏捕获）
-//! - `pin` / `results` / `menu` / `toast`  UI 窗口与自绘控件
+//! - `pin` / `menu` / `toast`  UI 窗口与自绘控件
 //! - `capture` / `imageio` / `clipboard` / `ocr` 能力层
 //! - `theme` / `util`  视觉与 Win32 辅助
 //! - `config` / `diag` / `error`  配置、诊断、错误类型
@@ -22,15 +22,16 @@ mod clipboard;
 mod config;
 mod diag;
 mod error;
+mod icons;
 mod imageio;
 mod menu;
 mod ocr;
 mod overlay;
 mod pin;
-mod results;
 mod theme;
 mod toast;
 mod toolbar;
+mod tooltip;
 mod tray;
 mod util;
 
