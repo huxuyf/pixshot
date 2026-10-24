@@ -1,0 +1,23 @@
+# 构建产物
+/target
+Cargo.lock.bak
+
+# 运行/测试产物：每次执行都会重新生成，不入库（需要留档时手动放进 artifacts/）
+/artifacts/
+/e2e_artifacts/
+/pixshot_smoke.png
+/pixshot_diag.log
+/ci_run.log
+
+# 编辑器与系统杂项
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# 工具数据与临时交付物
+# 注意：.workbuddy/ 是项目数据目录（会话记录与记忆），不是缓存——
+#      这里只做「不入库」，绝不删除。
+.workbuddy/
+/outputs/
