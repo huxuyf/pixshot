@@ -1,4 +1,4 @@
-//! 配置：`%APPDATA%\PixShot\config.ini`（`key = value` 纯文本，零依赖）。
+//! 配置：`config.ini`（与 pixshot.exe 同目录，`key = value` 纯文本，零依赖）。
 //!
 //! 设计约束：
 //! - 手写解析，不引第三方 TOML/YAML 库（保持"零额外依赖"路线）；
@@ -86,17 +86,13 @@ impl Config {
 
 static CACHE: Mutex<Option<Config>> = Mutex::new(None);
 
-/// 配置文件路径：`%APPDATA%\PixShot\config.ini`；无 APPDATA 时回退 exe 同目录。
+/// 配置文件路径：与 pixshot.exe 同目录的 `config.ini`；
+/// 取不到 exe 路径时（极少见）回退当前工作目录。
 pub fn path() -> PathBuf {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        if !appdata.is_empty() {
-            return PathBuf::from(appdata).join("PixShot").join("config.ini");
-        }
-    }
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("pixshot.ini")))
-        .unwrap_or_else(|| PathBuf::from("pixshot.ini"))
+        .and_then(|p| p.parent().map(|d| d.join("config.ini")))
+        .unwrap_or_else(|| PathBuf::from("config.ini"))
 }
 
 /// 取当前配置（首次调用时加载并缓存）。
