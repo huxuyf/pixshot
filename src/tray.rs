@@ -478,7 +478,7 @@ pub unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     }
 }
 
-/// 托盘右键菜单（仅「退出」）。`(x,y)` 为回调携带的屏幕坐标。
+/// 托盘右键菜单：「开机启动」（可勾选）与「退出」。`(x,y)` 为回调携带的屏幕坐标。
 ///
 /// 使用自绘 Fluent 弹窗而非系统 `TrackPopupMenuEx`：后者要求宿主窗口能成为
 /// 前台窗口，而托盘宿主是隐藏窗口，实测会**立即返回 0 且不显示菜单**。
@@ -488,14 +488,37 @@ unsafe fn tray_menu(hwnd: HWND, x: i32, y: i32) {
         diag::log("[tray] 菜单已在显示，忽略重复回调");
         return;
     }
-    let quit = menu::show_quit(x, y);
+    // 勾选状态以注册表为准（外部也可能改动自启项，不能只信内存）
+    let autostart_on = crate::autostart::is_enabled();
+    let autostart_label = if autostart_on { "√ 开机启动" } else { "开机启动" };
+    let items = [
+        menu::Item::new(autostart_label),
+        menu::Item::sep("退出"),
+    ];
+    let choice = menu::show(x, y, &items);
     TRAY_MENU_BUSY.store(false, Ordering::SeqCst);
-    diag::log(&format!("[tray] 自绘菜单返回 quit={quit}"));
-    if quit {
+    diag::log(&format!("[tray] 自绘菜单返回 choice={choice:?}"));
+
+    match choice {
+        // 切换开机自启（点击项后菜单关闭，不退出程序）
+        Some(0) => {
+            let target = !autostart_on;
+            match crate::autostart::set_enabled(target) {
+                Ok(()) => crate::toast::show(if target {
+                    "已启用开机启动"
+                } else {
+                    "已关闭开机启动"
+                }),
+                Err(e) => util::error_msgbox(&format!("设置开机启动失败：{e}")),
+            }
+        }
         // 完全退出：置退出标志（截图流程进行中时向外层传播）并结束主循环
-        util::request_quit();
-        // 先清掉托盘图标，避免进程退出后留下"幽灵图标"
-        remove_tray_icon(hwnd);
-        PostQuitMessage(0);
+        Some(1) => {
+            util::request_quit();
+            // 先清掉托盘图标，避免进程退出后留下"幽灵图标"
+            remove_tray_icon(hwnd);
+            PostQuitMessage(0);
+        }
+        _ => {}
     }
 }

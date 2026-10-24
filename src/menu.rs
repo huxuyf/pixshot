@@ -81,11 +81,6 @@ pub fn show(x: i32, y: i32, items: &[Item]) -> Option<usize> {
     unsafe { show_impl(x, y, items) }
 }
 
-/// 托盘「退出」菜单的兼容封装。
-pub fn show_quit(x: i32, y: i32) -> bool {
-    show(x, y, &[Item::new("退出")]) == Some(0)
-}
-
 unsafe fn show_impl(x: i32, y: i32, items: &[Item]) -> Option<usize> {
     register_class_w(CLASS, menu_proc, false, true, false);
 

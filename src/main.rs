@@ -12,9 +12,11 @@
 //! - `capture` / `imageio` / `clipboard` / `ocr` 能力层
 //! - `theme` / `util`  视觉与 Win32 辅助
 //! - `config` / `diag` / `error`  配置、诊断、错误类型
+//! - `autostart`  开机自启（写入 HKCU 的 Run 注册表项）
 
 #![windows_subsystem = "windows"]
 
+mod autostart;
 mod capture;
 mod clipboard;
 mod config;
