@@ -265,6 +265,15 @@ fn modifiers_match(mods: u32) -> bool {
     has_ctrl == want_ctrl && has_alt == want_alt && has_shift == want_shift && has_win == want_win
 }
 
+/// 是否放行「注入按键」（`keybd_event` / `SendInput` 产生的按键）。
+///
+/// 默认 **拒绝**：避免自动化工具（键盘宏、其他测试脚本）误触发截图。
+/// 但 E2E 只能通过注入按键模拟 F1，且当环境里 F1 已被其他程序占用时
+/// （`RegisterHotKey` 返回 1409）必然走钩子兜底路径——此时若继续拒绝注入，
+/// 该路径就无法被自动化验证。故提供 `PIXSHOT_ALLOW_INJECTED=1` 显式放开，
+/// 仅用于测试，不影响默认行为。
+static ALLOW_INJECTED: AtomicBool = AtomicBool::new(false);
+
 /// WH_KEYBOARD_LL 回调：捕获物理按键并投递 WM_HOTKEY（与 RegisterHotKey
 /// 共用同一条已充分验证的触发链路）。低级键盘钩子不占用热键槽位，
 /// 因此目标热键被其他程序占用时依然可用。
@@ -274,8 +283,9 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
         let kb = &*(lp.0 as *const KBDLLHOOKSTRUCT);
         let is_down = wp.0 == WM_KEYDOWN as usize || wp.0 == WM_SYSKEYDOWN as usize;
         let injected = (kb.flags.0 & LLKHF_INJECTED) != 0;
+        let allow_injected = ALLOW_INJECTED.load(Ordering::Relaxed);
         let want_vk = HOOK_VK.load(Ordering::Relaxed);
-        if is_down && !injected && want_vk != 0 && kb.vkCode == want_vk {
+        if is_down && (allow_injected || !injected) && want_vk != 0 && kb.vkCode == want_vk {
             if modifiers_match(HOOK_MODS.load(Ordering::Relaxed)) {
                 let p = HOOK_HWND.load(Ordering::Relaxed);
                 if p != 0 {
@@ -296,6 +306,11 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
 /// 安装低级键盘钩子作为热键兜底。返回是否成功。
 fn install_keyboard_hook(hwnd: HWND, mods: u32, vk: u32) -> bool {
     unsafe {
+        // 仅测试用：显式设置该环境变量时，注入按键也能触发（见 ALLOW_INJECTED 注释）
+        ALLOW_INJECTED.store(
+            std::env::var_os("PIXSHOT_ALLOW_INJECTED").is_some(),
+            Ordering::SeqCst,
+        );
         HOOK_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
         HOOK_VK.store(vk, Ordering::SeqCst);
         HOOK_MODS.store(mods, Ordering::SeqCst);

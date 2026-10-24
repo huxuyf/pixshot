@@ -28,6 +28,10 @@ param(
 )
 
 $env:PIXSHOT_NO_UI_ALERTS = '1'   # 沙箱下托盘注册必失败，屏蔽启动提示框以保证测试确定性
+# 本脚本用 keybd_event 注入 F1 来触发全局热键，注入按键带 LLKHF_INJECTED 标志。
+# 程序默认忽略注入按键（防止键盘宏误触发）；且当环境里 F1 已被别的程序占用时
+# （RegisterHotKey 返回 1409）只能走低级钩子兜底路径，该路径必须放行注入才能被测试。
+$env:PIXSHOT_ALLOW_INJECTED = '1'
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path $Exe)) { throw "找不到 $Exe，请先执行 cargo build" }
 $art = Join-Path $PSScriptRoot '..\e2e_artifacts'
@@ -48,8 +52,21 @@ public class Win32 {
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte sc, uint f, UIntPtr e);
+    // 注意：绝对不要把 $null 直接传给「标题」参数！
+    // PowerShell 会把 $null 自动转成空字符串 ""，而 FindWindowW 对 "" 的语义是
+    // 「标题必须为空字符串」，不是「任意标题」—— 实测结果是按类名查找永远返回 0。
+    // 需要「只按类名 / 不限定标题」时，用下面 FindWindowClass / FindChildClass
+    // 这两个 IntPtr 重载，显式传 [IntPtr]::Zero。
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string c, string t);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "FindWindowW")] public static extern IntPtr FindWindowClass(string c, IntPtr t);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr p, IntPtr a, string c, string t);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "FindWindowExW")] public static extern IntPtr FindChildClass(IntPtr p, IntPtr a, string c, IntPtr t);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
+    // 跨进程读取控件文本要用 SendMessage(WM_GETTEXT)，GetWindowTextW 只能读窗口标题缓存。
+    // 注意：这个声明此前一直缺失（脚本从未执行到 Get-ControlText 这一步），首次跑到才暴露。
+    [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr h);
@@ -71,6 +88,7 @@ public class Win32 {
 function Get-ClipText {
     for ($i = 0; $i -lt 10; $i++) {
         if ([Win32]::OpenClipboard([IntPtr]::Zero)) {
+            $h = [IntPtr]::Zero          # 预置，供 finally 安全引用
             try {
                 if (-not [Win32]::IsClipboardFormatAvailable(13)) { return '' }
                 $h = [Win32]::GetClipboardData(13)
@@ -79,7 +97,9 @@ function Get-ClipText {
                 if ($p -eq [IntPtr]::Zero) { return '' }
                 $len = 0
                 while ($len -lt 200000 -and [Runtime.InteropServices.Marshal]::ReadInt16($p, $len * 2) -ne 0) { $len++ }
-                [Runtime.InteropServices.Marshal]::PtrToStringUni($p, $len)
+                # 必须 return：否则本行只作为管道输出，for 会继续跑满 10 轮，
+                # 函数最终返回「10 份文本 + 末尾空串」的数组（表现为 Length=11 的假值）。
+                return [Runtime.InteropServices.Marshal]::PtrToStringUni($p, $len)
             } finally {
                 [void][Win32]::GlobalUnlock($h)
                 [void][Win32]::CloseClipboard()
@@ -113,7 +133,8 @@ if (($SelX + $SelW) -ge $sw -or ($SelY + $SelH) -ge $sh) { throw "选区超出�
 function Wait-Window([string]$Class, [int]$TimeoutMs = 5000) {
     $deadline = [Environment]::TickCount + $TimeoutMs
     while ($true) {
-        $h = [Win32]::FindWindowW($Class, $null)
+        # 只按类名匹配：标题参数显式传 0（不能传 $null，见 P/Invoke 声明处注释）
+        $h = [Win32]::FindWindowClass($Class, [IntPtr]::Zero)
         if ($h -ne [IntPtr]::Zero) { return $h }
         if ([Environment]::TickCount -ge $deadline) { return [IntPtr]::Zero }
         Start-Sleep -Milliseconds 80
@@ -173,6 +194,48 @@ function Find-ChildById([IntPtr]$Parent, [int]$Id) {
     }
     [IntPtr]::Zero
 }
+# ─── 自绘菜单（PixShotMenu）的项定位 ───────────────────────────
+# 菜单是纯自绘窗口（无子控件、无菜单文本可读），只能按几何位置点击。
+# 以下常量必须与 src/menu.rs 的 measure()/hit_test() 保持一致：
+#   pad = scaled(6)、item_h = scaled(34)、sep_h = scaled(9)（均为逻辑像素 × dpi/96）
+# 贴图菜单项顺序（src/pin.rs）：
+#   0 复制图像 / 1 保存为 <格式>… / 2 识别文字 (OCR) / 3[分隔线] 重置缩放 / 4[分隔线] 关闭贴图
+function Get-MenuItemCenter([IntPtr]$Menu, [int]$Index) {
+    $d = [math]::Max([int][Win32]::GetDpiForWindow($Menu), [int]$dpi)
+    $s = $d / 96.0
+    $pad = 6; $itemH = 34; $sep = 9
+    $sepBefore = @(3, 4)             # 0 基索引：第 4、5 项前有分隔线
+    $top = $pad
+    $centerY = $top
+    for ($i = 0; $i -le $Index; $i++) {
+        if ($i -gt 0 -and ($sepBefore -contains $i)) { $top += $sep }
+        if ($i -eq $Index) { $centerY = $top + [int]($itemH / 2); break }
+        $top += $itemH
+    }
+    $r = Get-Rect $Menu
+    @(
+        [int](($r.L + $r.R) / 2),
+        [int]($r.T + [math]::Round($centerY * $s))
+    )
+}
+# 点开贴图右键菜单并点击指定项；返回是否成功点中
+function Select-PinMenuItem([IntPtr]$Pin, [int]$Index) {
+    $c = Get-Center $Pin
+    $alive = [Win32]::IsWindow($Pin)
+    Write-Host ("  [调试] 右键贴图 center=({0},{1}) pin alive={2}" -f $c[0], $c[1], $alive)
+    if (-not $alive) { return $false }
+    RightClick-At $c[0] $c[1]
+    $menu = Wait-Window 'PixShotMenu' 2500
+    Write-Host ("  [调试] PixShotMenu 句柄=0x{0:X}" -f [int64]$menu)
+    if ($menu -eq [IntPtr]::Zero) { return $false }
+    Start-Sleep -Milliseconds 180
+    $pt = Get-MenuItemCenter $menu $Index
+    Write-Host ("  [调试] 菜单项 #{0} 点击=({1},{2})" -f $Index, $pt[0], $pt[1])
+    Click-At $pt[0] $pt[1]
+    Start-Sleep -Milliseconds 250
+    return $true
+}
+
 function Shot([int]$X, [int]$Y, [int]$W, [int]$H, [string]$File) {
     $bmp = New-Object System.Drawing.Bitmap($W, $H)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -183,8 +246,19 @@ function Shot([int]$X, [int]$Y, [int]$W, [int]$H, [string]$File) {
 
 $script:Pass = 0; $script:Fail = 0
 function Check([string]$Name, $Ok, [string]$Detail = '') {
-    if ($Ok) { $script:Pass++ } else { $script:Fail++ }
-    Write-Host ("  [{0}] {1}{2}" -f $(if ($Ok) { 'PASS' } else { 'FAIL' }), $Name, $(if ($Detail) { " -- $Detail" } else { '' }))
+    # 严格布尔判定。原因（实测踩过）：PowerShell 的 -eq 作用于「集合」时返回的是
+    # 筛选结果（数组）而不是布尔值，而非空数组在 if 中恒为真 —— 于是出现过
+    # 「剪贴板 11 字符 / 窗口 212 字符」却判 PASS 的自相矛盾记录。
+    # 这里只接受真正的 [bool]，其他类型一律记失败并告警，绝不静默放行。
+    $isOk = $false
+    if ($Ok -is [bool]) {
+        $isOk = $Ok
+    } else {
+        $t = if ($null -eq $Ok) { 'null' } else { $Ok.GetType().Name }
+        Write-Host ("  [断言告警]「{0}」的判定值不是布尔（实际 {1}），已按失败处理" -f $Name, $t) -ForegroundColor Yellow
+    }
+    if ($isOk) { $script:Pass++ } else { $script:Fail++ }
+    Write-Host ("  [{0}] {1}{2}" -f $(if ($isOk) { 'PASS' } else { 'FAIL' }), $Name, $(if ($Detail) { " -- $Detail" } else { '' }))
 }
 
 Write-Host ''
@@ -198,7 +272,7 @@ try {
     $proc = Start-Process -FilePath $Exe -PassThru
     $mainH = Wait-Window 'PixShotMain' 10000
     Start-Sleep -Milliseconds 800
-    $noOv = ([Win32]::FindWindowW('PixShotOverlay', $null)) -eq [IntPtr]::Zero
+    $noOv = ([Win32]::FindWindowClass('PixShotOverlay', [IntPtr]::Zero)) -eq [IntPtr]::Zero
     Check '启动后常驻托盘（无遮罩弹出）' $noOv
     if ($mainH -eq [IntPtr]::Zero) { throw '主窗口（托盘宿主）未创建' }
     Press-Key 0x70    # F1 全局热键（物理按键注入）
@@ -255,28 +329,25 @@ try {
     Check '滚轮缩放贴图（两次放大）' (($gw -gt [int]($SelW * 0.15)) -and ($gh -gt [int]($SelH * 0.15))) ("尺寸 +${gw}x+${gh}px")
 
     # ── 7. 右键菜单 → 「识别文字 (OCR)」 ──
-    # 键盘导航方案：正常情况（打开时无预选）↓×3 命中第 3 项；
-    # 若系统预选了第 1 项则 ↓×3 会落在「重置缩放」（无害），换 ↓×2 再试。
+    # 菜单已统一为自绘窗口 PixShotMenu（类名 #32768 的系统菜单不再出现），
+    # 且它只处理 Esc、不处理方向键/回车 —— 必须用鼠标点击菜单项。
+    # 贴图菜单第 3 项（0 基索引 2）即「识别文字 (OCR)」。
     $ocrw = [IntPtr]::Zero
-    $downsUsed = 0
-    foreach ($downs in 3, 3, 2) {
-        # 若上一轮菜单仍打开，先 Esc 关闭（仅当菜单确认打开时才按，避免误关贴图）
-        $menu = [Win32]::FindWindowW('#32768', $null)
-        if ($menu -ne [IntPtr]::Zero) { Press-Key 0x1B; Start-Sleep -Milliseconds 300 }
-        $c = Get-Center $pin
-        RightClick-At $c[0] $c[1]
-        Start-Sleep -Milliseconds 450
-        $menu = [Win32]::FindWindowW('#32768', $null)
-        if ($menu -eq [IntPtr]::Zero) { continue }
-        for ($i = 0; $i -lt $downs; $i++) { Press-Key 0x28 }
-        Start-Sleep -Milliseconds 150
-        Press-Key 0x0D
-        $ocrw = Wait-Window 'PixShotOcrResult' 2500
-        $downsUsed = $downs
+    $menuOk = $false
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $menuOk = Select-PinMenuItem $pin 2
+        if (-not $menuOk) {
+            Write-Host ("  [重试] 第 {0} 次未等到贴图右键菜单弹出" -f $attempt)
+            Start-Sleep -Milliseconds 400
+            continue
+        }
+        $ocrw = Wait-Window 'PixShotOcrResult' 3000
         if ($ocrw -ne [IntPtr]::Zero) { break }
-        Write-Host ("  [重试] ↓x$downs 未命中 OCR 项，换下一种键盘导航方案")
+        Write-Host ("  [重试] 第 {0} 次点击「识别文字 (OCR)」未弹出结果窗口" -f $attempt)
+        Start-Sleep -Milliseconds 400
     }
-    Check '右键菜单选择「识别文字 (OCR)」' ($ocrw -ne [IntPtr]::Zero) "命中方案 ↓x$downsUsed"
+    $menuDetail = if ($menuOk) { '自绘菜单已弹出，已点击第 3 项' } else { '右键菜单未弹出' }
+    Check '右键菜单选择「识别文字 (OCR)」' ($ocrw -ne [IntPtr]::Zero) $menuDetail
     if ($ocrw -eq [IntPtr]::Zero) { throw 'OCR 结果窗口未出现' }
 
     # ── 8. 等待识别完成，读取结果文本 ──
@@ -288,7 +359,7 @@ try {
         Start-Sleep -Milliseconds 250
     }
     Check 'OCR 后台识别完成' ($title -match '识别结果') $title
-    $edit = [Win32]::FindWindowExW($ocrw, [IntPtr]::Zero, 'EDIT', $null)
+    $edit = [Win32]::FindChildClass($ocrw, [IntPtr]::Zero, 'EDIT', [IntPtr]::Zero)
     $text = ''
     if ($edit -ne [IntPtr]::Zero) { $text = Get-ControlText $edit }
     Check '识别文本可在结果窗口查看' ($text.Trim().Length -gt 0) "共 $($text.Length) 字符"
@@ -299,47 +370,48 @@ try {
     }
 
     # ── 9. 「复制文本」→ 验证剪贴板 ──
-    # 贴图是置顶窗口，先把它移到屏幕右侧、结果窗口移到左侧，避免遮挡按钮
-    $SWP = 0x0001 -bor 0x0004 -bor 0x0010        # NOSIZE | NOZORDER | NOACTIVATE
-    [void][Win32]::SetWindowPos($pin, [IntPtr]::Zero, 1150, 100, 0, 0, $SWP)
-    [void][Win32]::SetWindowPos($ocrw, [IntPtr]::Zero, 60, 80, 0, 0, $SWP)
+    # 贴图是置顶窗口，先把它移到屏幕右侧、结果窗口移到左侧，避免互相遮挡按钮。
+    # 关键：OCR 结果窗口必须一并置顶（HWND_TOPMOST）。它本身是普通顶层窗口，
+    # 若只移动不改 Z 序（SWP_NOZORDER），会被最大化的编辑器盖住 ——
+    # 此时 GetWindowRect / 找子控件仍能成功，但注入的点击会落到下面那个窗口上，
+    # 表现为「点得到按钮却没有复制」（实测踩过）。
+    $SWP_TOP = 0x0001 -bor 0x0010               # NOSIZE | NOACTIVATE
+    $HWND_TOPMOST = [IntPtr](-1)
+    [void][Win32]::SetWindowPos($pin, $HWND_TOPMOST, 1150, 100, 0, 0, $SWP_TOP)
+    [void][Win32]::SetWindowPos($ocrw, $HWND_TOPMOST, 60, 80, 0, 0, $SWP_TOP)
     Start-Sleep -Milliseconds 350
+    $pr = Get-Rect $pin
+    $orr = Get-Rect $ocrw
+    Write-Host ("  [调试] pin alive={0} rect=({1},{2})-({3},{4})" -f [Win32]::IsWindow($pin), $pr.L, $pr.T, $pr.R, $pr.B)
+    Write-Host ("  [调试] ocr alive={0} rect=({1},{2})-({3},{4})" -f [Win32]::IsWindow($ocrw), $orr.L, $orr.T, $orr.R, $orr.B)
     $btnCopy = Find-ChildById $ocrw 100          # ID_COPY = 100
     Check '结果窗口含「复制文本」按钮' ($btnCopy -ne [IntPtr]::Zero)
     if ($btnCopy -ne [IntPtr]::Zero) {
         $cr = Get-Rect $btnCopy
-        Click-At ([int](($cr.L + $cr.R) / 2)) ([int](($cr.T + $cr.B) / 2))
-        # 等待并关闭「已复制到剪贴板」提示框（标题 PixShot OCR）
-        $box = [IntPtr]::Zero
-        $deadline = [Environment]::TickCount + 4000
-        while ([Environment]::TickCount -lt $deadline) {
-            $box = [Win32]::FindWindowW('#32770', 'PixShot OCR')
-            if ($box -ne [IntPtr]::Zero) { break }
-            Start-Sleep -Milliseconds 120
-        }
-        if ($box -ne [IntPtr]::Zero) { Press-Key 0x0D; Start-Sleep -Milliseconds 350 }
-        Start-Sleep -Milliseconds 400
+        $tx = [int](($cr.L + $cr.R) / 2)
+        $ty = [int](($cr.T + $cr.B) / 2)
+        Write-Host ("  [调试] btnCopy rect=({0},{1})-({2},{3}) 点击=({4},{5})" -f $cr.L, $cr.T, $cr.R, $cr.B, $tx, $ty)
+        Click-At $tx $ty
+        # 复制成功的提示已改为非模态 Toast（PixShotToast），不再有 #32770 消息框，
+        # 因此这里不再等待/关闭对话框，直接留出动画时间后校验剪贴板。
+        Start-Sleep -Milliseconds 500
+        Write-Host ("  [调试] 点击后 ocr alive={0} pin alive={1}" -f [Win32]::IsWindow($ocrw), [Win32]::IsWindow($pin))
         $clipS = Get-ClipText
         Check '识别结果可复制到剪贴板' ($clipS.Trim() -eq $text.Trim()) `
             ("剪贴板 $($clipS.Length) 字符 / 窗口 $($text.Length) 字符")
     }
 
     # ── 10. 贴图菜单「复制图像」→ 验证剪贴板位图（截图复制功能）──
-    # 按第 7 步命中的导航方案推断：↓x3 命中=无预选（复制图像=↓x1）；↓x2 命中=预选第1项（直接回车）
-    $imgDowns = $downsUsed - 2
-    $menu = [Win32]::FindWindowW('#32768', $null)
-    if ($menu -ne [IntPtr]::Zero) { Press-Key 0x1B; Start-Sleep -Milliseconds 300 }
-    $c = Get-Center $pin
-    RightClick-At $c[0] $c[1]
-    Start-Sleep -Milliseconds 450
-    $menu = [Win32]::FindWindowW('#32768', $null)
-    if ($menu -ne [IntPtr]::Zero) {
-        for ($i = 0; $i -lt $imgDowns; $i++) { Press-Key 0x28 }
-        Start-Sleep -Milliseconds 150
-        Press-Key 0x0D
+    # 第 1 项（0 基索引 0）即「复制图像」；同样走自绘菜单 + 鼠标点击。
+    # 先把贴图重新提到 TOPMOST 层顶部：环境里可能有其他置顶浮窗（如取色器）
+    # 恰好压在贴图中心，右键会被它吃掉，导致菜单弹不出来。
+    [void][Win32]::SetWindowPos($pin, $HWND_TOPMOST, 1150, 100, 0, 0, $SWP_TOP)
+    Start-Sleep -Milliseconds 250
+    $clicked = Select-PinMenuItem $pin 0
+    if ($clicked) {
         Start-Sleep -Milliseconds 700
         $imgOk = Test-ClipDib
-        Check '截图可复制到剪贴板（CF_DIB 位图）' $imgOk '剪贴板已含位图数据'
+        Check '截图可复制到剪贴板（CF_DIB 位图）' $imgOk '自绘菜单已弹出，已点击第 1 项「复制图像」'
     } else {
         Check '截图可复制到剪贴板（CF_DIB 位图）' $false '右键菜单未打开'
     }

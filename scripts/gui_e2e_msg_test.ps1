@@ -37,7 +37,9 @@ using System.Text;
 public class W {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string c, string t);
+    // 本脚本一律用 EnumWindows 按 PID + 类名查找窗口，
+    // 不提供 FindWindowW（把 $null 传给它的标题参数会被 PowerShell 转成 ""，
+    // 语义变成「标题必须为空」，是个静默踩坑点）。
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern int GetWindowLongW(IntPtr h, int i);
@@ -154,6 +156,7 @@ function Find-ChildById([IntPtr]$Parent, [int]$Id) {
 function Get-ClipText {
     for ($i = 0; $i -lt 10; $i++) {
         if ([W]::OpenClipboard([IntPtr]::Zero)) {
+            $h = [IntPtr]::Zero          # 预置，供 finally 安全引用
             try {
                 if (-not [W]::IsClipboardFormatAvailable(13)) { return '' }
                 $h = [W]::GetClipboardData(13)
@@ -162,7 +165,8 @@ function Get-ClipText {
                 if ($p -eq [IntPtr]::Zero) { return '' }
                 $len = 0
                 while ($len -lt 200000 -and [Runtime.InteropServices.Marshal]::ReadInt16($p, $len * 2) -ne 0) { $len++ }
-                [Runtime.InteropServices.Marshal]::PtrToStringUni($p, $len)
+                # 必须 return，否则 for 会继续跑满 10 轮，函数返回 11 个元素的数组。
+                return [Runtime.InteropServices.Marshal]::PtrToStringUni($p, $len)
             } finally {
                 [void][W]::GlobalUnlock($h)
                 [void][W]::CloseClipboard()
@@ -185,8 +189,17 @@ function Test-ClipDib {
 
 $script:Pass = 0; $script:Fail = 0
 function Check([string]$Name, $Ok, [string]$Detail = '') {
-    if ($Ok) { $script:Pass++ } else { $script:Fail++ }
-    Write-Host ("  [{0}] {1}{2}" -f $(if ($Ok) { 'PASS' } else { 'FAIL' }), $Name, $(if ($Detail) { " -- $Detail" } else { '' }))
+    # 严格布尔判定（与物理驱动版一致）：PowerShell 的 -eq 作用于集合时返回筛选结果
+    # 而非布尔，非空数组在 if 中恒为真，会造成自相矛盾的 PASS 记录。
+    $isOk = $false
+    if ($Ok -is [bool]) {
+        $isOk = $Ok
+    } else {
+        $t = if ($null -eq $Ok) { 'null' } else { $Ok.GetType().Name }
+        Write-Host ("  [断言告警]「{0}」的判定值不是布尔（实际 {1}），已按失败处理" -f $Name, $t) -ForegroundColor Yellow
+    }
+    if ($isOk) { $script:Pass++ } else { $script:Fail++ }
+    Write-Host ("  [{0}] {1}{2}" -f $(if ($isOk) { 'PASS' } else { 'FAIL' }), $Name, $(if ($Detail) { " -- $Detail" } else { '' }))
 }
 
 Write-Host ''
@@ -279,8 +292,7 @@ try {
     Start-Sleep -Milliseconds 500
     $dibOk = Test-ClipDib
     Check '截图复制到剪贴板（CF_DIB 位图）' $dibOk
-    $errBox = [W]::FindWindowW('#32770', 'PixShot')
-    if ($errBox -ne [IntPtr]::Zero) { [void][W]::PostMessageW($errBox, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero); Start-Sleep -Milliseconds 300 }
+    # 复制提示已改为非模态 Toast（PixShotToast），不再有 #32770 消息框需要关闭。
 
     # ── 5. 发起 OCR（工具栏按钮，后台线程识别）──
     [void][W]::SendMessageW($btnOcr, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
@@ -351,20 +363,10 @@ try {
     $btnCopyText = Find-ChildById $ocrw 100     # ID_COPY = 100
     Check '结果窗口含「复制文本」按钮' ($btnCopyText -ne [IntPtr]::Zero)
     if ($btnCopyText -ne [IntPtr]::Zero) {
-        # 复制成功会弹提示框阻塞应用线程，须 PostMessage 异步点击
+        # 复制提示已改为非模态 Toast，不再弹 #32770 模态框、也无须关闭，
+        # 异步点击后留出写剪贴板的时间即可。
         [void][W]::PostMessageW($btnCopyText, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
-        Start-Sleep -Milliseconds 900
-        $box = [IntPtr]::Zero
-        $deadline = [Environment]::TickCount + 3000
-        while ([Environment]::TickCount -lt $deadline) {
-            $box = [W]::FindWindowW('#32770', 'PixShot OCR')
-            if ($box -ne [IntPtr]::Zero) { break }
-            Start-Sleep -Milliseconds 120
-        }
-        if ($box -ne [IntPtr]::Zero) {
-            [void][W]::PostMessageW($box, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
-            Start-Sleep -Milliseconds 400
-        }
+        Start-Sleep -Milliseconds 700
         $clip = Get-ClipText
         Check '识别结果可复制到剪贴板（内容一致）' ($clip.Trim() -eq $text.Trim()) `
             ("剪贴板 $($clip.Length) 字符 / 窗口 $($text.Length) 字符")

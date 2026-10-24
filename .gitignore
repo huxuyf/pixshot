@@ -20,4 +20,3 @@ desktop.ini
 # 注意：.workbuddy/ 是项目数据目录（会话记录与记忆），不是缓存——
 #      这里只做「不入库」，绝不删除。
 .workbuddy/
-/outputs/
