@@ -114,7 +114,7 @@ pub fn save_with_dialog(
     fmt: SaveFormat,
     default_dir: Option<&str>,
 ) -> Result<Option<String>> {
-    let default_name = default_file_name(fmt);
+    let default_name = default_file_name(fmt, default_dir);
 
     let mut file_buf = [0u16; 260];
     for (i, c) in default_name.encode_utf16().take(259).enumerate() {
@@ -174,19 +174,39 @@ pub fn save_with_dialog(
     Ok(Some(path))
 }
 
-/// 默认文件名：截图_YYYYMMDD_HHMMSS.<ext>（本地时间，Win32 GetLocalTime，零依赖）。
-fn default_file_name(fmt: SaveFormat) -> String {
+/// 默认文件名：`截图_YYYYMMDD_NN.<ext>`（本地时间，Win32 GetLocalTime，零依赖）。
+///
+/// `dir` 为上次保存目录：在其中扫描当日已存的序列，取最大编号 +1，使当日截图
+/// 依次累加（`01`..`99`，满 99 后固定为 `99`，由文件覆盖提示兜底）。
+fn default_file_name(fmt: SaveFormat, dir: Option<&str>) -> String {
     let st = unsafe { GetLocalTime() };
-    format!(
-        "截图_{:04}{:02}{:02}_{:02}{:02}{:02}.{}",
-        st.wYear,
-        st.wMonth,
-        st.wDay,
-        st.wHour,
-        st.wMinute,
-        st.wSecond,
-        fmt.ext()
-    )
+    let ymd = format!("{:04}{:02}{:02}", st.wYear, st.wMonth, st.wDay);
+    let seq = next_seq(dir, &ymd);
+    format!("截图_{ymd}_{seq:02}.{}", fmt.ext())
+}
+
+/// 扫描 `dir` 下形如 `截图_<ymd>_NN.*` 的文件，返回下一个可用编号（1..=99）。
+/// `dir` 为空或不可读时按首个（1）处理。
+fn next_seq(dir: Option<&str>, ymd: &str) -> u32 {
+    const MAX: u32 = 99;
+    let prefix = format!("截图_{ymd}_");
+    let mut max = 0u32;
+    if let Some(dir) = dir.filter(|d| !d.is_empty()) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                let Some(rest) = name.strip_prefix(prefix.as_str()) else {
+                    continue;
+                };
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    max = max.max(n);
+                }
+            }
+        }
+    }
+    (max + 1).min(MAX)
 }
 
 #[cfg(test)]
@@ -214,10 +234,43 @@ mod tests {
 
     #[test]
     fn default_name_uses_format_extension() {
-        let n = default_file_name(SaveFormat::Jpeg);
-        assert!(n.starts_with("截图_"));
+        let n = default_file_name(SaveFormat::Jpeg, None);
+        assert!(n.starts_with("截图_"), "实际：{n}");
         assert!(n.ends_with(".jpg"), "实际：{n}");
-        assert!(default_file_name(SaveFormat::Bmp).ends_with(".bmp"));
-        assert!(default_file_name(SaveFormat::Png).ends_with(".png"));
+        assert!(n.contains('_'), "实际：{n}");
+        assert!(default_file_name(SaveFormat::Bmp, None).ends_with(".bmp"));
+        assert!(default_file_name(SaveFormat::Png, None).ends_with(".png"));
+    }
+
+    #[test]
+    fn next_seq_counts_existing_files_of_the_day() {
+        let dir = std::env::temp_dir().join(format!("pixshot_seq_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+
+        // 空目录 → 01
+        assert_eq!(next_seq(Some(&d), "20261025"), 1);
+
+        for name in [
+            "截图_20261025_01.png",
+            "截图_20261025_02.png",
+            "截图_20261025_07.PNG",
+            "截图_20261025_x.png",   // 非数字，忽略
+            "截图_20261024_09.png",  // 非当日，忽略
+            "其他_20261025_50.png",  // 前缀不符，忽略
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        assert_eq!(next_seq(Some(&d), "20261025"), 8);
+
+        // 达到上限后固定 99
+        std::fs::write(dir.join("截图_20261025_99.png"), b"x").unwrap();
+        assert_eq!(next_seq(Some(&d), "20261025"), 99);
+
+        // 目录缺失时回退 01
+        assert_eq!(next_seq(None, "20261025"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
