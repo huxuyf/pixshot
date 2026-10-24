@@ -75,6 +75,7 @@ Set-Variable -Name 'WM_LBUTTONDOWN' -Value 0x0201 -Option Constant
 Set-Variable -Name 'WM_MOUSEMOVE' -Value 0x0200 -Option Constant
 Set-Variable -Name 'WM_LBUTTONUP' -Value 0x0202 -Option Constant
 Set-Variable -Name 'WM_MOUSEWHEEL' -Value 0x020A -Option Constant
+Set-Variable -Name 'WM_CONTEXTMENU' -Value 0x007B -Option Constant
 Set-Variable -Name 'BM_CLICK' -Value 0x00F5 -Option Constant
 
 function LP([int]$x, [int]$y) { [IntPtr](($x -band 0xFFFF) -bor (($y -band 0xFFFF) -shl 16)) }
@@ -399,6 +400,20 @@ try {
         ("rect=({0},{1})-({2},{3})" -f $r0.L, $r0.T, $r0.R, $r0.B)
     $ex = [W]::GetWindowLongW($pin, -20)     # GWL_EXSTYLE
     Check '贴图窗口置顶（WS_EX_TOPMOST）' (($ex -band 8) -ne 0) ("exstyle=0x{0:X8}" -f $ex)
+
+    # ── 回归：贴图右键菜单弹出后，在贴图上（= 菜单之外）左键单击应立即关闭菜单 ──
+    # 菜单用 SetCapture 捕获鼠标，落在贴图（同进程窗口）上的点击也会送到菜单窗口，
+    # 且不会引起失焦（不走 WM_KILLFOCUS）。若菜单不判"坐标落在客户区之外"，
+    # 该点击会被当成"点在菜单内空白处"而忽略，菜单就残留在贴图上。
+    [void][W]::PostMessageW($pin, $WM_CONTEXTMENU, [IntPtr]::Zero, (LP 600 420))
+    $menu = Wait-WindowByEnum $pid0 'PixShotMenu' 5000
+    $menuDetail = if ($menu -eq [IntPtr]::Zero) { '菜单未弹出' } else { '菜单已弹出，在菜单外左键单击' }
+    $menuGone = $false
+    if ($menu -ne [IntPtr]::Zero) {
+        [void][W]::PostMessageW($menu, $WM_LBUTTONDOWN, [IntPtr]1, (LP -40 -40))   # 客户区外坐标
+        $menuGone = Wait-WindowGone $pid0 'PixShotMenu' 3000
+    }
+    Check '贴图右键菜单：点击菜单外（贴图上）即关闭' $menuGone $menuDetail
     try {
         Add-Type -AssemblyName System.Drawing
         $bmp = New-Object System.Drawing.Bitmap(($SelW + 60), ($SelH + 60))

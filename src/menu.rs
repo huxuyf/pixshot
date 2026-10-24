@@ -238,24 +238,25 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_LBUTTONDOWN => {
             let (x, y) = client_xy(lp);
-            match hit_test(hwnd, x, y) {
-                Some(i) => {
-                    if let Some(d) = data_of(hwnd) {
-                        d.chosen = Some(i);
-                    }
-                    let _ = DestroyWindow(hwnd);
+            if point_outside(hwnd, x, y) {
+                // 菜单外的左键单击必须在这里关闭：菜单用 SetCapture 捕获鼠标，
+                // 落在贴图（同一进程的窗口）上的点击也会被送到本窗口，且不会
+                // 引起失焦，所以不会走 WM_KILLFOCUS —— 不判外部坐标的话菜单
+                // 就会一直留在贴图上（实测缺陷）。
+                let _ = DestroyWindow(hwnd);
+            } else if let Some(i) = hit_test(hwnd, x, y) {
+                if let Some(d) = data_of(hwnd) {
+                    d.chosen = Some(i);
                 }
-                // 点击菜单内空白/分隔线：什么都不做（保持菜单）
-                None => {}
+                let _ = DestroyWindow(hwnd);
             }
+            // 菜单内空白/分隔线上的点击：保持菜单展开
             LRESULT(0)
         }
-        // 点击菜单外：SetCapture 把消息送到这里，坐标落在客户区之外 → 关闭
+        // 菜单外的右键：同样关闭（右击通常意为取消当前菜单）
         WM_RBUTTONDOWN => {
             let (x, y) = client_xy(lp);
-            let mut cr = RECT::default();
-            let _ = GetClientRect(hwnd, &mut cr);
-            if x < 0 || y < 0 || x >= cr.right || y >= cr.bottom {
+            if point_outside(hwnd, x, y) {
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
@@ -289,6 +290,13 @@ unsafe fn data_of(hwnd: HWND) -> Option<&'static mut Data> {
     } else {
         Some(&mut *(p as *mut Data))
     }
+}
+
+/// 客户区坐标是否落在菜单窗口之外（用于"点击菜单外即关闭"判定）。
+unsafe fn point_outside(hwnd: HWND, x: i32, y: i32) -> bool {
+    let mut cr = RECT::default();
+    let _ = GetClientRect(hwnd, &mut cr);
+    x < 0 || y < 0 || x >= cr.right || y >= cr.bottom
 }
 
 /// 客户区坐标 → 菜单项下标（落在分隔线/内边距上返回 None）。
