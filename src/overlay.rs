@@ -1,26 +1,36 @@
-//! 区域框选：拖动框选 / Esc 取消（只保留区域截图，不支持选窗口与全屏）。
+//! 区域框选：按下热键后**整屏冻结**（显示进入时捕获的整屏快照），在冻结画面上拖动
+//! 框选 / Esc 取消（只保留区域截图，不支持选窗口与全屏）。
 //!
-//! **无遮罩**：框选期间不对屏幕做任何暗化 —— 桌面保持原样可见，只叠加一圈
-//! 红色框线。实现方式是逐像素 alpha 的分层窗口（`UpdateLayeredWindow`）：
-//! 表面整块为"透明底"（alpha=1），仅在选区四条边上写入不透明纯红像素。
+//! **不做暗化**：冻结画面就是原始像素，不叠暗色，只在其上叠加一圈红色框线。
+//! 实现方式是逐像素 alpha 的分层窗口（`UpdateLayeredWindow`）：表面用整屏快照
+//! 铺满（BGRA、alpha=255），红框直接写进同一表面。
 //!
-//! 为什么透明底用 alpha=1 而不是 0：分层窗口的鼠标命中按 alpha 判定，
-//! alpha=0 的像素会让点击**穿透**到桌面上的其它窗口，拖拽根本发不起来；
-//! alpha=1 的视觉贡献是 1/255（不可察觉），但窗口整块仍然接收鼠标。
+//! **冻结持续到工具条关闭**：松开鼠标（选区确认）后表面**保持冻结画面不变**，
+//! 屏幕继续呈冻结状态，直到用户点了工具条任一图标 / 按 Esc / 点关闭 —— 也就是
+//! 本次截图会话结束时，窗口才随 [`Selection`] 析构被拆掉，屏幕恢复实时状态。
 //!
-//! 重要设计（截屏管线）：本模块在进入时截取**一次**虚拟屏幕快照，并把
-//! `(快照, 选区)` 一起返回给调用方裁剪成品。调用方不再重新截屏 ——
-//! 既省掉一次全屏 BitBlt 与一份全屏缓冲，也保证成品来自同一帧。
-//! 由于红框是画在分层窗口上、成品是从快照裁剪的，**红框不会出现在截图里**。
+//! **确认时回收用于裁剪的整屏资源**：选区确认那一刻成品已从整屏快照裁出，随即释放
+//! 快照，因此"用于裁剪的整屏缓冲"不再存活；而**显示中的**冻结画面留在窗口自己的
+//! 绘制表面上（这块表面本来就要占一整屏），保持显示不额外增加内存，随窗口销毁一并释放。
+//!
+//! 表面先用透明底（alpha=1）铺一遍、再用快照覆盖：透明底是兜底 —— 万一快照尺寸小于
+//! 虚拟屏幕，也不会留下 alpha=0 的像素。alpha=0 在分层窗口上会让点击**穿透**到桌面
+//! 上的其它窗口，拖拽根本发不起来（alpha=1 的视觉贡献是 1/255，不可察觉）。
+//!
+//! 重要设计（截屏管线）：快照优先取用热键链路上低级键盘钩子在按键投递到前台窗口之前
+//! 抓好的那一帧（`tray::take_precapture`，仅走钩子兜底的热键链路才有）；拿不到时
+//! （`RegisterHotKey` 可用、或由托盘点击触发）就在这里当场抓帧。成品从该快照裁剪，
+//! 因此**所见即所得**；红框只画在窗口表面、不写进快照，**不会出现在成品里**。
 //!
 //! 状态存放：`GWLP_USERDATA` 持有 `Box<State>` 指针（与 pin/results 同一模式），
 //! 不再使用 `static mut`。
 //!
-//! **红框保留**：拖动确认后窗口**不销毁**，红框继续显示在屏幕上，直到用户点击
-//! 工具条任一图标或关闭截图。此时 `run()` 结束模态循环但保留窗口与 `State`，
+//! **窗口保留到会话结束**：拖动确认后窗口**不销毁**，冻结画面与红框继续显示，直到用户
+//! 点击工具条任一图标或关闭截图。此时 `run()` 结束模态循环但保留窗口与 `State`，
 //! 交由 [`Selection`] 持有；`Selection` 析构（或显式 [`Selection::dismiss`]）
-//! 时才真正拆窗、释放 GDI 资源。为了让保留期间不挡住桌面操作，确认后窗口转为
-//! 鼠标穿透（`WS_EX_TRANSPARENT`），只作视觉提示。
+//! 时才真正拆窗、释放 GDI 资源。为了让保留期间仍能操作工具条，确认后窗口转为
+//! 鼠标穿透（`WS_EX_TRANSPARENT`）；工具条/贴图/菜单都是 `WS_EX_TOPMOST` 且在其后
+//! 创建，会压在冻结层之上。
 
 use std::sync::Arc;
 
@@ -46,17 +56,18 @@ pub struct SelectedRegion {
     pub height: i32,
 }
 
-/// 已确认的选区：成品快照 + 选区矩形 + **仍然在屏幕上显示的红框窗口**。
+/// 已确认的选区：**已裁好的成品** + 仍在屏幕上显示的「冻结画面 + 红框」窗口。
 ///
-/// 拖动确认后红框窗口不销毁，而是继续显示（鼠标穿透，纯视觉），这样用户在
-/// 操作工具条期间仍能看到自己框选的范围。窗口在 [`Selection`] 被析构或显式
-/// 调用 [`Selection::dismiss`] 时拆掉 —— 也就是用户点击工具条任一图标、
-/// 或关闭截图的那一刻。
+/// 成品在确认时就已从整屏快照裁出，整屏快照随即释放（不随本结构存活）——
+/// 因此这里只持有选区大小的图。窗口表面仍在显示"按下热键那一刻"的冻结画面，
+/// 用来让屏幕保持冻结直到本结构析构（工具条关闭 / Esc / 点关闭按钮）。
+///
+/// 拖动确认后窗口不销毁，而是继续显示（鼠标穿透，工具条可正常点选）；
+/// 窗口在 [`Selection`] 被析构或显式调用 [`Selection::dismiss`] 时拆掉 ——
+/// 那一刻屏幕才恢复为实时状态。
 pub struct Selection {
-    /// 进入框选时截取的整屏快照（与红框同一帧）。
+    /// 成品图（已从整屏快照按选区裁好）。
     pub image: Arc<CapturedImage>,
-    /// 用户在快照中框出的区域（虚拟屏幕物理像素）。
-    pub region: SelectedRegion,
     /// 红框窗口；`dismiss()` 后置空。
     hwnd: HWND,
     /// 红框窗口的 `State`（`GWLP_USERDATA` 指向同一块内存）。
@@ -101,7 +112,12 @@ const BG_PX: u32 = 1 << 24;
 const FRAME_PX: u32 = 0xFFFF_0000;
 
 struct State {
-    result: Option<SelectedRegion>,
+    /// 确认时从整屏快照裁出的成品（小图）；`Some` 即表示"选区已确认"，
+    /// `run()` 结尾取出交给 [`Selection`]。
+    result_image: Option<Arc<CapturedImage>>,
+    /// 整屏快照：既是"冻结画面"的底图，也是成品裁剪的来源。
+    /// **选区确认后立即置 `None` 释放**（不占整屏内存）。
+    snapshot: Option<Arc<CapturedImage>>,
     dragging: bool,
     /// 选区已确认：红框保留显示中，忽略此后的一切框选交互（窗口已鼠标穿透）。
     locked: bool,
@@ -128,7 +144,7 @@ struct State {
 
 
 /// 进入框选模式（模态，阻塞直到用户确认/取消）。
-/// 确认时返回「整屏快照 + 选区 + 仍在显示的红框」；取消返回 None。
+/// 确认时返回「已裁好的成品 + 仍在显示的红框」；取消返回 None。
 pub fn select_region() -> Option<Selection> {
     unsafe { run() }
 }
@@ -139,8 +155,22 @@ unsafe fn run() -> Option<Selection> {
         return None;
     }
 
-    // 预截取整个虚拟屏幕（唯一一次全屏捕获），供最终裁剪
-    let shot = Arc::new(capture::capture_region(vx, vy, vw, vh).ok()?);
+    // 优先使用「按下热键那一刻」抓到的整屏预捕获快照（由低级键盘钩子在按键进入
+    // 前台窗口之前抓取）：这样前台弹出的菜单/下拉框不会因热键按键先行关闭而从
+    // 成品里消失。没有（例如托盘点击触发）或已过期时，退回当前即刻抓帧。
+    let shot = match crate::tray::take_precapture() {
+        Some(img) if (img.x, img.y, img.width, img.height) == (vx, vy, vw, vh) => {
+            crate::diag::log(&format!(
+                "[overlay] 使用热键预捕获快照 {}×{}（按下热键那一刻的整屏）",
+                img.width, img.height
+            ));
+            img
+        }
+        _ => {
+            crate::diag::log("[overlay] 无可用预捕获快照 -> 当场抓帧");
+            Arc::new(capture::capture_region(vx, vy, vw, vh).ok()?)
+        }
+    };
 
     // 屏幕 DC 与整屏绘制表面（32bpp 预乘 BGRA）
     let screen_dc = GetDC(HWND::default());
@@ -174,7 +204,8 @@ unsafe fn run() -> Option<Selection> {
     let hinst = GetModuleHandleW(None).unwrap_or_default();
 
     let state = Box::into_raw(Box::new(State {
-        result: None,
+        result_image: None,
+        snapshot: Some(shot),
         dragging: false,
         locked: false,
         quiet_destroy: false,
@@ -215,10 +246,21 @@ unsafe fn run() -> Option<Selection> {
         return None;
     }
 
-    let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+    // 遮罩（冻结画面 + 红框）永不出现在任何截图里。测试用 escape hatch：
+    // `PIXSHOT_OVERLAY_CAPTURABLE=1` 时跳过，便于用普通屏幕截图回归"冻结观感"
+    // （正常使用不应设置此变量）。
+    if std::env::var_os("PIXSHOT_OVERLAY_CAPTURABLE").is_none() {
+        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+    }
+    // 表面先用透明底铺一遍（兜底：万一快照比虚拟屏幕小，也不会留下 alpha=0 的像素，
+    // 那种像素会让点击穿透、拖拽发不起来），再用整屏快照覆盖。
+    // 窗口一显示就是"冻结"的整屏画面（不叠暗色），所见即所得。
     {
         let s = &*state;
         clear_rect(s.surface_bits, vw, vh, (0, 0, vw, vh));
+        if let Some(shot) = &s.snapshot {
+            copy_snapshot_into_surface(s.surface_bits, vw, vh, shot);
+        }
         commit(hwnd, s, (0, 0, vw, vh));
     }
     let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -232,25 +274,22 @@ unsafe fn run() -> Option<Selection> {
     }
 
     // 消息循环结束：
-    // - 取消（Esc）→ 窗口已销毁、无选区，释放资源后返回 None；
-    // - 确认选区 → 窗口**保留**（红框继续显示），把 `State` 交还调用方，
-    //   直到调用方 dismiss（点工具条图标 / 关闭截图）才拆窗。
-    let s = Box::from_raw(state);
-    match s.result {
-        Some(region) => {
-            let state = Box::into_raw(s);
-            Some(Selection {
-                image: shot,
-                region,
-                hwnd,
-                state,
-            })
-        }
-        None => {
-            cleanup(&s);
-            None
-        }
+    // - 取消（Esc）→ 窗口已销毁、无选区，释放资源后返回 None（屏幕立即恢复实时）；
+    // - 确认选区 → 窗口**保留**（冻结画面 + 红框继续显示），成品已在 `finish_selection`
+    //   里裁好、整屏快照也已在那一刻释放；把 `State` 交还调用方，直到调用方 dismiss
+    //   （点工具条图标 / Esc / 关闭按钮）才拆窗 —— 那一刻屏幕才恢复实时状态。
+    let mut s = Box::from_raw(state);
+    if let Some(image) = s.result_image.take() {
+        let state = Box::into_raw(s);
+        return Some(Selection {
+            image,
+            hwnd,
+            state,
+        });
     }
+    // 无成品 = 用户取消（Esc / 关闭）
+    cleanup(&s);
+    None
 }
 
 /// 整屏 32bpp 自上而下的 BITMAPINFO（供 `CreateDIBSection` 建绘制表面）。
@@ -425,8 +464,33 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
     let r = norm_rect(s.start, s.cur);
     let min_side = util::scaled(MIN_DRAG_LOGICAL, overlay_dpi());
     if r.2 >= min_side && r.3 >= min_side {
-        s.result = Some(clamp_region(r, s.vx, s.vy, s.vw, s.vh));
+        let region = clamp_region(r, s.vx, s.vy, s.vw, s.vh);
+        let sel_c = (region.x - s.vx, region.y - s.vy, region.width, region.height);
+        let width = util::scaled(FRAME_W_LOGICAL, overlay_dpi());
+        // 把框线收敛到最终选区；表面底图仍是"冻结画面"、保持不动 ——
+        // 因此松手后屏幕**继续冻结**，直到工具条关闭（见 [`Selection::dismiss`]）。
+        if let Some(shot) = &s.snapshot {
+            if let Some(last) = s.last {
+                if last != sel_c {
+                    restore_rect(s.surface_bits, s.vw, s.vh, shot, last);
+                }
+            }
+            draw_frame(s.surface_bits, s.vw, s.vh, sel_c, width);
+        }
+        // 成品从整屏快照裁出后**立即释放快照**（用于裁剪的整屏资源及时回收）。
+        // 显示中的冻结画面留在窗口表面上（不额外占内存），随窗口在会话结束时一并销毁。
+        let cropped = s
+            .snapshot
+            .take()
+            .map(|shot| Arc::new(shot.crop(region.x, region.y, region.width, region.height)));
+        commit(hwnd, s, (0, 0, s.vw, s.vh));
+        s.last = Some(sel_c);
+        s.result_image = cropped;
         s.locked = true;
+        crate::diag::log(&format!(
+            "[overlay] 选区确认 {}×{} @ {},{}：已裁出成品并释放整屏快照（冻结画面保持到工具条关闭）",
+            region.width, region.height, region.x, region.y
+        ));
         // 红框保留显示：窗口转为鼠标穿透（纯视觉提示），不再接收框选交互；
         // 结束模态循环但**不拆窗**，由调用方持有的 Selection 负责后续关闭。
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -444,9 +508,11 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
         return;
     }
 
-    // 单击 / 过小的拖动：不产生选区，擦掉已画的框线，继续等待用户框选
+    // 单击 / 过小的拖动：不产生选区，擦掉已画的框线（恢复冻结底图），继续等待框选
     if let Some(last) = s.last.take() {
-        clear_rect(s.surface_bits, s.vw, s.vh, last);
+        if let Some(shot) = &s.snapshot {
+            restore_rect(s.surface_bits, s.vw, s.vh, shot, last);
+        }
         commit(hwnd, s, last);
     }
 }
@@ -464,9 +530,11 @@ unsafe fn repaint_frame(hwnd: HWND, s: &mut State) {
     let width = util::scaled(FRAME_W_LOGICAL, overlay_dpi());
     let has = cur_c.2 > 0 && cur_c.3 > 0;
 
-    // 先清上一帧、再画当前帧：顺序保证两帧重叠时结果正确
+    // 先清上一帧（恢复冻结底图原像素）、再画当前帧：顺序保证两帧重叠时结果正确
     if let Some(last) = s.last {
-        clear_rect(s.surface_bits, s.vw, s.vh, last);
+        if let Some(shot) = &s.snapshot {
+            restore_rect(s.surface_bits, s.vw, s.vh, shot, last);
+        }
     }
     if has {
         draw_frame(s.surface_bits, s.vw, s.vh, cur_c, width);
@@ -503,6 +571,44 @@ fn clip_rect(r: Rect4, vw: i32, vh: i32) -> Option<Rect4> {
 /// 把表面上某矩形区域复位为透明底。
 unsafe fn clear_rect(bits: *mut u32, vw: i32, vh: i32, r: Rect4) {
     fill(bits, vw, vh, r, BG_PX);
+}
+
+/// 用整屏快照铺满绘制表面（框选期间的"冻结画面"底图）。
+///
+/// 快照与表面同为 `vw×vh`、自上而下 BGRA、行距 `vw*4`，因此整块一次拷贝即可。
+/// 快照 alpha 恒为 255，与分层窗口要求的预乘 BGRA 在此取值下等价。
+unsafe fn copy_snapshot_into_surface(bits: *mut u32, vw: i32, vh: i32, shot: &CapturedImage) {
+    let rows = vh.min(shot.height.max(0));
+    let cols = vw.min(shot.width.max(0));
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    let n = rows as usize * cols as usize;
+    let src = shot.data.as_ptr() as *const u32;
+    if shot.data.len() >= n * 4 {
+        std::ptr::copy_nonoverlapping(src, bits, n);
+    }
+}
+
+/// 把表面上某矩形区域恢复为快照原像素（拖拽期间擦除上一帧框线）。
+///
+/// 与 [`clear_rect`] 的区别：框选期间表面底图是"冻结的整屏快照"而非透明底，
+/// 擦帧必须还原快照像素，否则会擦出一块透明空洞。
+unsafe fn restore_rect(bits: *mut u32, vw: i32, vh: i32, shot: &CapturedImage, r: Rect4) {
+    let Some((x, y, w, h)) = clip_rect(r, vw, vh) else {
+        return;
+    };
+    let src_stride = shot.width.max(1) as usize;
+    let src = shot.data.as_ptr() as *const u32;
+    for row in 0..h as usize {
+        let sy = y as usize + row;
+        let off = sy * src_stride + x as usize;
+        if (off + w as usize) * 4 > shot.data.len() {
+            break; // 越界保护（快照尺寸异常时宁可留原样也不越界读）
+        }
+        let dst = sy * vw as usize + x as usize;
+        std::ptr::copy_nonoverlapping(src.add(off), bits.add(dst), w as usize);
+    }
 }
 
 /// 在矩形四条边内侧画 `width` 像素宽的框线。
@@ -614,6 +720,80 @@ mod tests {
         assert_eq!(FRAME_PX >> 24, 0xFF, "框线必须不透明");
         // 预乘 BGRA：低字节是蓝通道 → 纯红 = B=0, G=0, R=0xFF
         assert_eq!(FRAME_PX & 0x00FF_FFFF, 0x00FF_0000, "框线必须是纯红（不是蓝）");
+    }
+
+    /// 与快照同尺寸、内容可辨认的假快照（每像素 = (x, y, 0x40, 0xFF)）。
+    fn fake_shot(w: i32, h: i32) -> CapturedImage {
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                data[i] = x as u8;
+                data[i + 1] = y as u8;
+                data[i + 2] = 0x40;
+                data[i + 3] = 0xFF;
+            }
+        }
+        CapturedImage {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+            data: Arc::from(data),
+        }
+    }
+
+    /// 冻结底图：整屏快照铺满表面后，每个像素都等于快照像素且 alpha=255。
+    /// alpha>0 是拖拽能发起的前提；冻结期间不允许出现透明空洞。
+    #[test]
+    fn surface_is_filled_with_snapshot() {
+        let (vw, vh) = (8i32, 6i32);
+        let shot = fake_shot(vw, vh);
+        let mut buf = vec![0u32; (vw * vh) as usize];
+        unsafe { copy_snapshot_into_surface(buf.as_mut_ptr(), vw, vh, &shot) };
+        assert!(buf.iter().all(|&px| px >> 24 == 0xFF), "冻结底图必须整块不透明");
+        let want: Vec<u32> = shot
+            .data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(buf, want, "冻结底图必须与快照逐像素一致");
+    }
+
+    /// 擦帧必须把框线还原成**快照像素**（而非透明底）。
+    /// 这是"冻结画面 + 拖动"与旧"透明底 + 拖动"的关键差异：若仍用透明底擦帧，
+    /// 拖动过的区域会留下透明空洞，冻结效果就破了。
+    #[test]
+    fn restore_rect_returns_to_snapshot_pixels() {
+        let (vw, vh) = (10i32, 10i32);
+        let shot = fake_shot(vw, vh);
+        let mut buf = vec![0u32; (vw * vh) as usize];
+        unsafe { copy_snapshot_into_surface(buf.as_mut_ptr(), vw, vh, &shot) };
+
+        let rect = (2, 2, 6, 6);
+        unsafe { draw_frame(buf.as_mut_ptr(), vw, vh, rect, 2) };
+        assert_eq!(buf[(2 * vw + 2) as usize], FRAME_PX, "应先画出框线");
+
+        unsafe { restore_rect(buf.as_mut_ptr(), vw, vh, &shot, rect) };
+        let want: Vec<u32> = shot
+            .data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(buf, want, "擦帧后必须完全还原为快照像素");
+    }
+
+    /// 越界矩形在铺底/擦帧里都不得 panic，也不得越界写。
+    #[test]
+    fn snapshot_blit_clips_out_of_bounds() {
+        let (vw, vh) = (6i32, 5i32);
+        let shot = fake_shot(4, 3); // 故意比表面小：只应铺满交错区域，不越界
+        let mut buf = vec![0u32; (vw * vh) as usize];
+        unsafe {
+            copy_snapshot_into_surface(buf.as_mut_ptr(), vw, vh, &shot);
+            restore_rect(buf.as_mut_ptr(), vw, vh, &shot, (4, 3, 100, 100));
+            restore_rect(buf.as_mut_ptr(), vw, vh, &shot, (-50, -50, 8, 8));
+        }
     }
 
     /// 框线只出现在四条边上，内部与外部保持透明底。

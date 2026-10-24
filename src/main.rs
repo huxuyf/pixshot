@@ -37,7 +37,6 @@ mod tray;
 mod util;
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::HiDpi::{
@@ -252,20 +251,15 @@ pub(crate) fn screenshot_flow() {
 }
 
 unsafe fn flow_impl() -> error::Result<()> {
-    // 1. 框选屏幕区域（模态）。返回「整屏快照 + 选区 + 仍在显示的红框」。
+    // 1. 框选屏幕区域（模态）。返回「已裁好的成品 + 仍在显示的红框」。
     //    红框窗口在工具条关闭前一直保留，用户操作期间能看到自己框选的范围。
     let Some(sel) = overlay::select_region() else {
         return Ok(()); // 用户取消
     };
-    // 2. 从同一帧快照裁剪成品：
-    //    - 不再重新截屏（消除"用户所见"与"最终图像"不一致的窗口）；
-    //    - 也不等待遮罩消失（遮罩与工具栏都设了 WDA_EXCLUDEFROMCAPTURE）。
-    let image = Arc::new(sel.image.crop(
-        sel.region.x,
-        sel.region.y,
-        sel.region.width,
-        sel.region.height,
-    ));
+    // 2. 成品已在框选确认时从整屏快照裁好（`sel.image`），整屏快照也在那一刻随之释放。
+    //    这里不再重新截屏，也不等待遮罩消失（遮罩与工具栏都设了 WDA_EXCLUDEFROMCAPTURE）。
+    //    `Selection` 实现了 Drop（关闭红框窗口），故只能 clone 出 Arc 而不能移出字段。
+    let image = sel.image.clone();
     // 3. 操作工具栏：贴图 / 复制 / 保存 / OCR。
     //    工具条一旦关闭（点任一图标 / Esc / 关闭按钮），`sel` 在函数返回时析构，
     //    红框随之消失。

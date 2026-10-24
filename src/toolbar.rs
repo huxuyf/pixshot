@@ -144,6 +144,18 @@ unsafe fn run_impl(image: Arc<CapturedImage>) -> Result<()> {
     let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
     let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
     let _ = SetForegroundWindow(hwnd);
+    // 显式提到置顶带最上层：框选遮罩此时是**不透明的置顶窗口**（显示冻结画面），
+    // 工具条必须稳稳压在它上面才看得见。工具条本身已是 WS_EX_TOPMOST 且在其后创建，
+    // 这里再显式 SetWindowPos 一次做保险（SWP_NOACTIVATE：只调 z 序，不改前台）。
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
 
     // 模态消息循环
     let mut msg = MSG::default();

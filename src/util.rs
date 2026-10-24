@@ -62,6 +62,11 @@ pub fn quit_requested() -> bool {
     APP_QUIT.load(Ordering::SeqCst)
 }
 
+/// 当前是否有截图流程进行中（供热键钩子跳过无意义的预捕获）。
+pub fn is_busy() -> bool {
+    APP_BUSY.load(Ordering::SeqCst)
+}
+
 /// UTF-8 → UTF-16（NUL 结尾）。
 pub fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()

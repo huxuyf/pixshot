@@ -10,6 +10,8 @@
 //!    这类组合键时必须自行校验修饰键状态，否则单独按 S 也会触发截图。
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -20,6 +22,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::capture::{self, CapturedImage};
 use crate::config;
 use crate::diag;
 use crate::menu;
@@ -59,6 +62,11 @@ static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
 static TRAY_MENU_BUSY: AtomicBool = AtomicBool::new(false);
 /// 主（托盘宿主）窗口句柄：供工具条把后台 OCR 完成事件投递回来弹 Toast。
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// 「按下热键那一刻」的整屏预捕获快照（见 [`precapture`] 的时序说明）。
+static PRECAPTURE: Mutex<Option<(Instant, Arc<CapturedImage>)>> = Mutex::new(None);
+/// 预捕获快照的有效期：超过即视为过期（热键被流程占用时可能没人消费它）。
+const PRECAPTURE_TTL: Duration = Duration::from_secs(1);
 
 /// 工具栏「OCR 识别」完成后通知主窗口的私有消息（`WPARAM` = `OCR_DONE_*`）。
 pub const WM_APP_OCR_DONE: u32 = WM_APP + 8;
@@ -269,6 +277,57 @@ fn key_down(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) < 0 }
 }
 
+/// 取走预捕获快照（只可消费一次；空或过期返回 None）。
+///
+/// 截图流程优先用它作为成品来源：它正是「按下热键那一刻」的整屏画面。
+pub fn take_precapture() -> Option<Arc<CapturedImage>> {
+    let mut g = PRECAPTURE.lock().ok()?;
+    match g.take() {
+        Some((t, img)) if t.elapsed() <= PRECAPTURE_TTL => Some(img),
+        _ => None,
+    }
+}
+
+/// 在按键**进入前台窗口之前**抓一帧整屏快照。
+///
+/// 只在低级键盘钩子兜底路径（`RegisterHotKey` 失败或 `PIXSHOT_FORCE_HOOK`）下调用：
+/// 该路径里钩子要 `CallNextHookEx` 让按键继续投递给前台窗口，若前台正弹着菜单/下拉框，
+/// 它会因这次按键而自行关闭。抓帧必须赶在这次投递**之前**——钩子回调恰好就在这个位置
+/// （`precapture()` 排在 `CallNextHookEx` 前）。若等 `WM_HOTKEY` 到消息循环里再抓，
+/// 菜单往往已经关闭，成品里就丢了它。
+///
+/// 反面：`RegisterHotKey` 成功时不装这个钩子 —— 系统热键会拦住按键、**不投递给前台
+/// 窗口**（实测前台窗口收不到该按键），因此不存在这个问题，流程在 `overlay` 里当场
+/// 抓帧就够了；常驻全局键盘钩子会让每次按键都绕本进程一圈，得不偿失。
+///
+/// 钩子回调必须尽快返回，因此只在真正需要时做一次整屏 `BitBlt`，且已有未消费快照时
+/// 直接跳过（连按/自动重复不会反复抓）。
+fn precapture() {
+    if util::is_busy() {
+        return; // 已有流程在跑，抓了也会被 BusyGuard 拒绝
+    }
+    let occupied = PRECAPTURE.lock().map(|g| g.is_some()).unwrap_or(true);
+    if occupied {
+        return; // 已有未消费快照
+    }
+    let (vx, vy, vw, vh) = capture::virtual_screen_rect();
+    if vw <= 0 || vh <= 0 {
+        return;
+    }
+    let t0 = Instant::now();
+    if let Ok(img) = capture::capture_region(vx, vy, vw, vh) {
+        diag::log(&format!(
+            "[hotkey] 预捕获整屏 {}×{} @ {vx},{vy} 用时 {:?}",
+            img.width,
+            img.height,
+            t0.elapsed()
+        ));
+        if let Ok(mut g) = PRECAPTURE.lock() {
+            *g = Some((t0, Arc::new(img)));
+        }
+    }
+}
+
 /// 钩子回调中对修饰键做严格校验（钩子不占热键槽位，不校验会误触发）。
 fn modifiers_match(mods: u32) -> bool {
     let want_ctrl = mods & config::MOD_CONTROL != 0;
@@ -296,6 +355,9 @@ static ALLOW_INJECTED: AtomicBool = AtomicBool::new(false);
 /// WH_KEYBOARD_LL 回调：捕获物理按键并投递 WM_HOTKEY（与 RegisterHotKey
 /// 共用同一条已充分验证的触发链路）。低级键盘钩子不占用热键槽位，
 /// 因此目标热键被其他程序占用时依然可用。
+///
+/// 这里先做一次整屏预捕获（见 [`precapture`]）：本回调在按键投递给前台窗口之前执行，
+/// 是唯一能保住「前台弹出的菜单/下拉框」的时机。
 unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     // code == HC_ACTION(0) 时 lp 才是有效的 KBDLLHOOKSTRUCT
     if code == 0 && lp.0 != 0 {
@@ -306,6 +368,8 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
         let want_vk = HOOK_VK.load(Ordering::Relaxed);
         if is_down && (allow_injected || !injected) && want_vk != 0 && kb.vkCode == want_vk {
             if modifiers_match(HOOK_MODS.load(Ordering::Relaxed)) {
+                // 先抓整屏：此刻按键还没经 CallNextHookEx 投递给前台窗口
+                precapture();
                 let p = HOOK_HWND.load(Ordering::Relaxed);
                 if p != 0 {
                     // 钩子回调必须尽快返回，避免拖慢全系统输入
