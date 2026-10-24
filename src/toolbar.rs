@@ -431,7 +431,8 @@ unsafe fn draw_icon_frame(
     let (bw, bh) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
     let v = fx.val(dis.hwndItem);
     let pressed = (dis.itemState.0 & ODS_SELECTED.0) != 0;
-    let (fill, ink) = util::btn_colors(style, skin, v, pressed);
+    // 只需前景（描边）色：底色由 util::draw_od_button 画，图标不再需要底色遮罩
+    let (_, ink) = util::btn_colors(style, skin, v, pressed);
 
     let mem = CreateCompatibleDC(dis.hDC);
     let bmp = CreateCompatibleBitmap(dis.hDC, bw, bh);
@@ -452,7 +453,7 @@ unsafe fn draw_icon_frame(
         dis2.hDC = mem;
         dis2.rcItem = full;
         util::draw_od_button(parent, &dis2, fx, style, skin);
-        icons::draw(mem, full, icon, ink, fill);
+        icons::draw(mem, full, icon, ink);
 
         let _ = BitBlt(dis.hDC, r.left, r.top, bw, bh, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old_bmp);
@@ -467,7 +468,7 @@ unsafe fn draw_icon_frame(
             let _ = DeleteDC(mem);
         }
         util::draw_od_button(parent, dis, fx, style, skin);
-        icons::draw(dis.hDC, r, icon, ink, fill);
+        icons::draw(dis.hDC, r, icon, ink);
     }
 }
 
@@ -574,12 +575,9 @@ unsafe extern "system" fn btn_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     d.tip_shown = false;
                 }
             }
-            // 按钮持有焦点时快捷键同样生效（转发给工具条的统一处理）
-            WM_KEYDOWN => {
-                if handle_shortcut(parent, wp.0) {
-                    return LRESULT(0);
-                }
-            }
+            // 按钮持有焦点时快捷键同样生效（转发给工具条的统一处理）；
+            // 守卫为真即表示该键已被消费，直接返回，不再转发给按钮原过程。
+            WM_KEYDOWN if handle_shortcut(parent, wp.0) => return LRESULT(0),
             _ => {}
         }
     }

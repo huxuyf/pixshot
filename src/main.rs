@@ -28,6 +28,7 @@ mod menu;
 mod ocr;
 mod overlay;
 mod pin;
+mod svgpath;
 mod theme;
 mod toast;
 mod toolbar;
