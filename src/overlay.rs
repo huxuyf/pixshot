@@ -1,11 +1,16 @@
 //! 框选遮罩：拖动框选 / 单击选择窗口 / Enter 全屏 / Esc 取消。
 //!
-//! 用预截取的整屏位图把选区内容"还原"显示，实现 Snipaste 式暗化遮罩。
+//! 用预截取的整屏快照把选区内容"还原"显示，实现 Snipaste 式暗化遮罩。
 //!
 //! 重要设计（截屏管线）：本模块在进入时截取**一次**虚拟屏幕快照，并把
 //! `(快照, 选区)` 一起返回给调用方裁剪成品。调用方不再重新截屏 ——
 //! 这既省掉一次全屏 BitBlt 与一份全屏缓冲，也保证「用户看到的选区还原画面」
 //! 与「最终得到的截图」是同一帧（原先两次捕获之间画面可能已变化）。
+//!
+//! 选区还原直接用 `StretchDIBits` 从该快照像素读取（不再另建整屏 DIB），
+//! 故框选期间只驻留「快照 + 双缓冲位图」两份全屏缓冲；也顺带消除了早先
+//! 「整屏 DIB 被选入 DC 却先于 DC 删除 → DeleteObject 失败」造成的每次
+//! 截图泄漏一整屏 DIB 的缺陷。
 //!
 //! 状态存放：`GWLP_USERDATA` 持有 `Box<State>` 指针（与 pin/results 同一模式），
 //! 不再使用 `static mut`；`State` 由 `run()` 在消息循环结束后释放，因此
@@ -21,7 +26,8 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush,
     DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, GetStockObject, ReleaseDC, SelectObject,
-    HBITMAP, HDC, HGDIOBJ, NULL_BRUSH, PS_SOLID, Rectangle, RoundRect, SRCCOPY,
+    StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, NULL_BRUSH,
+    PS_SOLID, Rectangle, RoundRect, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -50,9 +56,11 @@ struct State {
     vy: i32,
     vw: i32,
     vh: i32,
-    /// 预截取的虚拟屏幕位图（供选区还原）
-    mem_dc: HDC,
-    mem_bmp: HBITMAP,
+    /// 预截取的虚拟屏幕快照（供选区还原）。
+    /// 选区还原在 `paint` 里用 `StretchDIBits` 直接从这份像素读取，不再额外建一份
+    /// 整屏 DIB —— 既省一份全屏内存，也消除了「位图仍被选入 DC 时 DeleteObject
+    /// 失败」导致的每次截图泄漏一整屏 DIB 的隐患。
+    shot: Arc<CapturedImage>,
     /// 双缓冲：整屏离屏 DC（避免逐帧「填黑→贴图」造成的闪动）
     buf_dc: HDC,
     buf_bmp: HBITMAP,
@@ -76,7 +84,6 @@ unsafe fn run() -> Option<(Arc<CapturedImage>, SelectedRegion)> {
 
     // 预截取整个虚拟屏幕（唯一一次全屏捕获）
     let shot = Arc::new(capture::capture_region(vx, vy, vw, vh).ok()?);
-    let (mem_dc, mem_bmp) = capture::image_to_memory_bitmap(&shot).ok()?;
 
     // 双缓冲位图（与虚拟屏幕同尺寸）
     let screen_dc = GetDC(HWND::default());
@@ -84,8 +91,9 @@ unsafe fn run() -> Option<(Arc<CapturedImage>, SelectedRegion)> {
     let buf_bmp = CreateCompatibleBitmap(screen_dc, vw, vh);
     let _ = ReleaseDC(HWND::default(), screen_dc);
     if buf_dc.is_invalid() || buf_bmp.is_invalid() {
-        let _ = DeleteObject(mem_bmp);
-        let _ = DeleteDC(mem_dc);
+        // 二者均尚未选入任何 DC，可安全释放
+        let _ = DeleteObject(buf_bmp);
+        let _ = DeleteDC(buf_dc);
         return None;
     }
     let buf_old = SelectObject(buf_dc, buf_bmp);
@@ -102,8 +110,7 @@ unsafe fn run() -> Option<(Arc<CapturedImage>, SelectedRegion)> {
         vy,
         vw,
         vh,
-        mem_dc,
-        mem_bmp,
+        shot: Arc::clone(&shot),
         buf_dc,
         buf_bmp,
         buf_old,
@@ -158,8 +165,6 @@ unsafe fn cleanup(s: &State) {
     let _ = SelectObject(s.buf_dc, s.buf_old);
     let _ = DeleteObject(s.buf_bmp);
     let _ = DeleteDC(s.buf_dc);
-    let _ = DeleteObject(s.mem_bmp);
-    let _ = DeleteDC(s.mem_dc);
 }
 
 unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
@@ -389,13 +394,29 @@ unsafe fn paint(hwnd: HWND) -> LRESULT {
     FillRect(dc, &all, black);
     let _ = DeleteObject(black);
 
-    // 2. 拖动中：把预截取的屏幕内容 blit 回选区（视觉"还原"）+ 边框 + 尺寸
+    // 2. 拖动中：把预截取的屏幕内容画回选区（视觉"还原"）+ 边框 + 尺寸
     if s.dragging {
         let r = norm_rect(s.start, s.cur);
         if r.2 > 0 && r.3 > 0 {
             let dx = r.0 - s.vx;
             let dy = r.1 - s.vy;
-            let _ = BitBlt(dc, dx, dy, r.2, r.3, s.mem_dc, dx, dy, SRCCOPY);
+            // 直接从整屏快照还原：源坐标相对快照原点，与选区在遮罩内的偏移一致
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: s.shot.width,
+                    biHeight: -s.shot.height, // 自上而下
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0, // BI_RGB
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let bits = s.shot.data.as_ptr() as *const core::ffi::c_void;
+            let _ = StretchDIBits(
+                dc, dx, dy, r.2, r.3, dx, dy, r.2, r.3, Some(bits), &bmi, DIB_RGB_COLORS, SRCCOPY,
+            );
 
             let pen = CreatePen(PS_SOLID, 2, theme::current().accent); // 主题强调色边框
             let old: HGDIOBJ = SelectObject(dc, pen);

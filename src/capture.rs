@@ -170,48 +170,6 @@ pub fn capture_region(x: i32, y: i32, w: i32, h: i32) -> Result<CapturedImage> {
     }
 }
 
-/// 把 BGRA 图像放入一个内存位图（供遮罩层"选区还原"绘制）。
-/// 返回 (mem_dc, bmp)；用完后调用方需 DeleteObject(bmp) + DeleteDC(mem_dc)。
-pub fn image_to_memory_bitmap(img: &CapturedImage) -> Result<(HDC, HBITMAP)> {
-    unsafe {
-        let screen_dc: HDC = GetDC(HWND::default());
-        if screen_dc.is_invalid() {
-            return Err(AppError::Config("GetDC(屏幕) 失败".into()));
-        }
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        let _ = ReleaseDC(HWND::default(), screen_dc);
-        if mem_dc.is_invalid() {
-            return Err(AppError::Config("CreateCompatibleDC 失败".into()));
-        }
-
-        let bmi = top_down_header(img.width, img.height);
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let bmp = match CreateDIBSection(
-            mem_dc,
-            &bmi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            HANDLE::default(),
-            0,
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = DeleteDC(mem_dc);
-                return Err(e.into());
-            }
-        };
-        if bits.is_null() {
-            let _ = DeleteObject(bmp);
-            let _ = DeleteDC(mem_dc);
-            return Err(AppError::Config("CreateDIBSection 返回空指针".into()));
-        }
-
-        std::ptr::copy_nonoverlapping(img.data.as_ptr(), bits as *mut u8, img.data.len());
-        SelectObject(mem_dc, bmp);
-        Ok((mem_dc, bmp))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
