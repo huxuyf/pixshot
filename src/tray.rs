@@ -57,6 +57,25 @@ static LL_HOOK: AtomicIsize = AtomicIsize::new(0);
 static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
 /// 托盘菜单是否正在显示（一次真实右键会投递两条回调，必须去重）
 static TRAY_MENU_BUSY: AtomicBool = AtomicBool::new(false);
+/// 主（托盘宿主）窗口句柄：供工具条把后台 OCR 完成事件投递回来弹 Toast。
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// 工具栏「OCR 识别」完成后通知主窗口的私有消息（`WPARAM` = `OCR_DONE_*`）。
+pub const WM_APP_OCR_DONE: u32 = WM_APP + 8;
+/// OCR 完成码：失败 / 已复制到剪贴板 / 未识别到文字。
+pub const OCR_DONE_FAIL: usize = 0;
+pub const OCR_DONE_COPIED: usize = 1;
+pub const OCR_DONE_EMPTY: usize = 2;
+
+/// 主窗口句柄（未初始化时返回空句柄）。
+pub fn main_hwnd() -> HWND {
+    let p = MAIN_HWND.load(Ordering::SeqCst);
+    if p == 0 {
+        HWND::default()
+    } else {
+        HWND(p as *mut core::ffi::c_void)
+    }
+}
 
 // ─── 单实例保护 ──────────────────────────────────────────────────
 
@@ -335,6 +354,7 @@ fn install_keyboard_hook(hwnd: HWND, mods: u32, vk: u32) -> bool {
 
 /// 初始化托盘与热键。返回 (托盘成功, 托盘错误码, 热键可用)。
 pub fn init(hwnd: HWND) -> (bool, u32, bool) {
+    MAIN_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
     let _ = taskbar_created_msg(); // 预注册 TaskbarCreated，供 Explorer 重启后恢复
     let (tray_ok, tray_err) = add_tray_icon(hwnd);
 
@@ -436,6 +456,16 @@ pub unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let mut pt = windows::Win32::Foundation::POINT::default();
             let _ = GetCursorPos(&mut pt);
             tray_menu(hwnd, pt.x, pt.y);
+            LRESULT(0)
+        }
+
+        // 工具条「OCR 识别」：后台线程已完成识别并写入剪贴板，这里只负责弹提示。
+        WM_APP_OCR_DONE => {
+            match wp.0 {
+                OCR_DONE_COPIED => crate::toast::show("已复制文字到剪贴板"),
+                OCR_DONE_EMPTY => crate::toast::show("未识别到文字"),
+                _ => crate::toast::show("文字识别失败"),
+            }
             LRESULT(0)
         }
 

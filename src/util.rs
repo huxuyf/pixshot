@@ -216,6 +216,10 @@ pub fn add_button(parent: HWND, text: &str, x: i32, y: i32, w: i32, h: i32, id: 
 }
 
 /// 创建静态文本控件。
+///
+/// 当前无调用方：工具条已按要求不再显示任何标签文字（只保留按钮）。
+/// 保留该工厂以便后续需要文本控件时与 [`add_button`] 配套使用。
+#[allow(dead_code)]
 pub fn add_label(parent: HWND, text: &str, x: i32, y: i32, w: i32, h: i32) -> HWND {
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap_or_default();

@@ -115,6 +115,16 @@ function Wait-WindowByEnum([int]$TargetPid, [string]$Class, [int]$TimeoutMs = 12
         Start-Sleep -Milliseconds 100
     }
 }
+# 等待某 PID 的指定类名窗口消失（用于「工具条已关闭」这类异步销毁断言）
+function Wait-WindowGone([int]$TargetPid, [string]$Class, [int]$TimeoutMs = 5000) {
+    $deadline = [Environment]::TickCount + $TimeoutMs
+    while ($true) {
+        if ((Find-WindowByEnum $TargetPid $Class) -eq [IntPtr]::Zero) { return $true }
+        if ([Environment]::TickCount -ge $deadline) { return $false }
+        [void][System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 100
+    }
+}
 function Get-Rect([IntPtr]$H) {
     $r = New-Object W+RECT
     [void][W]::GetWindowRect($H, [ref]$r); $r
@@ -176,6 +186,18 @@ function Get-ClipText {
     }
     return ''
 }
+# 等待剪贴板出现文本（OCR 完成判定；CF_UNICODETEXT = 13）。
+# NotEqual 用于排除点击前已有的旧文本，确保读到的是本次写入的内容。
+function Wait-ClipText([int]$TimeoutMs = 25000, [string]$NotEqual = '') {
+    $deadline = [Environment]::TickCount + $TimeoutMs
+    while ($true) {
+        $t = Get-ClipText
+        if ($t -and $t.Trim().Length -gt 0 -and $t -ne $NotEqual) { return $t }
+        if ([Environment]::TickCount -ge $deadline) { return '' }
+        [void][System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 200
+    }
+}
 function Test-ClipDib {
     for ($i = 0; $i -lt 10; $i++) {
         if ([W]::OpenClipboard([IntPtr]::Zero)) {
@@ -203,7 +225,7 @@ function Check([string]$Name, $Ok, [string]$Detail = '') {
 }
 
 Write-Host ''
-Write-Host '==== PixShot E2E（消息驱动版 v2）：框选截图 -> 复制 -> 贴图置顶(缩放/Esc) -> OCR -> 复制 ===='
+Write-Host '==== PixShot E2E（消息驱动版 v3）：工具条结构 -> 复制/OCR/贴图 均关闭工具条 ===='
 Write-Host ''
 
 # 框选区域（虚拟屏幕坐标）
@@ -214,8 +236,10 @@ try {
     # ── 0. 文字靶标窗口（为 OCR 提供确定性内容，完全位于选区内）──
     $form = New-Object System.Windows.Forms.Form
     $form.StartPosition = 'Manual'
-    $form.Location = New-Object System.Drawing.Point(350, 350)
-    $form.Size = New-Object System.Drawing.Size(500, 300)
+    # 靶标窗口精确覆盖框选区域：否则选区边缘会露出桌面/其它窗口，
+    # 混入无关文字干扰 OCR 断言。
+    $form.Location = New-Object System.Drawing.Point($SelX, $SelY)
+    $form.Size = New-Object System.Drawing.Size($SelW, $SelH)
     $form.FormBorderStyle = 'None'
     $form.BackColor = [System.Drawing.Color]::White
     $form.TopMost = $true
@@ -224,89 +248,153 @@ try {
     $lbl.Font = New-Object System.Drawing.Font('Microsoft YaHei', 22, [System.Drawing.FontStyle]::Bold)
     $lbl.ForeColor = [System.Drawing.Color]::Black
     $lbl.AutoSize = $false
-    $lbl.Size = New-Object System.Drawing.Size(480, 280)
+    $lbl.Size = New-Object System.Drawing.Size(($SelW - 20), ($SelH - 20))
     $lbl.Location = New-Object System.Drawing.Point(10, 10)
     $form.Controls.Add($lbl)
     $form.Show()
     for ($i = 0; $i -lt 15; $i++) { [void][System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
     Write-Host '  [靶标] 已在选区内显示确定性文字窗口（PixShot OCR E2E / 识别测试文本 ABC 12345）'
 
-    # ── 1~3. 启动 → 消息拖拽框选 → 工具栏（带选区验证与重试）
-    # 注：SetCapture 期间真实鼠标移动也会进入选区（用户可能正在操作），
-    #     拖拽后从工具栏标签读取实际选区，若被干扰则重试整个流程。
-    $SelX = 300; $SelY = 300; $SelW = 600; $SelH = 400
-    $ov = [IntPtr]::Zero; $tb = [IntPtr]::Zero; $regionOk = $false; $attempt = 0
-    $startupOk = $false; $f1Ok = $false
-    while (-not $regionOk -and $attempt -lt 3) {
-        $attempt++
-        if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; Start-Sleep -Milliseconds 500 }
-        $proc = Start-Process -FilePath $Exe -PassThru
-        $pid0 = $proc.Id
-        # ── 需求验证：启动后托盘驻留（不弹遮罩）；F1（WM_HOTKEY 路径）触发截图 ──
-        $mainH = Wait-WindowByEnum $pid0 'PixShotMain' 10000
-        if ($mainH -eq [IntPtr]::Zero) { continue }
-        if (-not $startupOk) {
-            Start-Sleep -Milliseconds 500
-            # 启动后 0.5s 仍无遮罩 = 托盘驻留（未进入截图流程）
-            $startupOk = (Find-WindowByEnum $pid0 'PixShotOverlay') -eq [IntPtr]::Zero
-            Check '启动后常驻托盘（无遮罩/主窗口弹出）' $startupOk
-        }
-        # F1 全局热键路径：WM_HOTKEY(0x0312) wp=HOTKEY_ID —— Post 异步投递
-        [void][W]::PostMessageW($mainH, 0x0312, [IntPtr]1, [IntPtr]0)
-        $ov = Wait-WindowByEnum $pid0 'PixShotOverlay' 12000
-        if (-not $f1Ok) {
-            $f1Ok = $ov -ne [IntPtr]::Zero
-            Check 'F1 触发截图流程（遮罩出现）' $f1Ok
-        }
-        if ($ov -eq [IntPtr]::Zero) { continue }
-        # 快速拖拽（缩短受真实输入干扰的窗口）
-        [void][W]::SendMessageW($ov, $WM_LBUTTONDOWN, [IntPtr]1, (LP $SelX $SelY))
-        foreach ($p in @(@(560, 480), @(($SelX + $SelW), ($SelY + $SelH)))) {
-            [void][W]::SendMessageW($ov, $WM_MOUSEMOVE, [IntPtr]1, (LP $p[0] $p[1]))
-            Start-Sleep -Milliseconds 20
-        }
-        [void][W]::SendMessageW($ov, $WM_LBUTTONUP, [IntPtr]0, (LP ($SelX + $SelW) ($SelY + $SelH)))
-        $dragOk = -not [W]::IsWindow($ov)
-        if (-not $dragOk) { continue }
-        $tb = Wait-WindowByEnum $pid0 'PixShotToolbar' 15000
-        if ($tb -eq [IntPtr]::Zero) { continue }
-        $label = (Get-StaticTexts $tb) | Where-Object { $_ -match '已截取' } | Select-Object -First 1
-        Write-Host ("  [尝试 $attempt] 工具栏标签: {0}" -f $label)
-        if ($label -match '已截取\s*(\d+)\s*[×x]\s*(\d+)') {
-            $lw = [int]$Matches[1]; $lh = [int]$Matches[2]
-            if ($lw -eq $SelW -and $lh -eq $SelH) { $regionOk = $true }
-        }
+    # ── 启动一次；后续每个场景各自触发一次全新截图（因为每个操作都会关闭工具条）──
+    $proc = Start-Process -FilePath $Exe -PassThru
+    $pid0 = $proc.Id
+    $mainH = Wait-WindowByEnum $pid0 'PixShotMain' 10000
+    if ($mainH -eq [IntPtr]::Zero) { throw '主窗口（托盘宿主）未创建' }
+    Start-Sleep -Milliseconds 500
+    # 启动后 0.5s 仍无遮罩 = 托盘驻留（未进入截图流程）
+    Check '启动后常驻托盘（无遮罩/主窗口弹出）' ((Find-WindowByEnum $pid0 'PixShotOverlay') -eq [IntPtr]::Zero)
+
+    # F1（WM_HOTKEY 路径，Post 异步投递）→ 遮罩 → 消息拖拽框选 → 返回工具条窗口
+    # 由工具条几何反推本次拖拽得到的选区是否等于期望值。
+    # 工具条贴在选区下方 8 逻辑像素：左边界 = 选区左边界，
+    # 上边界 = 选区下边界 + scaled(8)；缩放系数由工具条高度（逻辑 104）反推。
+    function Test-CaptureValid([IntPtr]$Tb) {
+        if ($Tb -eq [IntPtr]::Zero) { return $false }
+        $r = Get-Rect $Tb
+        $scale = ($r.B - $r.T) / 104.0
+        if ($scale -le 0) { return $false }
+        $gap = [int][Math]::Round(8 * $scale)
+        return (([Math]::Abs($r.L - $SelX) -le 1) -and ([Math]::Abs($r.T - ($SelY + $SelH + $gap)) -le 2))
     }
-    Check '拖拽框选完成（遮罩按选区销毁）' $dragOk
-    Check '框选完成 -> 操作工具栏弹出，选区 600x400' ($regionOk) "第 $attempt 次尝试"
-    if (-not $regionOk) { throw '选区被真实鼠标干扰，3 次尝试均不符' }
+
+    # 关掉当前工具条（经标题栏 ✕），用于选区不符时重来
+    function Close-Toolbar([IntPtr]$Tb) {
+        $x = Find-ChildById $Tb 5
+        if ($x -ne [IntPtr]::Zero) { [void][W]::SendMessageW($x, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero) }
+        [void](Wait-WindowGone $pid0 'PixShotToolbar' 4000)
+    }
+
+    function Invoke-Capture {
+        # 消息驱动的拖拽偶发会被干扰成退化选区（0 尺寸或落到别的窗口），
+        # 因此每次都用工具条几何校验选区，不符则关掉重来（最多 3 次）。
+        for ($try = 1; $try -le 3; $try++) {
+            # 先把靶标窗口重新置顶：其它置顶浮窗（编辑器/取色器等）可能盖住它，
+            # 导致 OCR 读到的是背景内容而不是靶标文字。
+            $form.TopMost = $false; $form.TopMost = $true
+            [void][System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 150
+            [void][W]::PostMessageW($mainH, 0x0312, [IntPtr]1, [IntPtr]0)
+            $o = Wait-WindowByEnum $pid0 'PixShotOverlay' 12000
+            if ($o -eq [IntPtr]::Zero) { continue }
+            Start-Sleep -Milliseconds 200   # 等遮罩完成创建（WM_CREATE 设置状态指针）
+            [void][W]::SendMessageW($o, $WM_LBUTTONDOWN, [IntPtr]1, (LP $SelX $SelY))
+            foreach ($p in @(@(560, 480), @(($SelX + $SelW), ($SelY + $SelH)))) {
+                [void][W]::SendMessageW($o, $WM_MOUSEMOVE, [IntPtr]1, (LP $p[0] $p[1]))
+                Start-Sleep -Milliseconds 20
+            }
+            [void][W]::SendMessageW($o, $WM_LBUTTONUP, [IntPtr]0, (LP ($SelX + $SelW) ($SelY + $SelH)))
+            $t = Wait-WindowByEnum $pid0 'PixShotToolbar' 6000
+            if ($t -eq [IntPtr]::Zero) {
+                # 未得到工具条：可能是"单击选窗"未命中而退回框选，Esc 关掉遮罩再来
+                $o2 = Find-WindowByEnum $pid0 'PixShotOverlay'
+                if ($o2 -ne [IntPtr]::Zero) {
+                    [void][W]::SendMessageW($o2, $WM_KEYDOWN, [IntPtr]0x1B, [IntPtr]::Zero)
+                    Start-Sleep -Milliseconds 300
+                }
+                continue
+            }
+            Start-Sleep -Milliseconds 250   # 等子控件就绪
+            if (Test-CaptureValid $t) { return $t }
+            Write-Host ("  [重试] 第 {0} 次拖拽选区不符，关闭工具条重来" -f $try)
+            Close-Toolbar $t
+        }
+        [IntPtr]::Zero
+    }
+
+    $tb0 = Invoke-Capture
+    Check 'F1 触发截图流程（遮罩出现 -> 工具条弹出）' ($tb0 -ne [IntPtr]::Zero)
+    if ($tb0 -eq [IntPtr]::Zero) { throw '截图流程未走通（遮罩或工具条未出现）' }
     Write-Host ("  [操作] 消息驱动框选 ({0},{1}) {2}x{3}" -f $SelX, $SelY, $SelW, $SelH)
 
-    $btnCopy = Find-ChildById $tb 2      # BTN_COPY = 2
-    $btnOcr  = Find-ChildById $tb 4      # BTN_OCR  = 4
-    $btnPin  = Find-ChildById $tb 1      # BTN_PIN  = 1
-    Check '工具栏含 贴图/复制/OCR 按钮' ($btnPin -ne [IntPtr]::Zero -and $btnCopy -ne [IntPtr]::Zero -and $btnOcr -ne [IntPtr]::Zero)
+    # ── 需求 1/4：工具条只含按钮、无其它文字，且已移除「关闭」按钮 ──
+    $btnPin  = Find-ChildById $tb0 1     # BTN_PIN  = 1
+    $btnCopy = Find-ChildById $tb0 2     # BTN_COPY = 2
+    $btnSave = Find-ChildById $tb0 3     # BTN_SAVE = 3
+    $btnOcr  = Find-ChildById $tb0 4     # BTN_OCR  = 4
+    $btnRects = @($btnPin, $btnCopy, $btnSave, $btnOcr) | ForEach-Object { Get-Rect $_ }
+    $tbR = Get-Rect $tb0
+    $layoutOk = $true
+    for ($i = 0; $i -lt $btnRects.Count; $i++) {
+        $r = $btnRects[$i]
+        # 每个按钮都要有实际尺寸、落在工具条内、且不与左侧按钮重叠
+        # （防止 layout() 提前返回时全部控件堆在 (0,0) 10x10 而不被发现）
+        if (($r.R - $r.L) -lt 40 -or ($r.B - $r.T) -lt 20) { $layoutOk = $false }
+        if ($r.L -lt $tbR.L -or $r.R -gt $tbR.R) { $layoutOk = $false }
+        if ($i -gt 0) { if ($r.L -lt $btnRects[$i - 1].R) { $layoutOk = $false } }
+    }
+    Check '工具条含 贴图/复制/保存/OCR 按钮（且排布正确）' `
+        ($btnPin -ne [IntPtr]::Zero -and $btnCopy -ne [IntPtr]::Zero -and $btnSave -ne [IntPtr]::Zero -and $btnOcr -ne [IntPtr]::Zero -and $layoutOk) `
+        ("按钮宽 {0}px、起点 x={1}" -f ($btnRects[0].R - $btnRects[0].L), $btnRects[0].L)
+    $statics = @(Get-StaticTexts $tb0)
+    Check '工具条无其它文字（无标签/状态文本）' ($statics.Count -eq 0) ("STATIC 子控件数：{0}" -f $statics.Count)
+    $hasClose = $false
+    $cc = [W]::GetWindow($tb0, 5)
+    while ($cc -ne [IntPtr]::Zero) {
+        if ((Get-ControlText $cc) -eq '关闭') { $hasClose = $true }
+        $cc = [W]::GetWindow($cc, 2)
+    }
+    Check '工具条已移除「关闭」按钮' (-not $hasClose)
+    # 存档工具条外观：工具条设了 WDA_EXCLUDEFROMCAPTURE（截图工具惯例），
+    # 屏幕抓屏只会拍到它背后的内容，故这里只记录几何，不做像素存档。
+    $tr0 = Get-Rect $tb0
+    Write-Host ("  [调试] 工具条 rect=({0},{1})-({2},{3}) 尺寸 {4}x{5}" -f $tr0.L, $tr0.T, $tr0.R, $tr0.B, ($tr0.R - $tr0.L), ($tr0.B - $tr0.T))
 
-    # ── 4. 复制图像 -> 剪贴板 CF_DIB ──
+    # ── 需求 3：点「复制」→ 写剪贴板（CF_DIB）并关闭工具条 ──
     [void][W]::SendMessageW($btnCopy, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 500
-    $dibOk = Test-ClipDib
-    Check '截图复制到剪贴板（CF_DIB 位图）' $dibOk
-    # 复制提示已改为非模态 Toast（PixShotToast），不再有 #32770 消息框需要关闭。
+    Check '「复制」写入剪贴板（CF_DIB 位图）' (Test-ClipDib)
+    Check '「复制」后工具条已关闭' (Wait-WindowGone $pid0 'PixShotToolbar')
 
-    # ── 5. 发起 OCR（工具栏按钮，后台线程识别）──
-    [void][W]::SendMessageW($btnOcr, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
-    $ocrw = Wait-WindowByEnum $pid0 'PixShotOcrResult' 8000
-    Check 'OCR 结果窗口已打开' ($ocrw -ne [IntPtr]::Zero)
-    if ($ocrw -eq [IntPtr]::Zero) { throw 'OCR 结果窗口未出现' }
+    # ── 需求 2：点「OCR 识别」→ 不弹窗口，文字进剪贴板并关闭工具条 ──
+    $tb1 = Invoke-Capture
+    if ($tb1 -eq [IntPtr]::Zero) { throw '第二次截图未出现工具条' }
+    $before = Get-ClipText
+    $btnOcr1 = Find-ChildById $tb1 4
+    if ($btnOcr1 -eq [IntPtr]::Zero) { throw '第二次工具条未找到 OCR 按钮' }
+    [void][W]::SendMessageW($btnOcr1, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+    Check '「OCR 识别」后工具条已关闭' (Wait-WindowGone $pid0 'PixShotToolbar')
+    Start-Sleep -Milliseconds 300
+    Check '「OCR 识别」不再弹出结果窗口' ((Find-WindowByEnum $pid0 'PixShotOcrResult') -eq [IntPtr]::Zero)
+    $ocrText = Wait-ClipText 25000 $before
+    $hit = ($ocrText -match '(?i)pixshot|识别测试|测试文本|ABC|12345|OCR')
+    Check '「OCR 识别」把文字复制到剪贴板' ($ocrText.Trim().Length -gt 0 -and $hit) ("共 $($ocrText.Length) 字符")
+    if ($ocrText) {
+        $prev = if ($ocrText.Length -gt 200) { $ocrText.Substring(0, 200) + '...' } else { $ocrText }
+        Write-Host ("  [OCR 文本预览] {0}" -f (($prev -replace "[\r\n]+", " | ")))
+    }
 
-    # ── 6. 贴图 ──
-    [void][W]::SendMessageW($btnPin, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+    # ── 需求 3：点「贴图」→ 建贴图窗口并关闭工具条；附带验证选区/置顶/缩放/Esc ──
+    $tb2 = Invoke-Capture
+    if ($tb2 -eq [IntPtr]::Zero) { throw '第三次截图未出现工具条' }
+    $btnPin2 = Find-ChildById $tb2 1
+    if ($btnPin2 -eq [IntPtr]::Zero) { throw '第三次工具条未找到贴图按钮' }
+    [void][W]::SendMessageW($btnPin2, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
     $pin = Wait-WindowByEnum $pid0 'PixShotPin' 8000
-    Check '贴图窗口已创建' ($pin -ne [IntPtr]::Zero)
+    Check '「贴图」创建贴图窗口' ($pin -ne [IntPtr]::Zero)
     if ($pin -eq [IntPtr]::Zero) { throw '贴图窗口未出现' }
+    Check '「贴图」后工具条已关闭' (Wait-WindowGone $pid0 'PixShotToolbar')
     $r0 = Get-Rect $pin
-    Check '贴图位于原截图位置（初始 100% 缩放）' `
+    Check '贴图位于原截图位置（初始 100% 缩放，同时校验选区）' `
         (($r0.L -eq $SelX) -and ($r0.T -eq $SelY) -and (($r0.R - $r0.L) -eq $SelW) -and (($r0.B - $r0.T) -eq $SelH)) `
         ("rect=({0},{1})-({2},{3})" -f $r0.L, $r0.T, $r0.R, $r0.B)
     $ex = [W]::GetWindowLongW($pin, -20)     # GWL_EXSTYLE
@@ -320,7 +408,7 @@ try {
         Write-Host '  [存档] pin_visible.png'
     } catch { Write-Host "  [跳过] 截屏存档不可用：$($_.Exception.Message)" }
 
-    # ── 7. 滚轮缩放贴图（WM_MOUSEWHEEL，delta=+120 ×2）──
+    # ── 滚轮缩放贴图（WM_MOUSEWHEEL，delta=+120 ×2 → 约 1.21 倍）──
     [void][W]::SendMessageW($pin, $WM_MOUSEWHEEL, [IntPtr](120 -shl 16), [IntPtr]::Zero)
     Start-Sleep -Milliseconds 200
     [void][W]::SendMessageW($pin, $WM_MOUSEWHEEL, [IntPtr](120 -shl 16), [IntPtr]::Zero)
@@ -332,51 +420,10 @@ try {
     $zoomOk = ($gw -ge [int]($w0 * 0.17)) -and ($gw -le [int]($w0 * 0.30)) -and ($gh -ge [int]($h0 * 0.17)) -and ($gh -le [int]($h0 * 0.30))
     Check '滚轮缩放贴图（两次放大 ≈ ×1.21）' $zoomOk ("尺寸 ${w0}x${h0} -> +${gw}x+${gh}px")
 
-    # ── 8. OCR 识别完成并读取文本 ──
-    $title = ''
-    $deadline = [Environment]::TickCount + 25000
-    while ([Environment]::TickCount -lt $deadline) {
-        $title = Get-Text $ocrw
-        if ($title -match '识别结果' -or $title -match '识别失败') { break }
-        [void][System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 250
-    }
-    Check 'OCR 后台识别完成' ($title -match '识别结果') $title
-    $edit = [IntPtr]::Zero
-    $c = [W]::GetWindow($ocrw, 5)
-    while ($c -ne [IntPtr]::Zero) {
-        $sb = New-Object System.Text.StringBuilder 64
-        [void][W]::GetClassNameW($c, $sb, 64)
-        if ($sb.ToString() -eq 'EDIT') { $edit = $c; break }
-        $c = [W]::GetWindow($c, 2)
-    }
-    $text = ''
-    if ($edit -ne [IntPtr]::Zero) { $text = Get-ControlText $edit }
-    $hit = ($text -match '(?i)pixshot|识别测试|测试文本|ABC|12345|OCR')
-    Check 'OCR 识别出靶标文字（中文/英文/数字）' ($text.Trim().Length -gt 0 -and $hit) "共 $($text.Length) 字符"
-    if ($text) {
-        $prev = if ($text.Length -gt 200) { $text.Substring(0, 200) + '...' } else { $text }
-        Write-Host ("  [OCR 文本预览] {0}" -f (($prev -replace "[\r\n]+", " | ")))
-    }
-
-    # ── 9. 复制文本 -> 剪贴板比对 ──
-    $btnCopyText = Find-ChildById $ocrw 100     # ID_COPY = 100
-    Check '结果窗口含「复制文本」按钮' ($btnCopyText -ne [IntPtr]::Zero)
-    if ($btnCopyText -ne [IntPtr]::Zero) {
-        # 复制提示已改为非模态 Toast，不再弹 #32770 模态框、也无须关闭，
-        # 异步点击后留出写剪贴板的时间即可。
-        [void][W]::PostMessageW($btnCopyText, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
-        Start-Sleep -Milliseconds 700
-        $clip = Get-ClipText
-        Check '识别结果可复制到剪贴板（内容一致）' ($clip.Trim() -eq $text.Trim()) `
-            ("剪贴板 $($clip.Length) 字符 / 窗口 $($text.Length) 字符")
-    }
-
-    # ── 10. Esc 关闭贴图 ──
+    # ── Esc 关闭贴图 ──
     [void][W]::SendMessageW($pin, $WM_KEYDOWN, [IntPtr]0x1B, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 600
-    $pinGone = (Find-WindowByEnum $pid0 'PixShotPin') -eq [IntPtr]::Zero
-    Check 'Esc 关闭贴图窗口' $pinGone
+    Check 'Esc 关闭贴图窗口' (Wait-WindowGone $pid0 'PixShotPin')
 } finally {
     if ($form) { try { $form.Close(); [void][System.Windows.Forms.Application]::DoEvents() } catch { } }
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }

@@ -11,10 +11,9 @@ use crate::capture::{self, CapturedImage};
 use crate::config;
 use crate::error::{AppError, Result};
 use crate::theme;
-use crate::util::{self, add_button, add_label, raw, register_class_w};
-use crate::{clipboard, imageio, pin, results};
+use crate::util::{self, add_button, raw, register_class_w};
+use crate::{clipboard, imageio, ocr, pin, tray};
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject,
@@ -30,17 +29,16 @@ const BTN_SAVE: usize = 3;
 const BTN_OCR: usize = 4;
 const BTN_CLOSE: usize = 5;
 
-/// 逻辑客户区尺寸（96 DPI 基准）。
+/// 逻辑客户区尺寸（96 DPI 基准）。工具条只承载一行操作按钮，故比早期版本矮。
 const TB_W: i32 = 480;
-const TB_H: i32 = 174;
-/// 自绘标题栏高度（逻辑像素）。
-const TB_HEADER_H: i32 = 44;
+const TB_H: i32 = 104;
+/// 自绘标题栏高度（逻辑像素；无标题文字，仅作拖动区与 ✕ 的落点）。
+const TB_HEADER_H: i32 = 36;
 
 struct ToolbarData {
     image: Arc<CapturedImage>,
-    title: HWND,
-    status: HWND,
-    buttons: [HWND; 5],
+    /// 四个操作按钮：贴图 / 复制 / 保存 / OCR 识别
+    buttons: [HWND; 4],
     /// 标题栏关闭 ✕ 按钮（CloseGlyph 样式判定用）
     close_btn: HWND,
     /// 工具栏皮肤：固定深色
@@ -78,9 +76,7 @@ unsafe fn run_impl(image: Arc<CapturedImage>) -> Result<()> {
 
     let data = Box::into_raw(Box::new(ToolbarData {
         image,
-        title: HWND::default(),
-        status: HWND::default(),
-        buttons: [HWND::default(); 5],
+        buttons: [HWND::default(); 4],
         close_btn: HWND::default(),
         skin: theme::toolbar_skin(),
         backdrop: false,
@@ -118,7 +114,7 @@ unsafe fn run_impl(image: Arc<CapturedImage>) -> Result<()> {
     Ok(())
 }
 
-/// 按 DPI 与客户区尺寸重排控件（5 个按钮均分可用宽度，高 DPI 下不再溢出）。
+/// 按 DPI 与客户区尺寸重排控件（4 个按钮均分可用宽度，高 DPI 下不溢出）。
 unsafe fn layout(hwnd: HWND) {
     let Some(d) = data_of(hwnd) else { return };
     let mut cr = RECT::default();
@@ -126,32 +122,30 @@ unsafe fn layout(hwnd: HWND) {
     let (cw, ch) = (cr.right, cr.bottom);
     let dpi = util::dpi_of(hwnd);
     let s = |v: i32| util::scaled(v, dpi);
-    if cw < s(240) || ch < s(120) {
+    if cw < s(240) || ch < s(80) {
         return;
     }
 
-    let pad = s(24);
+    let pad = s(16);
     let header_h = s(TB_HEADER_H);
     let btn_h = s(38);
-    let gap = s(10);
+    let gap = s(8);
     let n = d.buttons.len() as i32;
     let total = cw - pad * 2;
     let btn_w = ((total - gap * (n - 1)) / n).max(s(56));
 
-    let _ = MoveWindow(d.title, pad, s(58), cw - pad * 2, s(20), BOOL(1));
-    let _ = MoveWindow(d.status, pad, s(80), cw - pad * 2, s(18), BOOL(1));
-
-    let by = (ch - s(66)).max(header_h);
+    let by = header_h + s(10);
     for (i, b) in d.buttons.iter().enumerate() {
         let bx = pad + i as i32 * (btn_w + gap);
         let _ = MoveWindow(*b, bx, by, btn_w, btn_h, BOOL(1));
     }
 
-    // 标题栏 ✕（右对齐）
-    let _ = MoveWindow(d.close_btn, cw - s(52), s(6), s(46), s(32), BOOL(1));
+    // 标题栏 ✕（右对齐；工具条唯一保留的"取消"入口）
+    let _ = MoveWindow(d.close_btn, cw - s(46), s(2), s(40), s(32), BOOL(1));
 }
 
-/// 工具栏自绘：深色基底 + 标题 + 圆角内容卡片。
+/// 工具栏自绘：深色基底 + 圆角内容卡片。
+/// 除按钮自身文本外不绘制任何文字（标题/状态已移除）。
 unsafe fn paint(hwnd: HWND) {
     let Some(d) = data_of(hwnd) else { return };
     let t = d.skin;
@@ -183,28 +177,7 @@ unsafe fn paint(hwnd: HWND) {
     SelectObject(hdc, op);
     let _ = DeleteObject(pen);
 
-    // 2. 标题
-    let font = util::gui_font(hwnd, 10, 600);
-    let old_font = SelectObject(hdc, font);
-    raw::SetBkMode(hdc.0 as isize, 1);
-    raw::SetTextColor(hdc.0 as isize, t.text);
-    let mut tr = RECT {
-        left: util::scaled(18, dpi),
-        top: 0,
-        right: cw - util::scaled(60, dpi),
-        bottom: header_h,
-    };
-    let tw = util::to_wide("PixShot");
-    let _ = raw::DrawTextW(
-        hdc.0 as isize,
-        PCWSTR::from_raw(tw.as_ptr()),
-        -1,
-        &mut tr,
-        0x20 | 0x4, // DT_SINGLELINE | DT_VCENTER
-    );
-    SelectObject(hdc, old_font);
-
-    // 3. 圆角内容卡片
+    // 2. 圆角内容卡片（操作按钮绘制其上）
     let brush = CreateSolidBrush(t.card);
     let pen = CreatePen(PS_SOLID, 1, t.stroke);
     let ob = SelectObject(hdc, brush);
@@ -225,12 +198,6 @@ unsafe fn paint(hwnd: HWND) {
     let _ = DeleteObject(pen);
 
     let _ = EndPaint(hwnd, &ps);
-}
-
-unsafe fn set_status(hwnd: HWND, text: &str) {
-    if let Some(d) = data_of(hwnd) {
-        let _ = SetWindowTextW(d.status, PCWSTR::from_raw(util::to_wide(text).as_ptr()));
-    }
 }
 
 unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -266,14 +233,12 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             d.skin = theme::toolbar_skin();
             d.backdrop = theme::apply_frame(hwnd, d.skin, false);
 
-            // 先以占位尺寸创建，再由 layout 统一定位（DPI 变化时同一函数复用）
-            d.title = add_label(hwnd, &format!("已截取 {} × {} 像素", d.image.width, d.image.height), 0, 0, 10, 10);
-            d.status = add_label(hwnd, "选择操作：", 0, 0, 10, 10);
+            // 工具条只放操作按钮：不再创建标题/状态标签（除按钮外不显示文字）。
+            // 先以占位尺寸创建，再由 layout 统一定位（DPI 变化时同一函数复用）。
             d.buttons[0] = add_button(hwnd, "贴图", 0, 0, 10, 10, BTN_PIN);
             d.buttons[1] = add_button(hwnd, "复制", 0, 0, 10, 10, BTN_COPY);
             d.buttons[2] = add_button(hwnd, "保存", 0, 0, 10, 10, BTN_SAVE);
             d.buttons[3] = add_button(hwnd, "OCR 识别", 0, 0, 10, 10, BTN_OCR);
-            d.buttons[4] = add_button(hwnd, "关闭", 0, 0, 10, 10, BTN_CLOSE);
             d.close_btn = add_button(hwnd, "✕", 0, 0, 10, 10, BTN_CLOSE);
             for b in d.buttons {
                 d.fx.register(b);
@@ -288,14 +253,6 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         WM_PAINT => {
             paint(hwnd);
             LRESULT(0)
-        }
-
-        WM_CTLCOLORSTATIC => {
-            let mut r = LRESULT(0);
-            if let Some(d) = data_of(hwnd) {
-                r = util::ctlcolor_static(wp, d.skin.text);
-            }
-            r
         }
 
         WM_DRAWITEM => {
@@ -387,15 +344,19 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     }
 }
 
+/// 关闭工具条：隐藏后结束其模态消息循环，回到主循环。
+/// 贴图 / 复制 / 保存 / OCR 四个操作都走这里 —— 工具条是「一次性操作条」。
+unsafe fn close_bar(hwnd: HWND) {
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    PostQuitMessage(0);
+}
+
 unsafe fn handle_command(hwnd: HWND, id: usize) {
     match id {
         BTN_PIN => {
             let Some(d) = data_of(hwnd) else { return };
             match pin::create(&d.image) {
-                Ok(_) => {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                    PostQuitMessage(0); // 结束工具栏循环，回到主循环；贴图窗口存活
-                }
+                Ok(_) => close_bar(hwnd),
                 Err(e) => util::error_msgbox(&format!("贴图失败：{e}")),
             }
         }
@@ -404,8 +365,8 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             // Arc 共享像素，copy_image 直接读切片，不再整幅复制
             match clipboard::copy_image(&d.image.data, d.image.width, d.image.height) {
                 Ok(()) => {
-                    set_status(hwnd, "✓ 已复制到剪贴板");
                     crate::toast::show("已复制图像到剪贴板");
+                    close_bar(hwnd);
                 }
                 Err(e) => util::error_msgbox(&format!("复制失败：{e}")),
             }
@@ -422,33 +383,51 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
                 cfg.save_dir.as_deref(),
             ) {
                 Ok(Some(path)) => {
-                    set_status(hwnd, &format!("✓ 已保存：{path}"));
                     let name = std::path::Path::new(&path)
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or(path);
                     crate::toast::show(&format!("已保存：{name}"));
+                    close_bar(hwnd);
                 }
-                Ok(None) => set_status(hwnd, "已取消保存"),
+                Ok(None) => close_bar(hwnd), // 取消保存同样关闭工具条
                 Err(e) => util::error_msgbox(&format!("保存失败：{e}")),
             }
         }
         BTN_OCR => {
             let Some(d) = data_of(hwnd) else { return };
-            // Arc 克隆：OCR 线程与工具栏共享同一份像素
-            match results::start_ocr(
-                Arc::clone(&d.image.data),
-                d.image.width,
-                d.image.height,
-            ) {
-                Ok(_) => {
-                    set_status(hwnd, "正在识别文字…（结果窗口已打开）");
-                    crate::toast::show("正在识别文字…");
+            // 不再弹出结果窗口：后台识别 → 直接写剪贴板 → 由主窗口弹 Toast。
+            // 识别必须离开 GUI 线程（WinRT 异步调用不可阻塞消息循环），因此
+            // 用 WM_APP_OCR_DONE 把结果码投递回主窗口展示提示。
+            let image = Arc::clone(&d.image.data);
+            let (w, h) = (d.image.width, d.image.height);
+            // HWND 非 Send：跨线程以地址（isize）传递，线程内还原
+            let main_addr = tray::main_hwnd().0 as isize;
+            std::thread::spawn(move || {
+                let code = match ocr::recognize(&image, w, h) {
+                    Ok(text) if !text.trim().is_empty() => {
+                        if clipboard::copy_text(&text).is_ok() {
+                            tray::OCR_DONE_COPIED
+                        } else {
+                            tray::OCR_DONE_FAIL
+                        }
+                    }
+                    Ok(_) => tray::OCR_DONE_EMPTY,
+                    Err(e) => {
+                        crate::diag::log(&format!("[ocr] 工具条识别失败: {e}"));
+                        tray::OCR_DONE_FAIL
+                    }
+                };
+                if main_addr != 0 {
+                    unsafe {
+                        let main = HWND(main_addr as *mut core::ffi::c_void);
+                        let _ = PostMessageW(main, tray::WM_APP_OCR_DONE, WPARAM(code), LPARAM(0));
+                    }
                 }
-                Err(e) => util::error_msgbox(&format!("OCR 启动失败：{e}")),
-            }
+            });
+            close_bar(hwnd);
         }
-        BTN_CLOSE => PostQuitMessage(0),
+        BTN_CLOSE => close_bar(hwnd),
         _ => {}
     }
 }
