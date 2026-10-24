@@ -204,6 +204,42 @@ toast_ms = 1600              ; 操作提示的停留毫秒数
 
 一键采集诊断信息：`pwsh -File scripts\diag_tray_hotkey.ps1`
 
+## OCR 引擎扩展点与双版本发布
+
+本仓库是**增强版**（`pixshot`）；另有**精简版** `pixshot-lite`，是同一代码基线删掉全部 OCR 的
+独立仓库。两条线各自独立更新，非 OCR 的修复按需互相 cherry-pick（见下）。
+
+| | 增强版 `pixshot` | 精简版 `pixshot-lite` |
+|---|---|---|
+| 功能 | 截图 / 贴图 / **OCR** | 截图 / 贴图 |
+| OCR 引擎 | 系统 `Windows.Media.Ocr`（当前）→ 将来可换内置高精度引擎 | 无 |
+| 依赖 | `windows`；接入内置引擎后额外带该引擎（体积显著增大） | 仅 `windows` |
+
+**引擎抽象层**（`src/ocr/engine.rs`）把「用哪个引擎」与识别管线解耦：管线（上采样、多变体
+跑分取优、按行重建）只依赖 `OcrEngineImpl` trait，不感知具体引擎。新增一个内置引擎只需三步：
+
+1. 新增 `src/ocr/<引擎名>.rs`，实现 `OcrEngineImpl`（`id` / `max_dimension` / `recognize`）；
+2. 在 `engine::create()` 里挑引擎 —— 这是**唯一的**挑选点，例如「配置指定内置 → 内置 → 回退系统」；
+3. 该引擎的依赖写进 `Cargo.toml` 并**设为 optional**（或走独立 profile），不启用时不进产物。
+
+这样内置引擎的体积代价只落在增强版上，精简版和「未启用该 feature 的增强版构建」都保持轻量。
+当前 `engine::create()` 恒返回系统 WinRT 引擎，行为与重构前完全一致。
+
+**两条线互相取补丁**（两仓库各自独立，没有共同祖先之外的自动同步）：
+
+```bash
+# 在增强版里挑精简版的提交
+git remote add lite git@github.com:huxuyf/pixshot-lite.git
+git fetch lite && git cherry-pick <精简版的提交>
+
+# 反向亦然：把增强版里与 OCR 无关的修复挑到精简版
+git remote add plus git@github.com:huxuyf/pixshot.git
+git fetch plus && git cherry-pick <增强版的提交>
+```
+
+涉及 `src/ocr*`、工具条/菜单里的 OCR 项、`config.ini` 的 `ocr_lang` 等改动**不要**跨线合并——
+精简版里这些代码不存在。改公共逻辑（截图、贴图、托盘、主题、日志、保存命名等）时**两条线都要改**。
+
 ## 项目结构
 
 ```
@@ -220,7 +256,10 @@ pixshot/
 │   ├── svgpath.rs        # SVG path 展平器：把 Lucide 的 d 字符串解析为折线（纯 Rust，可单测）
 │   ├── tooltip.rs        # 图标悬停提示气泡（自绘卡片，文案含快捷键；替代 comctl32 标准 tooltip）
 │   ├── pin.rs            # 置顶贴图窗口（拖动/滚轮缩放/自绘四周投影/离屏合成/右键菜单，像素级完整呈现）
-│   ├── ocr.rs            # Windows.Media.Ocr 封装（语言回退链、超尺寸降采样、识别→剪贴板→Toast 共用路径）
+│   ├── ocr.rs            # OCR 识别管线（多变体跑分取优、上采样、按行重建）+ 引擎抽象入口
+│   ├── ocr/
+│   │   ├── engine.rs     # 引擎抽象层：OcrEngineImpl trait + 唯一的引擎挑选点 engine::create()
+│   │   └── winrt.rs      # 系统引擎实现：Windows.Media.Ocr（语言回退链、无模型、零体积）
 │   ├── clipboard.rs      # Win32 剪贴板：CF_DIB 图像 / CF_UNICODETEXT 文本（RAII 守卫）
 │   ├── imageio.rs        # WIC 编码 PNG/JPEG/BMP + 系统保存对话框（记住上次目录）
 │   ├── config.rs         # config.ini 读写与解析（热键/格式/目录/OCR 语言/Toast 时长）

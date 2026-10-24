@@ -1,25 +1,21 @@
-//! OCR：Windows.Media.Ocr（WinRT，系统自带，支持中英文等多语言）。
+//! OCR：识别管线 + 可插拔引擎。
 //!
 //! 识别前处理链（见 `recognize_inner`）：小图上采样到引擎偏好的字高 → 生成若干候选图
 //! （原图 / Otsu 二值化 / 深色反相）→ 各跑一次识别 → 用启发式评分取最优 → 逐行重建并
 //! 清理中文假空格。引擎返回的是无置信度的纯文本，故用「有意义字符占比 × log(长度)」来代替。
 //!
-//! 引擎查找顺序：
-//! 1. 配置文件中指定的 `ocr_lang`（如 `zh-Hans-CN`）；
-//! 2. 系统用户配置语言；
-//! 3. `zh-Hans-CN` → `zh-Hans` → `en-US`；
-//! 4. 任意可用语言。
+//! 引擎本身与管线解耦，见 [`engine`]：当前唯一实现是系统自带的 Windows.Media.Ocr
+//! （[`winrt`]，无需安装、不打包模型）。将来接入内置高精度引擎时只改 [`engine::create`]。
 //!
 //! 本模块不含 GUI，可在任意后台线程调用（自行初始化 COM/MTA）。
 
+mod engine;
+mod winrt;
+
+use engine::OcrEngineImpl;
 use std::sync::Arc;
 
 use crate::error::{AppError, Result};
-use windows::core::HSTRING;
-use windows::Globalization::Language;
-use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
-use windows::Media::Ocr::OcrEngine;
-use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 /// 后台识别 → 文字写入剪贴板 → 交主窗口弹 Toast（**不弹结果窗口**）。
@@ -77,16 +73,21 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
     if bgra.len() < (w as usize) * (h as usize) * 4 {
         return Err(AppError::Ocr("图像数据不完整".into()));
     }
-    let engine = create_engine().ok_or_else(|| {
+    let engine = engine::create().ok_or_else(|| {
         AppError::Ocr(
             "系统未安装可用的 OCR 语言包。请在 设置 → 时间和语言 → 语言和区域 中添加\
              中文（简体）或英文语言，并包含“文字识别”可选功能。"
                 .into(),
         )
     })?;
+    crate::diag::log(&format!(
+        "[ocr] 引擎={} 上限={}px",
+        engine.id(),
+        engine.max_dimension()
+    ));
 
-    // Windows.Media.Ocr 对字符高 20–40px 最准：小图先放大，超限大图再等比缩小。
-    let max = OcrEngine::MaxImageDimension().unwrap_or(4096) as i32;
+    // 引擎对 20–40px 的字高最准：小图先放大，超限大图再等比缩小。
+    let max = engine.max_dimension();
     let (sw, sh) = target_size(w, h, max);
     let base: Vec<u8> = if sw != w || sh != h {
         resize_bicubic(bgra, w as usize, h as usize, sw as usize, sh as usize)
@@ -94,16 +95,16 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
         bgra.to_vec()
     };
 
-    // 多变体跑分取优：WinRT 不暴露置信度，就用「有意义字符占比 × log(长度)」这套启发式
+    // 多变体跑分取优：引擎不暴露置信度，就用「有意义字符占比 × log(长度)」这套启发式
     // 在几幅候选图之间挑最优。base 已足够干净时跳过其余候选，省掉多余的一次识别。
     let dark = mean_luma(&base) < DARK_LUMA_THRESHOLD;
     let mut best: Option<(f32, String)> = None;
-    try_candidate(&engine, "base", &base, sw, sh, &mut best);
+    try_candidate(engine.as_ref(), "base", &base, sw, sh, &mut best);
     let confident = best.as_ref().map_or(false, |(_, t)| is_confident(t));
     if !confident {
-        try_candidate(&engine, "binarized", &binarize_otsu(&base), sw, sh, &mut best);
+        try_candidate(engine.as_ref(), "binarized", &binarize_otsu(&base), sw, sh, &mut best);
         if dark {
-            try_candidate(&engine, "inverted", &invert(&base), sw, sh, &mut best);
+            try_candidate(engine.as_ref(), "inverted", &invert(&base), sw, sh, &mut best);
         }
     }
     best.map(|(_, t)| t)
@@ -114,14 +115,14 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
 ///
 /// 单个候选失败只记日志，不影响其它候选——候选中任何一幅成功即可返回结果。
 fn try_candidate(
-    engine: &OcrEngine,
+    engine: &dyn OcrEngineImpl,
     name: &str,
     data: &[u8],
     w: i32,
     h: i32,
     best: &mut Option<(f32, String)>,
 ) {
-    match run_engine(engine, data, w, h) {
+    match engine.recognize(data, w, h) {
         Ok(text) => {
             let score = score_text(&text);
             crate::diag::log(&format!(
@@ -136,63 +137,7 @@ fn try_candidate(
     }
 }
 
-/// 把一幅 BGRA 图交给引擎识别，并按 `OcrResult::Lines()` 逐行重建文本。
-///
-/// 用 `Lines()` 而非 `result.Text()`：后者把各行用空格拼成一行，中文会丢换行、插空格，
-/// 用户很容易把这当成识别错误。逐行 join 成 `\n` 后，再清掉中文之间被引擎插入的假空格。
-fn run_engine(engine: &OcrEngine, data: &[u8], w: i32, h: i32) -> Result<String> {
-    let buf = CryptographicBuffer::CreateFromByteArray(data)?;
-    let bmp = SoftwareBitmap::CreateCopyFromBuffer(&buf, BitmapPixelFormat::Bgra8, w, h)?;
-    let result = engine.RecognizeAsync(&bmp)?.get()?;
-    let lines = result.Lines()?;
-    let mut parts: Vec<String> = Vec::new();
-    for i in 0..lines.Size()? {
-        let line = lines.GetAt(i)?;
-        parts.push(line.Text()?.to_string());
-    }
-    Ok(collapse_cjk_spaces(&parts.join("\n")).trim().to_string())
-}
-
-/// 依次尝试多种方式创建 OCR 引擎。
-fn create_engine() -> Option<OcrEngine> {
-    // 1. 配置文件指定的语言
-    if let Some(tag) = crate::config::get().ocr_lang {
-        if let Ok(lang) = Language::CreateLanguage(&HSTRING::from(tag.as_str())) {
-            if let Ok(e) = OcrEngine::TryCreateFromLanguage(&lang) {
-                crate::diag::log(&format!("[ocr] 使用配置语言 {tag}"));
-                return Some(e);
-            }
-            crate::diag::log(&format!("[ocr] 配置语言 {tag} 不可用，继续回退"));
-        }
-    }
-    // 2. 系统用户配置的语言
-    if let Ok(e) = OcrEngine::TryCreateFromUserProfileLanguages() {
-        return Some(e);
-    }
-    // 3. 常用语言回退
-    for tag in ["zh-Hans-CN", "zh-Hans", "en-US"] {
-        if let Ok(lang) = Language::CreateLanguage(&HSTRING::from(tag)) {
-            if let Ok(e) = OcrEngine::TryCreateFromLanguage(&lang) {
-                return Some(e);
-            }
-        }
-    }
-    // 4. 任意可用语言
-    if let Ok(langs) = OcrEngine::AvailableRecognizerLanguages() {
-        if let Ok(size) = langs.Size() {
-            for i in 0..size {
-                if let Ok(lang) = langs.GetAt(i) {
-                    if let Ok(e) = OcrEngine::TryCreateFromLanguage(&lang) {
-                        return Some(e);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// 小图放大的目标最长边。Windows.Media.Ocr 对 20–40px 字符高最准，截图正文常只有
+/// 小图放大的目标最长边。引擎对 20–40px 字符高最准，截图正文常只有
 /// 12–16px，放大到该尺度可显著提升小字/中文的识别率。
 const OCR_UPSAMPLE_TARGET: i32 = 2400;
 /// 最大放大倍数。防止极小图被拉到天价尺寸白烧算力（放大收益在 3× 左右即饱和）。
