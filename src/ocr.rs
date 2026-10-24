@@ -1,5 +1,9 @@
 //! OCR：Windows.Media.Ocr（WinRT，系统自带，支持中英文等多语言）。
 //!
+//! 识别前处理链（见 `recognize_inner`）：小图上采样到引擎偏好的字高 → 生成若干候选图
+//! （原图 / Otsu 二值化 / 深色反相）→ 各跑一次识别 → 用启发式评分取最优 → 逐行重建并
+//! 清理中文假空格。引擎返回的是无置信度的纯文本，故用「有意义字符占比 × log(长度)」来代替。
+//!
 //! 引擎查找顺序：
 //! 1. 配置文件中指定的 `ocr_lang`（如 `zh-Hans-CN`）；
 //! 2. 系统用户配置语言；
@@ -81,26 +85,72 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
         )
     })?;
 
-    // Windows.Media.Ocr 有最大尺寸限制，超出时等比缩小
+    // Windows.Media.Ocr 对字符高 20–40px 最准：小图先放大，超限大图再等比缩小。
     let max = OcrEngine::MaxImageDimension().unwrap_or(4096) as i32;
-    let (sw, sh, data): (i32, i32, Vec<u8>) = if w > max || h > max {
-        let f = (max as f32 / w.max(h) as f32).min(1.0);
-        let nw = ((w as f32 * f) as i32).max(1);
-        let nh = ((h as f32 * f) as i32).max(1);
-        (
-            nw,
-            nh,
-            resize_nearest(bgra, w as usize, h as usize, nw as usize, nh as usize),
-        )
+    let (sw, sh) = target_size(w, h, max);
+    let base: Vec<u8> = if sw != w || sh != h {
+        resize_bicubic(bgra, w as usize, h as usize, sw as usize, sh as usize)
     } else {
-        (w, h, bgra.to_vec())
+        bgra.to_vec()
     };
 
-    let buf = CryptographicBuffer::CreateFromByteArray(&data)?;
-    let bmp = SoftwareBitmap::CreateCopyFromBuffer(&buf, BitmapPixelFormat::Bgra8, sw, sh)?;
+    // 多变体跑分取优：WinRT 不暴露置信度，就用「有意义字符占比 × log(长度)」这套启发式
+    // 在几幅候选图之间挑最优。base 已足够干净时跳过其余候选，省掉多余的一次识别。
+    let dark = mean_luma(&base) < DARK_LUMA_THRESHOLD;
+    let mut best: Option<(f32, String)> = None;
+    try_candidate(&engine, "base", &base, sw, sh, &mut best);
+    let confident = best.as_ref().map_or(false, |(_, t)| is_confident(t));
+    if !confident {
+        try_candidate(&engine, "binarized", &binarize_otsu(&base), sw, sh, &mut best);
+        if dark {
+            try_candidate(&engine, "inverted", &invert(&base), sw, sh, &mut best);
+        }
+    }
+    best.map(|(_, t)| t)
+        .ok_or_else(|| AppError::Ocr("所有候选识别均失败".into()))
+}
+
+/// 对一幅候选图跑一次识别，并把结果按启发式评分并入 `best`（更高分才替换）。
+///
+/// 单个候选失败只记日志，不影响其它候选——候选中任何一幅成功即可返回结果。
+fn try_candidate(
+    engine: &OcrEngine,
+    name: &str,
+    data: &[u8],
+    w: i32,
+    h: i32,
+    best: &mut Option<(f32, String)>,
+) {
+    match run_engine(engine, data, w, h) {
+        Ok(text) => {
+            let score = score_text(&text);
+            crate::diag::log(&format!(
+                "[ocr] 候选 {name}: score={score:.2} 字符数={}",
+                text.chars().count()
+            ));
+            if best.as_ref().map_or(true, |(b, _)| score > *b) {
+                *best = Some((score, text));
+            }
+        }
+        Err(e) => crate::diag::log(&format!("[ocr] 候选 {name} 识别失败: {e}")),
+    }
+}
+
+/// 把一幅 BGRA 图交给引擎识别，并按 `OcrResult::Lines()` 逐行重建文本。
+///
+/// 用 `Lines()` 而非 `result.Text()`：后者把各行用空格拼成一行，中文会丢换行、插空格，
+/// 用户很容易把这当成识别错误。逐行 join 成 `\n` 后，再清掉中文之间被引擎插入的假空格。
+fn run_engine(engine: &OcrEngine, data: &[u8], w: i32, h: i32) -> Result<String> {
+    let buf = CryptographicBuffer::CreateFromByteArray(data)?;
+    let bmp = SoftwareBitmap::CreateCopyFromBuffer(&buf, BitmapPixelFormat::Bgra8, w, h)?;
     let result = engine.RecognizeAsync(&bmp)?.get()?;
-    let text = result.Text()?.to_string();
-    Ok(text.trim().to_string())
+    let lines = result.Lines()?;
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0..lines.Size()? {
+        let line = lines.GetAt(i)?;
+        parts.push(line.Text()?.to_string());
+    }
+    Ok(collapse_cjk_spaces(&parts.join("\n")).trim().to_string())
 }
 
 /// 依次尝试多种方式创建 OCR 引擎。
@@ -142,66 +192,574 @@ fn create_engine() -> Option<OcrEngine> {
     None
 }
 
-/// 最近邻缩放（仅用于超出 OCR 尺寸限制时的降采样）。
-fn resize_nearest(bgra: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
-    let mut out = vec![0u8; nw * nh * 4];
+/// 小图放大的目标最长边。Windows.Media.Ocr 对 20–40px 字符高最准，截图正文常只有
+/// 12–16px，放大到该尺度可显著提升小字/中文的识别率。
+const OCR_UPSAMPLE_TARGET: i32 = 2400;
+/// 最大放大倍数。防止极小图被拉到天价尺寸白烧算力（放大收益在 3× 左右即饱和）。
+const OCR_MAX_UPSCALE: f32 = 3.0;
+
+/// 依据引擎上限决定 OCR 前的目标尺寸：小图放大、超限大图等比缩小、其余原样。
+///
+/// 放大分支的缩放系数被 `OCR_UPSAMPLE_TARGET / longest` 与 `OCR_MAX_UPSCALE` 双重约束，
+/// 因此结果最长边不超过目标值；仅在引擎上限低于目标值时才需要兜底收缩。
+fn target_size(w: i32, h: i32, max: i32) -> (i32, i32) {
+    if w <= 0 || h <= 0 {
+        return (w.max(1), h.max(1));
+    }
+    let longest = w.max(h) as f32;
+    let max = max.max(1) as f32;
+    let mut scale = if longest > max {
+        max / longest
+    } else if longest < OCR_UPSAMPLE_TARGET as f32 {
+        (OCR_UPSAMPLE_TARGET as f32 / longest).min(OCR_MAX_UPSCALE)
+    } else {
+        1.0
+    };
+    if longest * scale > max {
+        scale = max / longest;
+    }
+    let nw = ((w as f32 * scale).round() as i32).max(1);
+    let nh = ((h as f32 * scale).round() as i32).max(1);
+    (nw, nh)
+}
+
+/// Catmull-Rom 双三次核：|x|≤1 为 1.5|x|³-2.5|x|²+1，1<|x|<2 为 -0.5|x|³+2.5|x|²-4|x|+2。
+fn cubic_kernel(x: f32) -> f32 {
+    let x = x.abs();
+    if x <= 1.0 {
+        (1.5 * x - 2.5) * x * x + 1.0
+    } else if x < 2.0 {
+        ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0
+    } else {
+        0.0
+    }
+}
+
+/// 高质量可分离双三次缩放（先横向再纵向），用于 OCR 前的上/下采样。
+///
+/// 放大时双三次能生成真实的中间灰度（最近邻只会复制像素，放大成马赛克）；
+/// 缩小时按缩放比**加宽核的支撑域**做低通，等价于带权重的区域平均，避免抽点采样
+/// 把细笔画整根丢掉。两者都减少锯齿对字符笔画的破坏。输入/输出均为 BGRA、自上而下、
+/// 行距 = width×4；四个通道（含 alpha）一并插值，以像素中心对齐并钳制采样坐标。
+fn resize_bicubic(bgra: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
     if w == 0 || h == 0 || nw == 0 || nh == 0 {
+        return vec![0u8; nw * nh * 4];
+    }
+    if nw == w && nh == h {
+        let mut out = vec![0u8; w * h * 4];
+        let n = out.len().min(bgra.len());
+        out[..n].copy_from_slice(&bgra[..n]);
         return out;
     }
-    for y in 0..nh {
-        let sy = (y * h / nh).min(h - 1);
+
+    let read = |x: usize, y: usize, c: usize| -> f32 {
+        let i = (y * w + x) * 4 + c;
+        if i < bgra.len() {
+            bgra[i] as f32
+        } else {
+            0.0
+        }
+    };
+
+    // 横向：w → nw，中间结果用 f32 承接，避免纵向再做一次 8 位量化
+    let mut tmp = vec![0f32; nw * h * 4];
+    let rx = w as f32 / nw as f32;
+    let fx = rx.max(1.0); // 缩小 → 核支撑域按此加宽
+    let support_x = 2.0 * fx;
+    for y in 0..h {
         for x in 0..nw {
-            let sx = (x * w / nw).min(w - 1);
-            let s = (sy * w + sx) * 4;
+            let src = (x as f32 + 0.5) * rx - 0.5;
             let d = (y * nw + x) * 4;
-            if s + 4 <= bgra.len() {
-                out[d..d + 4].copy_from_slice(&bgra[s..s + 4]);
+            let lo = (src - support_x).ceil() as i32;
+            let hi = (src + support_x).floor() as i32;
+            for c in 0..4 {
+                let mut acc = 0f32;
+                let mut wsum = 0f32;
+                for idx in lo..=hi {
+                    let wt = cubic_kernel((src - idx as f32) / fx);
+                    let cx = idx.clamp(0, w as i32 - 1) as usize;
+                    acc += wt * read(cx, y, c);
+                    wsum += wt;
+                }
+                tmp[d + c] = if wsum != 0.0 { acc / wsum } else { 0.0 };
+            }
+        }
+    }
+
+    // 纵向：h → nh，量化回 8 位
+    let mut out = vec![0u8; nw * nh * 4];
+    let ry = h as f32 / nh as f32;
+    let fy = ry.max(1.0);
+    let support_y = 2.0 * fy;
+    for y in 0..nh {
+        let src = (y as f32 + 0.5) * ry - 0.5;
+        let lo = (src - support_y).ceil() as i32;
+        let hi = (src + support_y).floor() as i32;
+        for x in 0..nw {
+            let d = (y * nw + x) * 4;
+            for c in 0..4 {
+                let mut acc = 0f32;
+                let mut wsum = 0f32;
+                for idx in lo..=hi {
+                    let wt = cubic_kernel((src - idx as f32) / fy);
+                    let cy = idx.clamp(0, h as i32 - 1) as usize;
+                    acc += wt * tmp[(cy * nw + x) * 4 + c];
+                    wsum += wt;
+                }
+                let v = if wsum != 0.0 { acc / wsum } else { 0.0 };
+                out[d + c] = v.round().clamp(0.0, 255.0) as u8;
             }
         }
     }
     out
 }
 
+/// 判定「深色背景」的平均亮度阈值（0–255）。深色主题（IDE/终端）常见均值 30–60，
+/// 白底文档 200 以上，取中间偏暗处作为分界。
+const DARK_LUMA_THRESHOLD: f32 = 110.0;
+
+/// 按 Rec.601 计算整幅图平均亮度（0–255）。输入 BGRA。
+fn mean_luma(bgra: &[u8]) -> f32 {
+    let mut sum = 0f64;
+    let mut n = 0u64;
+    for px in bgra.chunks_exact(4) {
+        sum += luma(px[2], px[1], px[0]);
+        n += 1;
+    }
+    if n == 0 {
+        0.0
+    } else {
+        (sum / n as f64) as f32
+    }
+}
+
+/// 单像素亮度（R/G/B 顺序，Rec.601）。
+fn luma(r: u8, g: u8, b: u8) -> f64 {
+    0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64
+}
+
+/// 反相 RGB（alpha 保持不透明）。用于白字黑底的深色截图——WinRT 对这类图识别较差。
+fn invert(bgra: &[u8]) -> Vec<u8> {
+    let mut out = bgra.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        px[0] = 255 - px[0];
+        px[1] = 255 - px[1];
+        px[2] = 255 - px[2];
+        px[3] = 255;
+    }
+    out
+}
+
+/// Otsu 全局阈值：在直方图上寻找类间方差最大的分割点。
+fn otsu_threshold(hist: &[u32; 256], total: u32) -> u8 {
+    if total == 0 {
+        return 127;
+    }
+    let sum_all: f64 = (0..256).map(|i| i as f64 * hist[i] as f64).sum();
+    let mut sum_b = 0f64;
+    let mut w_b = 0u32;
+    let mut max_var = -1f64;
+    let mut thr = 127u8;
+    for t in 0..256 {
+        w_b += hist[t];
+        if w_b == 0 {
+            continue;
+        }
+        let w_f = total - w_b;
+        if w_f == 0 {
+            break;
+        }
+        sum_b += t as f64 * hist[t] as f64;
+        let m_b = sum_b / w_b as f64;
+        let m_f = (sum_all - sum_b) / w_f as f64;
+        let var = w_b as f64 * w_f as f64 * (m_b - m_f) * (m_b - m_f);
+        if var > max_var {
+            max_var = var;
+            thr = t as u8;
+        }
+    }
+    thr
+}
+
+/// 灰度化 + Otsu 二值化，并把背景统一成白色（深色背景自动反相）。
+///
+/// 对低对比度、彩色/渐变背景的截图，二值化能把文字从背景里「拔」出来；统一成白底黑字
+/// 也顺应引擎偏好。输出 BGRA，只有 0/255 两种灰度。
+fn binarize_otsu(bgra: &[u8]) -> Vec<u8> {
+    let mut hist = [0u32; 256];
+    let mut total = 0u32;
+    for px in bgra.chunks_exact(4) {
+        let y = luma(px[2], px[1], px[0]).round() as usize;
+        hist[y.min(255)] += 1;
+        total += 1;
+    }
+    let thr = otsu_threshold(&hist, total) as usize;
+    // 暗色像素占多数 ⇒ 背景是暗的（白字黑底），需反相输出为白底黑字
+    let dark_count: u32 = hist[..=thr].iter().sum();
+    let dark_is_bg = dark_count * 2 > total;
+
+    let mut out = bgra.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let y = luma(px[2], px[1], px[0]).round() as usize;
+        let mut v: u8 = if y.min(255) <= thr { 0 } else { 255 };
+        if dark_is_bg {
+            v = 255 - v;
+        }
+        px[0] = v;
+        px[1] = v;
+        px[2] = v;
+        px[3] = 255;
+    }
+    out
+}
+
+/// 是否为 CJK（中日韩）表意文字/假名/谚文。用于清理引擎在汉字间插入的假空格。
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF   // 平假名 / 片假名
+        | 0x3400..=0x4DBF // 汉字扩展 A
+        | 0x4E00..=0x9FFF // 汉字基本区
+        | 0xF900..=0xFAFF // 兼容汉字
+        | 0xAC00..=0xD7AF // 谚文音节
+        | 0x20000..=0x2FA1F // 汉字扩展 B 及以后
+    )
+}
+
+/// 删除夹在两个 CJK 字符之间的空格/制表符（引擎常把中文按「词」拆开并加空格）。
+/// 拉丁文之间的空格、以及换行一律保留。
+fn collapse_cjk_spaces(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev: Option<char> = None;
+    let mut pending_space = false;
+    for c in text.chars() {
+        if c == ' ' || c == '\t' {
+            pending_space = true;
+            continue;
+        }
+        if pending_space {
+            let drop = c == '\n' || (prev.map_or(false, is_cjk) && is_cjk(c));
+            if !drop {
+                out.push(' ');
+            }
+            pending_space = false;
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
+}
+
+/// 该字符是否算「有意义的正文内容」——字母/数字（含 CJK）与常见标点。
+/// 用来把乱码符号从评分里剔除。
+fn is_meaningful(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(
+            c,
+            '.' | ',' | ':' | ';' | '?' | '!' | '-' | '_' | '/' | '\\' | '+' | '=' | '%'
+                | '@' | '#' | '&' | '(' | ')' | '[' | ']' | '{' | '}' | '\'' | '"'
+                | '、' | '。' | '，' | '：' | '；' | '？' | '！' | '（' | '）'
+                | '《' | '》' | '“' | '”' | '‘' | '’' | '—' | '…' | '·'
+        )
+}
+
+/// 对识别结果打分：有意义字符占比 × log(1 + 有意义字符数)。
+///
+/// 既惩罚乱码（占比低），又用对数压缩长度分量——避免「又长又脏」的结果仅靠数量取胜。
+/// 候选之间只比较相对高低，绝对值无意义。
+fn score_text(text: &str) -> f32 {
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if chars.is_empty() {
+        return 0.0;
+    }
+    let total = chars.len() as f32;
+    let good = chars.iter().filter(|c| is_meaningful(**c)).count() as f32;
+    if good == 0.0 {
+        return 0.0;
+    }
+    (good / total) * (1.0 + good.ln())
+}
+
+/// base 候选是否已经「足够可信」，可信则不再跑其余候选。
+/// 判据：至少 8 个有意义字符，且有意义字符占比 ≥ 0.95。
+fn is_confident(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if chars.len() < 8 {
+        return false;
+    }
+    let good = chars.iter().filter(|c| is_meaningful(**c)).count();
+    good as f32 / chars.len() as f32 >= 0.95
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 每像素的值编码为 (x, y) 便于验证采样点
-    fn grid(w: usize, h: usize) -> Vec<u8> {
+    /// 纯色 BGRA 图（每像素同值），用于验证插值不引入颜色偏差。
+    fn solid(w: usize, h: usize, px: [u8; 4]) -> Vec<u8> {
         let mut v = vec![0u8; w * h * 4];
-        for y in 0..h {
-            for x in 0..w {
-                let i = (y * w + x) * 4;
-                v[i] = x as u8;
-                v[i + 1] = y as u8;
-                v[i + 3] = 255;
-            }
+        for c in v.chunks_exact_mut(4) {
+            c.copy_from_slice(&px);
         }
         v
     }
 
+    // ---- target_size：缩放决策 ----
+
     #[test]
-    fn resize_same_size_is_copy() {
-        let src = grid(4, 4);
-        let out = resize_nearest(&src, 4, 4, 4, 4);
-        assert_eq!(out, src);
+    fn target_size_upscales_small_images_to_target() {
+        // 1000×800：放大到最长边 2400（2.4×，未触及 3× 上限）
+        let (nw, nh) = target_size(1000, 800, 4096);
+        assert_eq!((nw, nh), (2400, 1920));
     }
 
     #[test]
-    fn resize_downscales_and_picks_nearest() {
-        let src = grid(8, 8);
-        let out = resize_nearest(&src, 8, 8, 4, 4);
-        assert_eq!(out.len(), 4 * 4 * 4);
-        // 目标 (1,1) 对应源 (2,2)
-        let i = (1 * 4 + 1) * 4;
-        assert_eq!(out[i], 2);
-        assert_eq!(out[i + 1], 2);
+    fn target_size_caps_upscale_factor() {
+        // 200×150：3× 上限生效，而不是拉到 2400（那会是 12×）
+        let (nw, nh) = target_size(200, 150, 4096);
+        assert_eq!((nw, nh), (600, 450));
+    }
+
+    #[test]
+    fn target_size_shrinks_oversized() {
+        // 8000×4000 超上限：等比缩到最长边 4096
+        let (nw, nh) = target_size(8000, 4000, 4096);
+        assert_eq!((nw, nh), (4096, 2048));
+    }
+
+    #[test]
+    fn target_size_keeps_mid_size_unchanged() {
+        // 3000×2000 已落在 [目标, 上限] 区间：不缩放
+        assert_eq!(target_size(3000, 2000, 4096), (3000, 2000));
+    }
+
+    #[test]
+    fn target_size_never_exceeds_max() {
+        for (w, h) in [(10, 10), (500, 2000), (1365, 1365), (4000, 100), (9000, 9000)] {
+            let (nw, nh) = target_size(w, h, 4096);
+            assert!(nw <= 4096 && nh <= 4096, "{w}×{h} → {nw}×{nh} 超出上限");
+            assert!(nw >= 1 && nh >= 1);
+        }
+    }
+
+    #[test]
+    fn target_size_is_robust_on_degenerate_input() {
+        assert_eq!(target_size(0, 0, 4096), (1, 1));
+        assert_eq!(target_size(-5, 10, 4096), (1, 10));
+        // 引擎上限异常（0/负）时不得 panic
+        let (nw, nh) = target_size(100, 50, 0);
+        assert!(nw >= 1 && nh >= 1);
+    }
+
+    // ---- resize_bicubic：缩放本身 ----
+
+    #[test]
+    fn resize_same_size_is_copy() {
+        let src = solid(4, 4, [10, 20, 30, 255]);
+        assert_eq!(resize_bicubic(&src, 4, 4, 4, 4), src);
+    }
+
+    #[test]
+    fn resize_output_length_is_exact() {
+        let src = solid(8, 8, [1, 2, 3, 255]);
+        assert_eq!(resize_bicubic(&src, 8, 8, 20, 6).len(), 20 * 6 * 4);
+    }
+
+    #[test]
+    fn resize_upscale_preserves_flat_color() {
+        // 纯色放大：加权插值后仍应为同一颜色（含 alpha），即不产生伪彩/暗边
+        let src = solid(4, 4, [120, 60, 200, 255]);
+        let out = resize_bicubic(&src, 4, 4, 16, 16);
+        for c in out.chunks_exact(4) {
+            assert_eq!(c, [120, 60, 200, 255], "纯色放大出现了颜色偏差");
+        }
+    }
+
+    #[test]
+    fn resize_downscale_preserves_flat_color() {
+        let src = solid(16, 16, [7, 8, 9, 255]);
+        let out = resize_bicubic(&src, 16, 16, 4, 4);
+        for c in out.chunks_exact(4) {
+            assert_eq!(c, [7, 8, 9, 255], "纯色缩小出现了颜色偏差");
+        }
+    }
+
+    #[test]
+    fn resize_upscale_interpolates_between_pixels() {
+        // 左黑右白的 2×1 图放大到 8 宽：应出现介于两者之间的灰度像素
+        // （最近邻只会给出 0/255，这正是我们要避免的锯齿）
+        let mut src = vec![0u8; 2 * 1 * 4];
+        src[0..4].copy_from_slice(&[0, 0, 0, 255]); // 左：黑
+        src[4..8].copy_from_slice(&[255, 255, 255, 255]); // 右：白
+        let out = resize_bicubic(&src, 2, 1, 8, 1);
+        let vals: Vec<u8> = out.chunks_exact(4).map(|c| c[0]).collect();
+        assert!(
+            vals.iter().any(|&v| v > 0 && v < 255),
+            "双三次放大应产生中间灰度，实际 {vals:?}"
+        );
+        assert!(vals[0] < *vals.last().unwrap(), "左端应比右端暗，方向正确");
+    }
+
+    #[test]
+    fn resize_downscale_averages_step_edge() {
+        // 上半黑下半白的 4×4 缩到 2×2：跨越阶跃的像素应被均值化成中间灰，
+        // 而不是整块取黑或白
+        let mut src = vec![0u8; 4 * 4 * 4];
+        for y in 0..4 {
+            for x in 0..4 {
+                let i = (y * 4 + x) * 4;
+                let v = if y < 2 { 0 } else { 255 };
+                src[i..i + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let out = resize_bicubic(&src, 4, 4, 2, 2);
+        let vals: Vec<u8> = out.chunks_exact(4).map(|c| c[0]).collect();
+        assert!(
+            vals.iter().any(|&v| v > 0 && v < 255),
+            "缩小的阶跃边缘应被均值化，实际 {vals:?}"
+        );
     }
 
     #[test]
     fn resize_never_panics_on_degenerate_input() {
         // 0 尺寸 / 数据不足时不得 panic（OCR 链路的边界保险）
-        assert!(resize_nearest(&[], 0, 0, 0, 0).is_empty());
-        assert_eq!(resize_nearest(&[0u8; 16], 2, 2, 1, 1).len(), 4);
+        assert!(resize_bicubic(&[], 0, 0, 0, 0).is_empty());
+        assert_eq!(resize_bicubic(&[0u8; 16], 2, 2, 1, 1).len(), 4);
+        // 声明尺寸大于实际数据：越界读应返回 0 而非 panic
+        assert_eq!(resize_bicubic(&[0u8; 4], 2, 2, 8, 8).len(), 8 * 8 * 4);
+    }
+
+    #[test]
+    fn cubic_kernel_is_an_interpolating_filter() {
+        // 核函数在整数点应为 1（原样保留）、在 ±1 处为 0、|x|≥2 处为 0
+        assert!((cubic_kernel(0.0) - 1.0).abs() < 1e-6);
+        assert!(cubic_kernel(1.0).abs() < 1e-6);
+        assert!(cubic_kernel(-1.0).abs() < 1e-6);
+        assert_eq!(cubic_kernel(2.0), 0.0);
+        assert_eq!(cubic_kernel(-3.0), 0.0);
+    }
+
+    // ---- 预处理：亮度 / 反相 / 二值化 ----
+
+    #[test]
+    fn mean_luma_covers_extremes() {
+        assert!((mean_luma(&solid(2, 2, [0, 0, 0, 255])) - 0.0).abs() < 0.5);
+        assert!((mean_luma(&solid(2, 2, [255, 255, 255, 255])) - 255.0).abs() < 0.5);
+        // 空输入不得除零 panic
+        assert_eq!(mean_luma(&[]), 0.0);
+    }
+
+    #[test]
+    fn invert_flips_rgb_keeps_opaque_alpha() {
+        let src = solid(1, 1, [10, 20, 30, 255]);
+        let out = invert(&src);
+        assert_eq!(&out[..], &[245, 235, 225, 255]);
+        // 反相两次应还原
+        assert_eq!(invert(&out), src);
+    }
+
+    #[test]
+    fn otsu_threshold_splits_bimodal_histogram() {
+        // 双峰：100 个像素在 20，100 个在 220 → 阈值应落在两峰之间
+        let mut hist = [0u32; 256];
+        hist[20] = 100;
+        hist[220] = 100;
+        let thr = otsu_threshold(&hist, 200);
+        assert!(thr >= 20 && thr < 220, "阈值 {thr} 未落在两峰之间");
+    }
+
+    #[test]
+    fn otsu_threshold_handles_empty() {
+        assert_eq!(otsu_threshold(&[0u32; 256], 0), 127);
+    }
+
+    #[test]
+    fn binarize_turns_light_background_into_white() {
+        // 白底（灰 240）黑字（灰 10）
+        let mut src = solid(4, 1, [240, 240, 240, 255]);
+        src[0..4].copy_from_slice(&[10, 10, 10, 255]);
+        let out = binarize_otsu(&src);
+        assert_eq!(out[0], 0, "暗色文字应变为黑");
+        assert_eq!(out[4], 255, "亮色背景应变为白");
+    }
+
+    #[test]
+    fn binarize_unifies_dark_background_to_white_too() {
+        // 黑底（灰 15）白字（灰 230）：输出应反相为白底黑字
+        let mut src = solid(4, 1, [15, 15, 15, 255]);
+        src[0..4].copy_from_slice(&[230, 230, 230, 255]);
+        let out = binarize_otsu(&src);
+        assert_eq!(out[0], 0, "亮色文字在暗底上应转为黑");
+        assert_eq!(out[4], 255, "暗色背景应转为白");
+    }
+
+    #[test]
+    fn binarize_output_is_pure_black_or_white() {
+        let mut src = vec![0u8; 6 * 1 * 4];
+        for (i, v) in [0u8, 40, 90, 150, 200, 255].iter().enumerate() {
+            src[i * 4..i * 4 + 4].copy_from_slice(&[*v, *v, *v, 255]);
+        }
+        for c in binarize_otsu(&src).chunks_exact(4) {
+            assert!(c[0] == 0 || c[0] == 255, "二值化输出应只有 0/255，实际 {}", c[0]);
+            assert_eq!(c[3], 255);
+        }
+    }
+
+    // ---- 文本清理与评分 ----
+
+    #[test]
+    fn is_cjk_recognizes_scripts() {
+        assert!(is_cjk('中'));
+        assert!(is_cjk('あ'));
+        assert!(is_cjk('한'));
+        assert!(!is_cjk('A'));
+        assert!(!is_cjk('1'));
+        assert!(!is_cjk(','));
+    }
+
+    #[test]
+    fn collapse_drops_spaces_between_cjk_chars() {
+        assert_eq!(collapse_cjk_spaces("你 好 世 界"), "你好世界");
+        assert_eq!(collapse_cjk_spaces("中 文 混 排"), "中文混排");
+    }
+
+    #[test]
+    fn collapse_keeps_latin_and_cjk_latin_spaces() {
+        assert_eq!(collapse_cjk_spaces("hello world"), "hello world");
+        // CJK 与拉丁之间、以及拉丁与 CJK 之间的空格保留
+        assert_eq!(collapse_cjk_spaces("中 A 文"), "中 A 文");
+    }
+
+    #[test]
+    fn collapse_keeps_newlines_and_drops_trailing_space() {
+        assert_eq!(collapse_cjk_spaces("第一行\n第二行"), "第一行\n第二行");
+        // 换行前的假空格应被丢弃
+        assert_eq!(collapse_cjk_spaces("你好 \n世界"), "你好\n世界");
+        assert_eq!(collapse_cjk_spaces("尾部 "), "尾部");
+    }
+
+    #[test]
+    fn score_prefers_clean_text_over_noise() {
+        let clean = "这是一段正常的识别结果";
+        let noisy = "这◊§一段※正‖常◊的识※别结§果";
+        assert!(
+            score_text(clean) > score_text(noisy),
+            "干净文本应比同长度的乱码得分高"
+        );
+        assert_eq!(score_text(""), 0.0);
+        assert_eq!(score_text("   \n\t "), 0.0);
+        // 纯乱码没有有意义字符 → 0 分
+        assert_eq!(score_text("◊§※‖"), 0.0);
+    }
+
+    #[test]
+    fn score_rewards_more_content_all_else_equal() {
+        assert!(score_text("识别结果很长的一段文字") > score_text("识别结果"));
+    }
+
+    #[test]
+    fn is_confident_gates_on_length_and_purity() {
+        assert!(is_confident("这是一段足够长的干净中文识别结果"));
+        assert!(!is_confident("短"), "过短不算可信");
+        assert!(!is_confident("这◊§一段※正‖常◊的识※别结§果"), "含乱码不算可信");
     }
 }
