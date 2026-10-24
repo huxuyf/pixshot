@@ -1,4 +1,4 @@
-# 复验：#1 自绘托盘菜单（出现 + 点击退出 + Esc 关闭）  #3 单击选择窗口
+# 复验：#1 自绘托盘菜单（出现 + 点击退出 + Esc 关闭）  #3 拖动框选区域
 $out = "C:\Users\user\Desktop\pixpin\pixshot\fix5_verify.txt"
 function W($s) { Add-Content -Path $out -Value $s -Encoding UTF8 }
 Set-Content -Path $out -Value "=== 复验 $(Get-Date -Format 'HH:mm:ss') ===" -Encoding UTF8
@@ -108,25 +108,25 @@ if ($menu2 -ne [IntPtr]::Zero) {
 }
 
 W ""
-W "== #3 单击选择窗口（靶标 300,300 600x400）=="
-[void][V]::SetCursorPos(600, 500) | Out-Null
+W "== #3 拖动框选区域（400,350 → 1000,750，600x400）=="
 [void][V]::PostMessageW($main2, 0x0312, [IntPtr]1, [IntPtr]0)
 $ov = Wait-W $p2.Id 'PixShotOverlay' 8000
 W "  遮罩已打开: $($ov -ne [IntPtr]::Zero)"
 if ($ov -ne [IntPtr]::Zero) {
     Start-Sleep -Milliseconds 600
-    [void][V]::SendMessageW($ov, 0x0201, [IntPtr]1, (LP 600 500))
+    [void][V]::SendMessageW($ov, 0x0201, [IntPtr]1, (LP 400 350))
+    [void][V]::SendMessageW($ov, 0x0200, [IntPtr]1, (LP 1000 750))
     Start-Sleep -Milliseconds 150
-    [void][V]::SendMessageW($ov, 0x0202, [IntPtr]0, (LP 600 500))
+    [void][V]::SendMessageW($ov, 0x0202, [IntPtr]0, (LP 1000 750))
     Start-Sleep -Milliseconds 300
-    W "  单击后遮罩关闭: $(-not [V]::IsWindow($ov))   <- 期望 True"
+    W "  框选后遮罩关闭: $(-not [V]::IsWindow($ov))   <- 期望 True"
     $tb = Wait-W $p2.Id 'PixShotToolbar' 6000
     if ($tb -ne [IntPtr]::Zero) {
         $lbls = Children $tb
         W "  工具栏文本: $($lbls -join ' | ')"
         $l = ($lbls | Where-Object { $_ -match '已截取' } | Select-Object -First 1)
         if ($l -and $l -match '已截取\s*(\d+)\s*[×x]\s*(\d+)') {
-            W "  选区尺寸: $($Matches[1]) x $($Matches[2])   <- 靶标 600x400 逻辑 = 750x500 物理(125% DPI)"
+            W "  选区尺寸: $($Matches[1]) x $($Matches[2])   <- 拖动 600x400"
         }
         # == #5 双击关闭贴图 ==
         W ""

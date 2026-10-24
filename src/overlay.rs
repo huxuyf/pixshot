@@ -1,4 +1,4 @@
-//! 框选：拖动框选 / 单击选择窗口 / Enter 全屏 / Esc 取消。
+//! 区域框选：拖动框选 / Esc 取消（只保留区域截图，不支持选窗口与全屏）。
 //!
 //! **无遮罩**：框选期间不对屏幕做任何暗化 —— 桌面保持原样可见，只叠加一圈
 //! 红色框线。实现方式是逐像素 alpha 的分层窗口（`UpdateLayeredWindow`）：
@@ -42,8 +42,7 @@ pub struct SelectedRegion {
 }
 
 const VK_ESCAPE: usize = 0x1B;
-const VK_RETURN: usize = 0x0D;
-/// 小于该边长视为「单击」而非「拖动框选」（逻辑像素，按 DPI 换算后比较）。
+/// 小于该边长的拖动视为无效框选（忽略，继续等待用户框选）。
 const MIN_DRAG_LOGICAL: i32 = 3;
 /// 框线粗细（逻辑像素）。
 const FRAME_W_LOGICAL: i32 = 2;
@@ -306,22 +305,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         }
 
         WM_KEYDOWN => {
-            match wp.0 {
-                VK_ESCAPE => {
-                    let _ = DestroyWindow(hwnd);
-                }
-                VK_RETURN => {
-                    if let Some(s) = state_of(hwnd) {
-                        s.result = Some(SelectedRegion {
-                            x: s.vx,
-                            y: s.vy,
-                            width: s.vw,
-                            height: s.vh,
-                        });
-                    }
-                    let _ = DestroyWindow(hwnd);
-                }
-                _ => {}
+            if wp.0 == VK_ESCAPE {
+                let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
         }
@@ -337,7 +322,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     }
 }
 
-/// 鼠标松开：拖动够大则取选区，否则按「单击选窗口」处理。
+/// 鼠标松开：拖动够大则取选区；过小（含单击）则擦掉框线，留在框选状态。
 unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
     let Some(s) = state_of(hwnd) else { return };
     if !s.dragging {
@@ -354,65 +339,10 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
         return;
     }
 
-    // 单击（非拖动）：选中光标下的窗口。
-    // 必须先把遮罩自身藏起来 —— 遮罩是覆盖全屏的置顶窗口，
-    // 否则 WindowFromPoint 永远返回遮罩自己，该功能形同虚设。
-    // 命中点用本次点击的坐标（s.cur，屏幕坐标）而非 GetCursorPos，
-    // 以免点击与处理之间光标移动导致选错窗口。
-    let pt = POINT {
-        x: s.cur.x,
-        y: s.cur.y,
-    };
-    let _ = ShowWindow(hwnd, SW_HIDE);
-    let hit = WindowFromPoint(pt);
-    let root = GetAncestor(hit, GA_ROOT);
-    let target = if root.is_invalid() { hit } else { root };
-
-    let mut picked = None;
-    // 诊断：记录命中窗口的类名与矩形，便于定位选错窗口的问题
-    {
-        let mut cb = [0u16; 64];
-        let n = GetClassNameW(target, &mut cb);
-        let cls = String::from_utf16_lossy(&cb[..(n.max(0) as usize).min(63)]);
-        let mut rr = RECT::default();
-        let _ = GetWindowRect(target, &mut rr);
-        crate::diag::log(&format!(
-            "[overlay] 单击命中: hwnd=0x{:X} class={cls} rect=({},{})-({},{}) visible={}",
-            target.0 as usize,
-            rr.left,
-            rr.top,
-            rr.right,
-            rr.bottom,
-            IsWindowVisible(target).as_bool()
-        ));
-    }
-    if !target.is_invalid() && !is_own_window(target) && IsWindowVisible(target).as_bool() {
-        let mut wr = RECT::default();
-        if GetWindowRect(target, &mut wr).is_ok() {
-            let ww = wr.right - wr.left;
-            let wh = wr.bottom - wr.top;
-            if ww >= min_side && wh >= min_side {
-                picked = Some(clamp_region(
-                    (wr.left, wr.top, ww, wh),
-                    s.vx,
-                    s.vy,
-                    s.vw,
-                    s.vh,
-                ));
-            }
-        }
-    }
-    match picked {
-        Some(reg) => {
-            s.result = Some(reg);
-            let _ = DestroyWindow(hwnd);
-        }
-        None => {
-            // 未命中可截窗口：恢复继续框选
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(hwnd);
-            repaint_frame(hwnd, s);
-        }
+    // 单击 / 过小的拖动：不产生选区，擦掉已画的框线，继续等待用户框选
+    if let Some(last) = s.last.take() {
+        clear_rect(s.surface_bits, s.vw, s.vh, last);
+        commit(hwnd, s, last);
     }
 }
 
@@ -489,26 +419,6 @@ unsafe fn fill(bits: *mut u32, vw: i32, vh: i32, r: Rect4, px: u32) {
             std::slice::from_raw_parts_mut(bits.add(off), w as usize).fill(px);
         }
     }
-}
-
-/// 是否是本程序自己的窗口（单击选窗时需排除）。
-unsafe fn is_own_window(h: HWND) -> bool {
-    let mut buf = [0u16; 64];
-    let n = GetClassNameW(h, &mut buf);
-    if n <= 0 {
-        return false;
-    }
-    let cls = String::from_utf16_lossy(&buf[..(n as usize).min(63)]);
-    matches!(
-        cls.as_str(),
-        "PixShotMain"
-            | "PixShotOverlay"
-            | "PixShotToolbar"
-            | "PixShotPin"
-            | "PixShotOcrResult"
-            | "PixShotMenu"
-            | "PixShotToast"
-    )
 }
 
 fn point_from_lparam(lp: LPARAM, vx: i32, vy: i32) -> POINT {

@@ -30,6 +30,8 @@ public class M {
 "@
 $log = Join-Path $PSScriptRoot '..\perf_baseline.txt'
 function Log($s) { Add-Content -Path $log -Value $s -Encoding UTF8 }
+# 屏幕坐标 → LPARAM（低字 x / 高字 y）
+function LP([int]$x, [int]$y) { [IntPtr]((($x -band 0xFFFF)) -bor (($y -band 0xFFFF) -shl 16)) }
 Set-Content -Path $log -Value "=== PixShot 性能基线 v2 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" -Encoding UTF8
 
 # EnumWindows 按 PID 收集全部窗口类名（与 gui_e2e_msg_test.ps1 相同的已验证模式）
@@ -112,7 +114,10 @@ while ([Environment]::TickCount -lt ($t0 + 15000)) {
     $ov = [M]::FindWindowW('PixShotOverlay', $null)
     if ($ov -ne [IntPtr]::Zero) { break }
     Start-Sleep -Milliseconds 2 }
-[void][M]::SendMessageW($ov, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero)   # Enter 全屏选区
+# 只保留区域截图：拖动框选覆盖整个虚拟屏幕（超大坐标由程序钳制到屏幕范围）
+[void][M]::SendMessageW($ov, 0x0201, [IntPtr]1, (LP 0 0))          # WM_LBUTTONDOWN
+[void][M]::SendMessageW($ov, 0x0200, [IntPtr]1, (LP 8000 8000))    # WM_MOUSEMOVE
+[void][M]::SendMessageW($ov, 0x0202, [IntPtr]0, (LP 8000 8000))    # WM_LBUTTONUP
 $tbr = Wait-Enum $p.Id 'PixShotToolbar'
 if ($tbr -eq [IntPtr]::Zero) { Log "!! 工具栏未出现"; Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; exit 1 }
 $btn = [IntPtr]::Zero; $c = [M]::GetWindow($tbr, 5)
