@@ -14,7 +14,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC,
-    GetStockObject, ReleaseDC, RoundRect, SelectObject, NULL_BRUSH, PS_SOLID,
+    GetStockObject, ReleaseDC, RoundRect, SelectObject, HDC, NULL_BRUSH, PS_SOLID,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
@@ -324,12 +324,17 @@ fn client_xy(lp: LPARAM) -> (i32, i32) {
 
 unsafe fn paint(hwnd: HWND) {
     let Some(d) = data_of(hwnd) else { return };
-    let t = theme::current();
     let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut cr = RECT::default();
     let _ = GetClientRect(hwnd, &mut cr);
-    let (w, h) = (cr.right, cr.bottom);
+    paint_into(hwnd, hdc, cr.right, cr.bottom, d, theme::current());
+    let _ = EndPaint(hwnd, &ps);
+}
+
+/// 菜单绘制主体：把整张菜单画到任意 DC（WM_PAINT 与预览测试共用）。
+/// `hwnd` 仅用于取 DPI 与主题字体。
+unsafe fn paint_into(hwnd: HWND, hdc: HDC, w: i32, h: i32, d: &Data, t: theme::Theme) {
     let dpi = util::dpi_of(hwnd);
 
     // 背景卡片
@@ -368,11 +373,16 @@ unsafe fn paint(hwnd: HWND) {
             let _ = DeleteObject(sep);
             top += d.sep_h;
         }
-        // 悬停高亮（仅启用项）
+        // 悬停高亮（仅启用项）：灰底圆角块
+        //
+        // 注意：这里**不能**像画边框那样改选 `NULL_BRUSH` —— 那会让 RoundRect 只描边、
+        // 不填充，结果是拿当前（默认黑色）画笔勾出一个「黑色方框」。填充笔与描边笔
+        // 取同一颜色，才能得到干净的实心灰底。
         if d.hover == Some(i) && it.enabled {
             let hb = CreateSolidBrush(t.hover);
-            let old = SelectObject(hdc, hb);
-            let _ = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            let hp = CreatePen(PS_SOLID, 1, t.hover);
+            let old_brush = SelectObject(hdc, hb);
+            let old_pen = SelectObject(hdc, hp);
             let r2 = util::scaled(10, dpi);
             let _ = RoundRect(
                 hdc,
@@ -383,8 +393,10 @@ unsafe fn paint(hwnd: HWND) {
                 r2,
                 r2,
             );
-            SelectObject(hdc, old);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
             let _ = DeleteObject(hb);
+            let _ = DeleteObject(hp);
         }
         // 文本
         let color = if it.enabled { t.text } else { COLORREF(0x0080_8080) };
@@ -401,5 +413,90 @@ unsafe fn paint(hwnd: HWND) {
     }
 
     SelectObject(hdc, old_font);
-    let _ = EndPaint(hwnd, &ps);
+}
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject as DelObj, SelectObject,
+        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC,
+    };
+
+    /// 渲染菜单（含悬停项）供人工核对：`cargo test --bin pixshot render_menu_preview -- --ignored`
+    #[test]
+    #[ignore = "仅在需要人工核对菜单观感时运行"]
+    fn render_menu_preview() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            // 与贴图右键菜单同构：5 项，第 2 项处于悬停态
+            let items = vec![
+                Item::new("复制图像"),
+                Item::new("保存为 PNG…"),
+                Item::new("识别文字 (OCR)"),
+                Item::sep("重置缩放 (100%)"),
+                Item::sep("关闭贴图 (Esc)"),
+            ];
+            let dpi = 96;
+            let s = |v: i32| util::scaled(v, dpi);
+            let (item_h, sep_h, pad) = (s(38), s(11), s(6));
+            let n_items = items.len() as i32;
+            let d = Data {
+                items,
+                hover: Some(2),
+                chosen: None,
+                item_h,
+                sep_h,
+                pad,
+                width: s(220),
+            };
+            let h = pad * 2 + n_items * item_h + 2 * sep_h;
+            let (w, h) = (d.width, h);
+
+            let mut bi = BITMAPINFO::default();
+            bi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = -h;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB.0;
+            let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+            let hbmp = CreateDIBSection(HDC::default(), &bi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .unwrap();
+            let mem = CreateCompatibleDC(None);
+            let old = SelectObject(mem, hbmp);
+
+            // 两张：浅色主题（默认）与深色主题，确认悬停都是"灰底"而不是黑色方框
+            let mut canvas: Vec<u8> = Vec::new();
+            let mut sheet_h = 0;
+            for t in [theme_for(false), theme_for(true)] {
+                let mut one = Vec::new();
+                paint_into(HWND::default(), mem, w, h, &d, t);
+                let n = (w * h) as usize;
+                let mut px = std::slice::from_raw_parts(bits as *const u8, n * 4).to_vec();
+                for p in px.chunks_exact_mut(4) {
+                    p[3] = 255;
+                }
+                one.extend_from_slice(&px);
+                canvas.extend_from_slice(&one);
+                sheet_h += h;
+            }
+            SelectObject(mem, old);
+            let _ = DelObj(hbmp);
+            let _ = DeleteDC(mem);
+            let _ = crate::imageio::save_png("target/menu_preview.png", &canvas, w, sheet_h);
+        }
+    }
+
+    /// 取浅色 / 深色真实色板做预览（不依赖系统设置）。
+    fn theme_for(dark: bool) -> theme::Theme {
+        if dark {
+            theme::DARK
+        } else {
+            theme::LIGHT
+        }
+    }
 }

@@ -21,8 +21,8 @@ use crate::{clipboard, icons, imageio, ocr, pin, tooltip};
 
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, RoundRect,
-    SelectObject, PS_SOLID,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush,
+    DeleteDC, DeleteObject, EndPaint, FillRect, RoundRect, SelectObject, PS_SOLID, SRCCOPY,
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -297,12 +297,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     } else {
                         BtnStyle::Icon
                     };
-                    // 先画圆角底（不画文本），再叠加矢量图标
-                    util::draw_od_button(hwnd, &*dis, &d.fx, style, d.skin);
-                    let v = d.fx.val((*dis).hwndItem);
-                    let pressed = ((*dis).itemState.0 & ODS_SELECTED.0) != 0;
-                    let (fill, ink) = util::btn_colors(style, d.skin, v, pressed);
-                    icons::draw((*dis).hDC, (*dis).rcItem, icon_of(id), ink, fill);
+                    draw_icon_frame(hwnd, &*dis, style, d.skin, &d.fx, icon_of(id));
                 }
             }
             LRESULT(1)
@@ -417,6 +412,63 @@ unsafe fn close_bar(hwnd: HWND) {
 /// Ctrl 是否按下（读物理按键状态，不依赖焦点/键序）。
 unsafe fn ctrl_down() -> bool {
     (GetKeyState(VK_CONTROL) as u16) & 0x8000 != 0
+}
+
+/// 绘制一个图标按钮的**整帧**（`WM_DRAWITEM` 与预览测试共用）。
+///
+/// 双缓冲：整帧（圆角底 + 抗锯齿图标）先合成到内存位图，再一次性 `BitBlt` 上屏。
+/// 直接画到按钮 DC 会分两批落屏 —— GDI+ 开始绘制前会先冲刷 GDI 队列，于是"底色"先到屏、
+/// "图标"后到屏；悬停动画 60fps 下看起来就是图标一闪一闪。
+unsafe fn draw_icon_frame(
+    parent: HWND,
+    dis: &DRAWITEMSTRUCT,
+    style: BtnStyle,
+    skin: theme::Theme,
+    fx: &util::HoverFx,
+    icon: icons::Icon,
+) {
+    let r = dis.rcItem;
+    let (bw, bh) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
+    let v = fx.val(dis.hwndItem);
+    let pressed = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+    let (fill, ink) = util::btn_colors(style, skin, v, pressed);
+
+    let mem = CreateCompatibleDC(dis.hDC);
+    let bmp = CreateCompatibleBitmap(dis.hDC, bw, bh);
+    if !mem.is_invalid() && !bmp.is_invalid() {
+        let old_bmp = SelectObject(mem, bmp);
+        let full = RECT {
+            left: 0,
+            top: 0,
+            right: bw,
+            bottom: bh,
+        };
+        // 先铺父窗口卡片底色：圆角以外的四角与工具条底色一致（否则是未初始化像素）
+        let card = CreateSolidBrush(skin.card);
+        FillRect(mem, &full, card);
+        let _ = DeleteObject(card);
+
+        let mut dis2 = *dis;
+        dis2.hDC = mem;
+        dis2.rcItem = full;
+        util::draw_od_button(parent, &dis2, fx, style, skin);
+        icons::draw(mem, full, icon, ink, fill);
+
+        let _ = BitBlt(dis.hDC, r.left, r.top, bw, bh, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old_bmp);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
+    } else {
+        // 退让：拿不到离屏资源时直接绘制（宁可闪一下，也不能留下空白按钮）
+        if !bmp.is_invalid() {
+            let _ = DeleteObject(bmp);
+        }
+        if !mem.is_invalid() {
+            let _ = DeleteDC(mem);
+        }
+        util::draw_od_button(parent, dis, fx, style, skin);
+        icons::draw(dis.hDC, r, icon, ink, fill);
+    }
 }
 
 /// 处理工具条快捷键。返回 true 表示已消费该按键。
@@ -587,5 +639,96 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             close_bar(hwnd);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC,
+    };
+
+    /// 渲染工具条按钮（默认态 / 悬停态 / 关闭悬停态）供人工核对。
+    /// 走的就是 `WM_DRAWITEM` 用的那条双缓冲路径：`cargo test --bin pixshot render_toolbar_preview -- --ignored`
+    #[test]
+    #[ignore = "仅在需要人工核对工具条按钮观感时运行"]
+    fn render_toolbar_preview() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let dpi = 96;
+            let btn = util::scaled(TB_BTN_SZ, dpi);
+            let (cols, rows) = (BTN_ORDER.len() as i32, 3);
+            let (w, h) = (cols * btn, rows * btn);
+            let mut bi = BITMAPINFO::default();
+            bi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = -h;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB.0;
+            let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+            let hbmp =
+                CreateDIBSection(HDC::default(), &bi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let mem = CreateCompatibleDC(None);
+            let old = SelectObject(mem, hbmp);
+
+            let skin = theme::toolbar_skin();
+            let card = CreateSolidBrush(skin.card);
+            let full = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            FillRect(mem, &full, card);
+            let _ = DeleteObject(card);
+
+            // 钉子句柄不可用（Icon 样式不读窗口文本），悬停值靠手工设置 entries 模拟
+            let fake = HWND::default();
+            for (row, (style, v)) in [
+                (BtnStyle::Icon, 0.0f32),        // 默认态
+                (BtnStyle::Icon, 1.0),           // 悬停态（淡灰底）
+                (BtnStyle::IconClose, 1.0),      // 关闭按钮悬停态（红底白叉）
+            ]
+            .iter()
+            .enumerate()
+            {
+                for (i, &id) in BTN_ORDER.iter().enumerate() {
+                    let rc = RECT {
+                        left: i as i32 * btn,
+                        top: row as i32 * btn,
+                        right: (i as i32 + 1) * btn,
+                        bottom: (row as i32 + 1) * btn,
+                    };
+                    let mut fx = util::HoverFx::new();
+                    fx.register(fake);
+                    fx.entries[0].1 = *v; // 直接把插值设到目标态
+                    fx.entries[0].2 = *v;
+                    // itemState 用默认值（未按下）：外观完全由悬停插值 v 决定
+                    let dis = DRAWITEMSTRUCT {
+                        hDC: mem,
+                        rcItem: rc,
+                        hwndItem: fake,
+                        ..Default::default()
+                    };
+                    draw_icon_frame(HWND::default(), &dis, *style, skin, &fx, icon_of(id));
+                }
+            }
+
+            let n = (w * h) as usize;
+            let mut px = std::slice::from_raw_parts(bits as *const u8, n * 4).to_vec();
+            for p in px.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+            SelectObject(mem, old);
+            let _ = DeleteObject(hbmp);
+            let _ = DeleteDC(mem);
+            let _ = crate::imageio::save_png("target/toolbar_preview.png", &px, w, h);
+        }
     }
 }

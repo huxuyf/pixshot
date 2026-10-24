@@ -62,7 +62,7 @@ pub struct Theme {
     pub close_hover: COLORREF,
 }
 
-const DARK: Theme = Theme {
+pub(crate) const DARK: Theme = Theme {
     dark: true,
     bg: COLORREF(0x0020_2020),
     card: COLORREF(0x002B_2B2B),
@@ -71,12 +71,12 @@ const DARK: Theme = Theme {
     text2: COLORREF(0x00C8_C8C8),
     accent: COLORREF(0x00FF_C24C), // #4CC2FF
     accent_text: COLORREF(0x0010_1010),
-    hover: COLORREF(0x0030_3030),
+    hover: COLORREF(0x0038_3838), // 菜单悬停灰底（须明显区别于 card 0x2B）
     press: COLORREF(0x003A_3A3A),
     close_hover: COLORREF(0x001C_2BC4), // #C42B1C
 };
 
-const LIGHT: Theme = Theme {
+pub(crate) const LIGHT: Theme = Theme {
     dark: false,
     bg: COLORREF(0x00F3_F3F3),
     card: COLORREF(0x00FF_FFFF),
