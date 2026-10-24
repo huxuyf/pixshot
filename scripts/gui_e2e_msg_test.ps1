@@ -323,7 +323,7 @@ try {
     }
 
     $tb0 = Invoke-Capture
-    Check 'F1 触发截图流程（遮罩出现 -> 工具条弹出）' ($tb0 -ne [IntPtr]::Zero)
+    Check 'F1 触发截图流程（框选层出现 -> 工具条弹出）' ($tb0 -ne [IntPtr]::Zero)
     if ($tb0 -eq [IntPtr]::Zero) { throw '截图流程未走通（遮罩或工具条未出现）' }
     Write-Host ("  [操作] 消息驱动框选 ({0},{1}) {2}x{3}" -f $SelX, $SelY, $SelW, $SelH)
 
