@@ -1,0 +1,86 @@
+name: Release
+
+# 推送到 main 即自动构建 release 产物，并发布到仓库 Releases（首页会显示 latest）。
+# 也可在 Actions 页手动触发（workflow_dispatch）。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 创建 Release / 打 tag 需要写权限
+permissions:
+  contents: write
+
+# 同一分支上的重复触发只保留最新一次，避免并发发布
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: 构建并发布（Windows x64）
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 把 VS 的 rc.exe / link.exe 放进 PATH：build.rs 需要 rc.exe（或 windres）嵌入应用图标
+      - name: 准备 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 安装 Rust（stable, MSVC）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 缓存 cargo / target
+        uses: Swatinem/rust-cache@v2
+
+      # 发布前的质量门：单元 + 集成测试（含 OCR 端到端）。Cargo.lock 已入库，用 --locked 保证可复现。
+      - name: 运行测试
+        run: cargo test --release --locked
+
+      - name: 构建 release
+        run: cargo build --release --locked
+
+      # build.rs 已把 onnxruntime.dll 与 model\*.onnx 布置到 target\release\，
+      # 这里把 exe + 运行时 + 模型 + 许可声明打成一个 zip。
+      - name: 组装分发包
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v0.1.${{ github.run_number }}"
+          $dst = "dist/pixshot"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          foreach ($f in @('pixshot.exe', 'onnxruntime.dll', 'onnxruntime_providers_shared.dll')) {
+              $src = "target/release/$f"
+              if (-not (Test-Path $src)) { throw "缺少产物 $src（检查 build.rs 的资产布置）" }
+              Copy-Item -Path $src -Destination $dst
+          }
+          Copy-Item -Path target/release/model -Destination $dst/model -Recurse -Force
+          Copy-Item -Path README.md, NOTICE -Destination $dst
+
+          $zip = "pixshot-$tag.zip"
+          Compress-Archive -Path "$dst/*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
+
+          Get-ChildItem $zip, "$zip.sha256" | ForEach-Object {
+              Write-Host ("产出 {0}（{1:N2} MB）" -f $_.Name, ($_.Length / 1MB))
+          }
+
+      - name: 发布到 Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: PixShot v0.1.${{ github.run_number }}
+          files: |
+            pixshot-*.zip
+            pixshot-*.zip.sha256
+          generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true

@@ -390,28 +390,50 @@ mod tests {
     }
 
     /// 端到端：GDI 离屏渲染一行中英混排文字 → 检测 + 识别 → 断言关键字与置信度。
+    ///
+    /// 中文断言依赖系统装有中文字体（`C:\Windows\Fonts` 下的雅黑/宋体等）。CI 的英文
+    /// Runner 未必安装中文字体，此时 GDI 会替换字体导致汉字渲染成方块，故**无中文字体时
+    /// 跳过中文断言**，仅校验英文/数字——避免把「缺字体」误判成「识别错误」。
     #[test]
     fn onnx_recognizes_rendered_text() {
         if models().is_err() {
             eprintln!("跳过：ONNX 模型/运行时不可用");
             return;
         }
+        let cjk = cjk_font_face();
+        if cjk.is_none() {
+            eprintln!("提示：未发现中文字体，跳过中文断言（仅校验英文/数字）");
+        }
         let (w, h) = (600i32, 110i32);
         let bgra = render_text_bgra(w, h, "PixShot OCR 识别测试 AB 12345");
         let lines = OnnxEngine.recognize_lines(&bgra, w, h).expect("识别失败");
         let text: String = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" ");
         let confs: Vec<f32> = lines.iter().map(|l| l.conf).collect();
-        eprintln!("OCR 结果: {text:?} 行置信度 {confs:?}");
+        eprintln!("OCR 结果: {text:?} 行置信度 {confs:?} 中文字体 {:?}", cjk);
         assert!(!lines.is_empty(), "应至少检出并识别出一行");
         assert!(text.contains("12345"), "应识别出数字，实际 {text:?}");
-        assert!(text.contains("识别测试"), "应识别出中文，实际 {text:?}");
         assert!(text.contains("PixShot"), "应识别出英文，实际 {text:?}");
         assert!(confs.iter().all(|c| *c > 0.8), "行置信度应偏高，实际 {confs:?}");
+        if cjk.is_some() {
+            assert!(text.contains("识别测试"), "应识别出中文，实际 {text:?}");
+        }
+    }
+
+    /// 系统可用的中文字体名（雅黑优先，其次宋体）；都没有则返回 `None`。
+    fn cjk_font_face() -> Option<&'static str> {
+        let dir = std::path::Path::new(r"C:\Windows\Fonts");
+        if dir.join("msyh.ttc").is_file() || dir.join("msyh.ttf").is_file() {
+            Some("Microsoft YaHei")
+        } else if dir.join("simsun.ttc").is_file() {
+            Some("SimSun")
+        } else {
+            None
+        }
     }
 
     /// GDI 离屏渲染一行文字为 BGRA（白底黑字、自上而下），供测试构造确定性输入。
     fn render_text_bgra(w: i32, h: i32, text: &str) -> Vec<u8> {
-        use windows::core::w;
+        use windows::core::{w, PCWSTR};
         use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, RECT};
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
@@ -456,7 +478,12 @@ mod tests {
                 CLIP_DEFAULT_PRECIS.0 as u32,
                 CLEARTYPE_QUALITY.0 as u32,
                 DEFAULT_PITCH.0 as u32,
-                w!("Microsoft YaHei"),
+                // 有中文字体就用它（雅黑/宋体），否则用系统默认字体
+                match cjk_font_face() {
+                    Some("SimSun") => w!("SimSun"),
+                    Some(_) => w!("Microsoft YaHei"),
+                    None => PCWSTR::null(),
+                },
             );
             let oldf = SelectObject(mem, HGDIOBJ(font.0));
             SetBkMode(mem, TRANSPARENT);
