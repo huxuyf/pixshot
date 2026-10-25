@@ -108,9 +108,9 @@ unsafe fn run_impl(image: Arc<CapturedImage>) -> Result<()> {
     let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as i32;
     let (tw, th) = (util::scaled(TB_W, dpi), util::scaled(TB_H, dpi));
 
-    // 定位在选区下方 8px，越界则钳制回虚拟屏幕内
+    // 定位在选区下方 8px，水平对齐选区中线，越界则钳制回虚拟屏幕内
     let (vx, vy, vw, vh) = capture::virtual_screen_rect();
-    let x = image.x.clamp(vx, (vx + vw - tw).max(vx));
+    let x = (image.x + (image.width - tw) / 2).clamp(vx, (vx + vw - tw).max(vx));
     let y = (image.y + image.height + util::scaled(8, dpi)).clamp(vy, (vy + vh - th).max(vy));
 
     let data = Box::into_raw(Box::new(ToolbarData {
