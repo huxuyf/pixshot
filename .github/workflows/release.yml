@@ -1,86 +1,160 @@
 name: Release
 
-# 推送到 main 即自动构建 release 产物，并发布到仓库 Releases（首页会显示 latest）。
-# 也可在 Actions 页手动触发（workflow_dispatch）。
+# 推送到 main 即自动编译 Release 并在 Releases 页面发布；
+# 也可在 Actions 页面手动触发（workflow_dispatch）。
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-# 创建 Release / 打 tag 需要写权限
+# 发布 Release 需要写 contents 权限。
 permissions:
   contents: write
 
-# 同一分支上的重复触发只保留最新一次，避免并发发布
+# 串行执行，不取消进行中的构建。
+# 发布流程会改动 tag 与 release，被中途取消会留下「tag 已移动但 release 未更新」的
+# 不一致状态；排队执行更安全（有 rust-cache，单次约几分钟）。
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-release:
-    name: 构建并发布（Windows x64）
+  build-release:
+    name: 编译并发布 Release
+    # 必须是 Windows：build.rs 用 rc.exe 嵌入应用图标，
+    # 且依赖链中的 Win32 API 绑定只能在 Windows 目标上链接。
     runs-on: windows-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
 
-      # 把 VS 的 rc.exe / link.exe 放进 PATH：build.rs 需要 rc.exe（或 windres）嵌入应用图标
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v7
+
+      # 把 VS 的 rc.exe 放进 PATH：build.rs 需要 rc.exe（或 windres）嵌入应用图标，
+      # GitHub 的 windows 运行器默认不把 VS 工具链放进 PATH。
       - name: 准备 MSVC 环境
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: 安装 Rust（stable, MSVC）
+      - name: 安装 Rust 工具链（MSVC）
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: 缓存 cargo / target
+      - name: 缓存 cargo 构建（加速后续构建）
         uses: Swatinem/rust-cache@v2
+
+      - name: 读取版本号（以 Cargo.toml 为唯一来源）
+        id: version
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' |
+                  Select-Object -First 1
+          if (-not $line) { throw '无法从 Cargo.toml 解析 version' }
+          $version = $line.Matches[0].Groups[1].Value
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "版本号：$version"
 
       # 发布前的质量门：单元 + 集成测试（含 OCR 端到端）。Cargo.lock 已入库，用 --locked 保证可复现。
       - name: 运行测试
         run: cargo test --release --locked
 
-      - name: 构建 release
+      - name: 编译 Release
         run: cargo build --release --locked
 
-      # build.rs 已把 onnxruntime.dll 与 model\*.onnx 布置到 target\release\，
-      # 这里把 exe + 运行时 + 模型 + 许可声明打成一个 zip。
-      - name: 组装分发包
+      - name: 校验产物与体积
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = "v0.1.${{ github.run_number }}"
-          $dst = "dist/pixshot"
-          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $exe = 'target/release/pixshot.exe'
+          if (-not (Test-Path $exe)) { throw "未生成 $exe" }
+          $mb = (Get-Item $exe).Length / 1MB
+          Write-Host ('exe 体积 {0:N2} MB' -f $mb)
+          # 与 scripts\ci.ps1 一致的体积护栏：防止依赖/特性膨胀。
+          if ($mb -gt 4.0) { throw ('exe 体积 {0:N2} MB 超出 4.0 MB 上限' -f $mb) }
+          foreach ($f in @('onnxruntime.dll', 'model\det.onnx', 'model\rec.onnx')) {
+              if (-not (Test-Path "target/release/$f")) { throw "缺少 OCR 资产 target/release/$f" }
+          }
+          Write-Host 'OCR 资产齐备'
 
+      # 分发包 = exe + OCR 运行时 + 模型 + 文档，打成一个 zip（下载解压即用，无需安装）。
+      - name: 打包发布文件（重命名 + 校验和）
+        id: package
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.value }}'
+          $name = "pixshot-v$version-x64.zip"
+          $dst = 'dist/pixshot'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
           foreach ($f in @('pixshot.exe', 'onnxruntime.dll', 'onnxruntime_providers_shared.dll')) {
               $src = "target/release/$f"
               if (-not (Test-Path $src)) { throw "缺少产物 $src（检查 build.rs 的资产布置）" }
               Copy-Item -Path $src -Destination $dst
           }
-          Copy-Item -Path target/release/model -Destination $dst/model -Recurse -Force
+          Copy-Item -Path target/release/model -Destination "$dst/model" -Recurse -Force
           Copy-Item -Path README.md, NOTICE -Destination $dst
+          Compress-Archive -Path "$dst/*" -DestinationPath "target/release/$name" -Force
+          $hash = (Get-FileHash "target/release/$name" -Algorithm SHA256).Hash
+          "$hash  $name" | Out-File -FilePath 'target/release/SHA256SUMS.txt' -Encoding ascii
+          "asset=target/release/$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha256=$hash"             | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "SHA256: $hash"
 
-          $zip = "pixshot-$tag.zip"
-          Compress-Archive -Path "$dst/*" -DestinationPath $zip -Force
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
-
-          Get-ChildItem $zip, "$zip.sha256" | ForEach-Object {
-              Write-Host ("产出 {0}（{1:N2} MB）" -f $_.Name, ($_.Length / 1MB))
+      # tag 与 release 一一对应，所以同一版本重复推送时 tag 必须跟到最新提交，
+      # 否则 release 里的附件是本次代码、tag 却停在首个提交，源码与二进制对不上。
+      - name: 让 tag 跟随最新提交（同版本重复发布时）
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tag = "v${{ steps.version.outputs.value }}"
+          $repo = '${{ github.repository }}'
+          gh api "repos/$repo/git/ref/tags/$tag" --silent 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "tag $tag 已存在，移动到 ${{ github.sha }}"
+            gh api -X PATCH "repos/$repo/git/refs/tags/$tag" `
+              -f sha='${{ github.sha }}' -F force=true | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "移动 tag $tag 失败" }
+          } else {
+            Write-Host "tag $tag 不存在，将由发布步骤在当前提交上创建"
           }
+          # 探测用的 gh api 在 tag 不存在时返回 404，$LASTEXITCODE 会残留非 0；
+          # 步骤结束时 PowerShell 会把它当作本步退出码，故显式收尾。
+          exit 0
 
-      - name: 发布到 Releases
-        uses: softprops/action-gh-release@v2
+      - name: 生成 Release 说明
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.value }}'
+          $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm') + ' UTC'
+          @"
+          PixShot v$version
+
+          Windows 桌面工具：框选截图 / 贴图置顶 / 本地 OCR 文字识别（Rust + Win32，免安装）。
+
+          - 提交：${{ github.sha }}
+          - 构建时间：$stamp
+          - SHA256：${{ steps.package.outputs.sha256 }}
+
+          下载下方的 ``pixshot-v$version-x64.zip``，解压后双击 ``pixshot.exe`` 即可运行，
+          无需安装、无需联网（OCR 模型与运行时已随包）。
+
+          > 本 Release 跟随 main 分支更新：同一版本号重复推送会刷新这里的附件与 tag，
+          > 不会新增一条 Release。需要留档某次具体构建，请到 Actions 页面下载该次运行的产物；
+          > 需要新增一条 Release，请先提升 Cargo.toml 里的 version。
+          "@ | Out-File -FilePath 'release_notes.md' -Encoding utf8
+
+      - name: 发布到 GitHub Releases
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: v0.1.${{ github.run_number }}
-          name: PixShot v0.1.${{ github.run_number }}
-          files: |
-            pixshot-*.zip
-            pixshot-*.zip.sha256
-          generate_release_notes: true
+          # 版本号即 release 身份：已存在则原地更新，不存在则新建。
+          tag_name: v${{ steps.version.outputs.value }}
+          name: PixShot v${{ steps.version.outputs.value }}
+          body_path: release_notes.md
           make_latest: true
+          # 产物缺失时直接失败，避免发布出没有附件的空 release。
           fail_on_unmatched_files: true
+          files: |
+            ${{ steps.package.outputs.asset }}
+            target/release/SHA256SUMS.txt
