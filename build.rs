@@ -30,6 +30,10 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/icon_geometry.rs");
 
+    // OCR 随包资产：把 onnxruntime.dll 与 model/*.onnx 摆到 exe 同目录，
+    // 使 `target/<profile>/` 自带可运行（发布时整目录即为分发内容）。
+    stage_ocr_assets();
+
     if env::var_os("PIXSHOT_NO_ICON").is_some() {
         println!("cargo:warning=PIXSHOT_NO_ICON 已设置 -> 跳过图标嵌入（托盘将回退系统默认图标）");
         return;
@@ -59,6 +63,72 @@ fn main() {
                  \n"
             );
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// OCR 资产布置：onnxruntime.dll + model/*.onnx → exe 同目录
+// ─────────────────────────────────────────────────────────────────
+
+/// 把内置 OCR 引擎需要的运行时与模型复制到 `target/<profile>/`（exe 所在目录）。
+///
+/// 仅在大小不同时覆盖，避免每次增量构建都重写 ~30MB。缺文件只告警不中断：
+/// 允许在未随仓库放置模型的环境里构建（此时 OCR 会回退系统引擎）。
+fn stage_ocr_assets() {
+    let out = match env::var("OUT_DIR") {
+        Ok(v) => PathBuf::from(v),
+        Err(_) => return,
+    };
+    // OUT_DIR = <target>/<profile>/build/pixshot-<hash>/out → 上溯三级即 exe 目录
+    let Some(exe_dir) = out.ancestors().nth(3).map(Path::to_path_buf) else {
+        return;
+    };
+    let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+
+    let pairs: [(&str, PathBuf); 3] = [
+        (
+            "vendor/onnxruntime/onnxruntime.dll",
+            exe_dir.join("onnxruntime.dll"),
+        ),
+        (
+            "vendor/onnxruntime/onnxruntime_providers_shared.dll",
+            exe_dir.join("onnxruntime_providers_shared.dll"),
+        ),
+        ("model/det.onnx", exe_dir.join("model").join("det.onnx")),
+    ];
+    for (rel, dst) in pairs {
+        let src = root.join(rel);
+        println!("cargo:rerun-if-changed={rel}");
+        if !src.is_file() {
+            println!("cargo:warning=缺少 OCR 资产 {rel}（内置引擎将不可用）");
+            continue;
+        }
+        copy_if_changed(&src, &dst);
+    }
+    // rec.onnx 体积最大，单独处理也走同一逻辑
+    let rec_src = root.join("model/rec.onnx");
+    println!("cargo:rerun-if-changed=model/rec.onnx");
+    if rec_src.is_file() {
+        copy_if_changed(&rec_src, &exe_dir.join("model").join("rec.onnx"));
+    } else {
+        println!("cargo:warning=缺少 OCR 资产 model/rec.onnx（内置引擎将不可用）");
+    }
+}
+
+/// 大小不同才复制（内容变化必然改变大小，够用且省事）。
+fn copy_if_changed(src: &Path, dst: &Path) {
+    let same = match (fs::metadata(src), fs::metadata(dst)) {
+        (Ok(a), Ok(b)) => a.len() == b.len(),
+        _ => false,
+    };
+    if same {
+        return;
+    }
+    if let Some(dir) = dst.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Err(e) = fs::copy(src, dst) {
+        println!("cargo:warning=复制 {} 失败: {e}", src.display());
     }
 }
 

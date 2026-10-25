@@ -1,0 +1,30 @@
+# 第三方组件声明（NOTICE）
+
+PixShot 的 OCR 内置本地 ONNX 推理链，随包分发了以下第三方组件。均为宽松许可（MIT / Apache-2.0），
+可自由再分发，但需保留本声明。
+
+## 1. ONNX Runtime 1.23.0
+
+- 文件：`vendor/onnxruntime/onnxruntime.dll`、`vendor/onnxruntime/onnxruntime_providers_shared.dll`
+- 版权：© Microsoft Corporation
+- 许可：MIT License
+- 来源：官方发行版 Python wheel（`onnxruntime==1.23.0`，`onnxruntime/capi/`），Windows x64，CPU 构建
+- 说明：仅使用 `CPUExecutionProvider`。运行时通过 `ort` 的 `load-dynamic` 在启动时从
+  exe 同目录加载，不静态链接。
+
+## 2. PaddleOCR PP-OCRv4 模型（经 RapidOCR 转出 ONNX）
+
+- 文件：`model/det.onnx`（文本检测，DB）、`model/rec.onnx`（文本识别，CRNN+CTC）
+- 版权：© PaddlePaddle Authors（百度）
+- 许可：Apache License 2.0
+- 来源：RapidOCR 发行包（`rapidocr-onnxruntime`）随附的
+  `ch_PP-OCRv4_det_infer.onnx` / `ch_PP-OCRv4_rec_infer.onnx`
+- 说明：中英双语。字符字典内嵌在 `rec.onnx` 的 ONNX metadata（`character` 键）中，未单独分发词典文件。
+  原版 PP-OCR 模型可从 PaddleOCR / RapidOCR 官方渠道获取。
+
+## 3. Rust 依赖
+
+- `ort`（ONNX Runtime 的 Rust 绑定）：许可 MIT OR Apache-2.0
+- `windows`（Microsoft 官方 Win32/WinRT 绑定）：许可 MIT OR Apache-2.0
+
+完整依赖树与版本见 `Cargo.lock`。

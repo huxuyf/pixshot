@@ -14,12 +14,12 @@ PixShot 本地 CI 流水线
 ----
   pwsh -File scripts\ci.ps1                 # 全流程
   pwsh -File scripts\ci.ps1 -SkipE2E        # 只跑静态检查与构建
-  pwsh -File scripts\ci.ps1 -MaxSizeMB 3.0  # 放宽体积护栏
+  pwsh -File scripts\ci.ps1 -MaxSizeMB 5.0  # 放宽体积护栏
 
 参数
 ----
   -SkipE2E        跳过 GUI 端到端测试
-  -MaxSizeMB      release 产物体积上限（默认 2.6，用于防止依赖/特性膨胀）
+  -MaxSizeMB      release 产物体积上限（默认 4.0；内置 ONNX 引擎后 exe 约 3.1MB）
   -TargetDir      自定义 CARGO_TARGET_DIR（默认仓库内 target\，不设置该环境变量）
 
 退出码
@@ -32,7 +32,7 @@ PixShot 本地 CI 流水线
 [CmdletBinding()]
 param(
     [switch]$SkipE2E,
-    [double]$MaxSizeMB = 2.6,
+    [double]$MaxSizeMB = 4.0,
     [string]$TargetDir = ''
 )
 
@@ -125,16 +125,28 @@ Invoke-Step 'cargo build --release（发布产物）' {
 }
 
 # ------------------------------------------------------------ 5. 体积护栏
-Invoke-Step '发布体积护栏' {
+Invoke-Step '发布体积护栏（exe 体积 + OCR 资产齐备）' {
     $exe = Join-Path $targetRoot 'release\pixshot.exe'
     if (-not (Test-Path $exe)) {
         throw "未找到 $exe"
     }
     $mb = (Get-Item $exe).Length / 1MB
-    Write-Host ('  体积 {0:N2} MB / 上限 {1:N2} MB' -f $mb, $MaxSizeMB) -ForegroundColor DarkGray
+    Write-Host ('  exe 体积 {0:N2} MB / 上限 {1:N2} MB' -f $mb, $MaxSizeMB) -ForegroundColor DarkGray
     if ($mb -gt $MaxSizeMB) {
         throw ('体积 {0:N2} MB 超出上限 {1:N2} MB —— 检查是否新增了重量级依赖或未裁剪的 crate feature' -f $mb, $MaxSizeMB)
     }
+    # OCR 依赖随包资产：缺任一都意味着「内置引擎」退化为系统 OCR，属发布缺陷
+    $assets = @(
+        'model\det.onnx',
+        'model\rec.onnx',
+        'vendor\onnxruntime\onnxruntime.dll'
+    )
+    foreach ($rel in $assets) {
+        if (-not (Test-Path (Join-Path $root $rel))) {
+            throw ("缺少 OCR 随包资产 {0} —— 内置 ONNX 引擎将不可用" -f $rel)
+        }
+    }
+    Write-Host '  OCR 资产：det.onnx / rec.onnx / onnxruntime.dll 齐备' -ForegroundColor DarkGray
 }
 
 # -------------------------------------------------------------- 6. GUI E2E

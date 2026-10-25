@@ -1,4 +1,4 @@
-//! PixShot —— 截图 / 贴图 / OCR（Rust + Win32 + Windows.Media.Ocr）
+//! PixShot —— 截图 / 贴图 / OCR（Rust + Win32 + 本地 ONNX 推理）
 //!
 //! 流程：热键（默认 F1）/ 托盘 → 框选 → 从同一帧快照裁剪 → 操作工具栏
 //! （贴图 / 复制 / 保存 / OCR）。贴图窗口置顶显示，支持拖动、滚轮缩放、
@@ -304,7 +304,7 @@ fn run_smoke() -> i32 {
         }
     }
 
-    println!("[3/3] OCR 识别（Windows.Media.Ocr）...");
+    println!("[3/3] OCR 识别（本地 ONNX 推理链）...");
     match ocr::recognize(&img.data, img.width, img.height) {
         Ok(text) => {
             println!("[OK] 识别完成，共 {} 字符：", text.chars().count());

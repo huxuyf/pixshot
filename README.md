@@ -1,7 +1,9 @@
 # PixShot —— 截图 / 贴图 / OCR（Rust · Windows 桌面工具）
 
-仿 Snipaste 的 Windows 桌面小工具，纯 Rust 实现（Win32 GUI + Windows.Media.Ocr），零非 Rust
-运行时依赖。技术路线沿用本仓库 `screen_recorder` 工程已使用的 `windows` crate 绑定。
+仿 Snipaste 的 Windows 桌面小工具，纯 Rust 实现（Win32 GUI + 本地 ONNX 推理 OCR）。
+技术路线沿用本仓库 `screen_recorder` 工程已使用的 `windows` crate 绑定；OCR 由内置的
+PaddleOCR PP-OCRv4 ONNX 模型在本地推理（`ort` + 随包 `onnxruntime.dll`），系统
+`Windows.Media.Ocr` 仅作缺失模型/运行时的回退。
 
 ## 功能
 
@@ -11,9 +13,9 @@
 | **托盘常驻** | 启动后仅常驻任务栏托盘区域（无任何窗口弹出）；**F1 全局热键**（可在配置文件中改为 `Ctrl+Shift+S` 等）或**左键点击托盘**进入截图流程；右键托盘菜单含「开机启动」（可勾选，写入 HKCU 的 Run 键实现登录自启）与「退出」（点击后完全退出）。具备：单实例保护、托盘注册失败重试（5 次）、`TaskbarCreated` 处理（Explorer 重启后自动恢复图标）、`NOTIFYICON_VERSION_4` 回调协议（按 SETVERSION 成败自动分派两种回调布局）、失败可见（日志 + 提示框） |
 | **截图** | 按下热键后**整屏冻结**（显示捕获到的整屏快照，**不做暗化**）→ 十字光标、拖动框选并叠加一圈**红色框线**、Esc 取消（**只保留区域截图**，无活动窗口 / 全屏截图）→ 操作工具栏（**白底黑图标**的紧凑工具条：**贴图 / 保存 / 复制 / OCR / 关闭** 五个**纯图标**按钮，悬停出提示气泡并显示快捷键 Ctrl+T / Ctrl+S / Ctrl+C / Ctrl+O / Esc，点任一按钮后工具栏自动关闭，此时**冻结画面与红框才消失**）；**冻结画面与红框在工具条关闭前一直保留**（鼠标穿透，工具条压在其上），**整个流程只截一次全屏**，后续裁剪都基于同一份快照，多显示器/高 DPI 下选区与结果严格一致。可保存为 **PNG / JPEG / BMP**（系统保存对话框，记住上次目录），或复制为 `CF_DIB` 位图 |
 | **贴图** | 截图以无边框小窗钉在桌面**置顶**显示（Snipaste 式），**图像四周带柔和投影**（窗口用 `WS_EX_LAYERED` + `UpdateLayeredWindow`：比图像四周各多出一圈留白用于自绘投影，投影外完全透明且鼠标穿透）；按住左键拖动、滚轮以光标为锚点缩放（0.05×–8×）、右键菜单（复制图像 Ctrl+C / 保存为当前格式 Ctrl+S / OCR Ctrl+O / 重置缩放 / 关闭，快捷键右对齐显示且在菜单展开时直接可用）、Esc 关闭。100% 缩放走 `StretchDIBits` 直出快路径，其余缩放走离屏合成 + `HALFTONE`（缩小）/ `COLORONCOLOR`（放大） |
-| **OCR** | 调用系统自带 `Windows.Media.Ocr`（WinRT，支持中英文等多语言，无需安装任何 OCR 引擎）。**工具条「复制识别到的文字」与贴图右键菜单「识别文字 (OCR)」走同一条路径**（`ocr::recognize_to_clipboard_async`）：后台识别 → 文字写入剪贴板（`CF_UNICODETEXT`）→ 右下角 Toast「已复制文字到剪贴板」，**两处都不弹出结果窗口**，功能与提示完全一致。识别语言可在配置文件中固定（默认走系统语言 → zh-Hans-CN → en-US → 任意可用语言的回退链） |
+| **OCR** | **内置本地 ONNX 推理链**（对齐 PixPin 路线）：DB 文本检测 → CRNN+CTC 文本识别 → 版面/段落聚类，模型（PP-OCRv4 中英，`model/det.onnx`、`model/rec.onnx`）与运行时（`onnxruntime.dll`）随包分发，**离线、开箱即用**，并给出**逐行真实置信度**与文本框几何。**工具条「复制识别到的文字」与贴图右键菜单「识别文字 (OCR)」走同一条路径**（`ocr::recognize_to_clipboard_async`）：后台识别 → 文字写入剪贴板（`CF_UNICODETEXT`）→ 右下角 Toast「已复制文字到剪贴板」，**两处都不弹出结果窗口**，功能与提示完全一致。可选后处理：标点全/半角、去空格、版面类型（见配置）。字符字典内嵌在 `rec.onnx` 的 ONNX metadata 里，无需单独词典文件。**缺模型/运行时时自动回退系统 `Windows.Media.Ocr`** |
 | **提示与菜单** | 操作反馈使用非模态 Toast（右下角自动消失、点击即关），不再弹系统消息框打断操作；托盘与贴图右键共用同一套自绘 Fluent 菜单（支持多项目 / 分隔线 / 禁用态） |
-| **配置** | `config.ini`（与 `pixshot.exe` 同目录）纯文本配置：热键、保存格式、默认保存目录、OCR 语言、Toast 停留时长；手写解析器，非法值自动回退默认并写诊断日志 |
+| **配置** | `config.ini`（与 `pixshot.exe` 同目录）纯文本配置：热键、保存格式、默认保存目录、OCR 语言/版面/标点/去空格/置信度、Toast 停留时长；手写解析器，非法值自动回退默认并写诊断日志 |
 
 ## 构建与运行
 
@@ -35,14 +37,17 @@ cargo run --release
 # 无 GUI 冒烟测试：全屏截图 → 保存 PNG → OCR 识别（验证核心链路）
 cargo run --release -- --smoke
 
-# 单元测试 + 集成测试（53 项，纯逻辑、不触碰桌面）
+# 单元测试 + 集成测试（111 项，纯逻辑、不触碰桌面；含 OCR 端到端一项，需随包模型）
 cargo test
 
 # 本地 CI：check → test → build → release → 体积护栏 → E2E（加 -SkipE2E 跳过最后一步）
 pwsh -File scripts\ci.ps1
 ```
 
-产物：`target\release\pixshot.exe`（单文件，约 2.2 MB，无 DLL 依赖，可直接分发）。
+产物：`target\release\` 目录即分发内容 —— `pixshot.exe`（约 3.1 MB）+ `onnxruntime.dll`
+（约 15 MB）+ `model\{det,rec}.onnx`（约 16 MB），合计约 34 MB。`build.rs` 会在构建时把运行时
+与模型摆到 exe 同目录，因此 `target\release\` 自带可运行，整目录拷走即可用（OCR 需同目录的
+`onnxruntime.dll` 与 `model\`；若缺失则自动回退系统 `Windows.Media.Ocr`）。
 
 ### 图标嵌入与构建工具链
 
@@ -114,16 +119,20 @@ pwsh -File scripts\fix_integrity.ps1
 hotkey   = F1                ; 全局热键，支持 Ctrl / Alt / Shift / Win 组合，如 Ctrl+Shift+S
 format   = png               ; 保存格式：png / jpg / bmp
 save_dir =                   ; 默认保存目录，留空则每次打开对话框时从系统默认位置开始
-ocr_lang =                   ; OCR 语言，留空则自动回退（系统语言 → zh-Hans-CN → en-US → 任意）
+ocr_lang =                   ; OCR 语言，留空则自动回退（仅回退到系统 OCR 时生效）
+ocr_layout_type = auto       ; OCR 版面：auto（自动）/ single（单行）/ multi（多行，段落空行分隔）
+ocr_punctuation_type = none  ; OCR 标点：none（不转换）/ full（半角→全角）/ half（全角→半角）
+ocr_remove_spaces = 0        ; OCR 是否删除空格（保留换行）：0 / 1
+ocr_confidence = 0.00        ; 行置信度下限 0.0-1.0（仅内置 ONNX 引擎生效，低于它的行不输出）
 toast_ms = 1600              ; 操作提示的停留毫秒数
 ```
 
 解析器为手写实现（不引入 ini/toml 依赖）：未知键忽略、非法值回退默认值，两类情况都会
 写入诊断日志，不会因配置写坏而启动失败。保存成功后自动记住本次目录（回写 `save_dir`）。
 
-> OCR 需要 Windows 语言包带"文字识别"可选功能（中文/英文系统一般已内置）。
-> 若提示没有可用语言包：设置 → 时间和语言 → 语言和区域 → 添加语言（如"英语(美国)"或
-> "中文(简体)"）→ 语言选项 → 勾选"文字识别"。
+> **OCR 引擎**：优先使用内置的本地 ONNX 推理链（`onnxruntime.dll` + `model\{det,rec}.onnx`
+> 与 exe 同目录），离线可用、无需系统语言包。若这些文件缺失，则回退系统 `Windows.Media.Ocr`
+> —— 此时才需要 Windows 语言包带"文字识别"可选功能（中文/英文系统一般已内置）。
 
 ## 操作方式
 
@@ -212,18 +221,23 @@ toast_ms = 1600              ; 操作提示的停留毫秒数
 | | 增强版 `pixshot` | 精简版 `pixshot-lite` |
 |---|---|---|
 | 功能 | 截图 / 贴图 / **OCR** | 截图 / 贴图 |
-| OCR 引擎 | 系统 `Windows.Media.Ocr`（当前）→ 将来可换内置高精度引擎 | 无 |
-| 依赖 | `windows`；接入内置引擎后额外带该引擎（体积显著增大） | 仅 `windows` |
+| OCR 引擎 | **内置本地 ONNX 推理链**（PP-OCRv4，随包模型）+ 回退系统 `Windows.Media.Ocr` | 无 |
+| 依赖 | `ort`（load-dynamic）+ `windows`；随包 `onnxruntime.dll` 与 `model\*.onnx`（约 31 MB） | 仅 `windows` |
 
-**引擎抽象层**（`src/ocr/engine.rs`）把「用哪个引擎」与识别管线解耦：管线（上采样、多变体
-跑分取优、按行重建）只依赖 `OcrEngineImpl` trait，不感知具体引擎。新增一个内置引擎只需三步：
+**引擎抽象层**（`src/ocr/engine.rs`）把「用哪个引擎」与识别管线解耦：管线只依赖
+`OcrEngineImpl` trait。trait 用 `self_contained()` 区分两种引擎：
 
-1. 新增 `src/ocr/<引擎名>.rs`，实现 `OcrEngineImpl`（`id` / `max_dimension` / `recognize`）；
-2. 在 `engine::create()` 里挑引擎 —— 这是**唯一的**挑选点，例如「配置指定内置 → 内置 → 回退系统」；
-3. 该引擎的依赖写进 `Cargo.toml` 并**设为 optional**（或走独立 profile），不启用时不进产物。
+- **自包含**（内置 ONNX）：引擎自带检测 + 识别 + 置信度，管线直接取 `recognize_lines()` 的
+  行结构做版面聚类与后处理，**不走上采样/多候选启发式**；
+- **非自包含**（系统 WinRT）：只给无置信度的纯文本，管线走「上采样 → 多变体（原图/Otsu/反相）
+  → 启发式评分取优」的老路。
 
-这样内置引擎的体积代价只落在增强版上，精简版和「未启用该 feature 的增强版构建」都保持轻量。
-当前 `engine::create()` 恒返回系统 WinRT 引擎，行为与重构前完全一致。
+新增一个内置引擎只需三步：
+
+1. 新增 `src/ocr/<引擎名>.rs`，实现 `OcrEngineImpl`（`id` / `max_dimension` / `recognize`，
+   自包含引擎另覆写 `self_contained` 与 `recognize_lines`）；
+2. 在 `engine::create()` 里挑引擎 —— 这是**唯一的**挑选点，当前顺序为「内置 ONNX → 系统 WinRT」；
+3. 该引擎的依赖写进 `Cargo.toml`。
 
 **两条线互相取补丁**（两仓库各自独立，没有共同祖先之外的自动同步）：
 
@@ -244,8 +258,11 @@ git fetch plus && git cherry-pick <增强版的提交>
 
 ```
 pixshot/
-├── Cargo.toml            # windows 0.58 绑定（Win32 + WinRT OCR），无其他依赖
-├── build.rs             # 应用图标：纯 Rust 光栅化器生成 .ico + windres/rc.exe 嵌入 exe 资源
+├── Cargo.toml            # ort 2.0.0-rc.11（load-dynamic）+ windows 0.58 绑定
+├── build.rs             # 图标生成与嵌入 + 把 onnxruntime.dll / model\*.onnx 布置到 exe 同目录
+├── NOTICE               # 第三方组件声明（ONNX Runtime MIT、PaddleOCR 模型 Apache-2.0）
+├── model/               # 随包 OCR 模型：det.onnx（检测）/ rec.onnx（识别，内嵌字典）
+├── vendor/onnxruntime/  # 随包运行时：onnxruntime.dll(+providers_shared)
 ├── src/
 │   ├── main.rs           # 入口：进程级初始化、截图流程编排（含 panic 兜底与重入保护）、--smoke
 │   ├── tray.rs           # 托盘常驻 + 全局热键（RegisterHotKey → 低级钩子回退）+ 单实例互斥
@@ -256,10 +273,13 @@ pixshot/
 │   ├── svgpath.rs        # SVG path 展平器：把 Lucide 的 d 字符串解析为折线（纯 Rust，可单测）
 │   ├── tooltip.rs        # 图标悬停提示气泡（自绘卡片，文案含快捷键；替代 comctl32 标准 tooltip）
 │   ├── pin.rs            # 置顶贴图窗口（拖动/滚轮缩放/自绘四周投影/离屏合成/右键菜单，像素级完整呈现）
-│   ├── ocr.rs            # OCR 识别管线（多变体跑分取优、上采样、按行重建）+ 引擎抽象入口
+│   ├── ocr.rs            # OCR 识别管线（按引擎是否自包含分派：版面聚类 vs 多变体跑分取优）
 │   ├── ocr/
-│   │   ├── engine.rs     # 引擎抽象层：OcrEngineImpl trait + 唯一的引擎挑选点 engine::create()
-│   │   └── winrt.rs      # 系统引擎实现：Windows.Media.Ocr（语言回退链、无模型、零体积）
+│   │   ├── engine.rs     # 引擎抽象层：OcrEngineImpl trait（含 self_contained/recognize_lines）+ 唯一挑选点
+│   │   ├── onnx.rs       # 内置引擎：DB 检测 + CTC 识别 + 会话缓存 + 真实置信度（首选）
+│   │   ├── onnx_image.rs # ONNX 前/后处理（BGRA→RGB、双三次缩放、检测概率图→连通域→unclip 框）
+│   │   ├── layout.rs     # 版面重建与后处理：行/段落聚类、标点全/半角、去空格
+│   │   └── winrt.rs      # 系统引擎实现：Windows.Media.Ocr（回退用；语言回退链、无模型）
 │   ├── clipboard.rs      # Win32 剪贴板：CF_DIB 图像 / CF_UNICODETEXT 文本（RAII 守卫）
 │   ├── imageio.rs        # WIC 编码 PNG/JPEG/BMP + 系统保存对话框（记住上次目录）
 │   ├── config.rs         # config.ini 读写与解析（热键/格式/目录/OCR 语言/Toast 时长）
@@ -345,8 +365,9 @@ pwsh -File scripts\gui_e2e_test.ps1 -Exe target\release\pixshot.exe
 不依赖桌面上恰好有文字。
 
 > 测试结果示例（本仓库开发机，Windows 11 26300，125% DPI）：
-> `[消息驱动版] 测试结束：21 项通过，0 项失败`，OCR 识别输出
-> `PixShot OCR E2E 识 别 测 试 文 本 ABC 12345`。
+> `[消息驱动版] 测试结束：21 项通过，0 项失败`，OCR 识别输出形如
+> `PixShot OCR E2E 识别测试文本 ABC 12345`（内置 ONNX 引擎；回退到系统 OCR 时中文间可能
+> 出现假空格，管线会自动清理）。
 >
 > 说明：物理驱动版依赖向系统注入鼠标/键盘输入，在禁止输入注入的受限宿主
 > （如某些自动化沙箱）中会被拦截——此时请使用消息驱动版。
@@ -423,8 +444,12 @@ pwsh -File scripts\gui_e2e_test.ps1 -Exe target\release\pixshot.exe
   操作反馈统一走 `toast.rs` 的非模态 Toast，不再用 `MessageBoxW` 打断操作流。
 - **配置**：`config.ini` 由手写解析器读取（零依赖），非法值回退默认并记日志，
   配置损坏不会导致启动失败。
-- **OCR**：`Windows.Media.Ocr` 系统自带、离线、开箱即用（回退链：用户语言 → zh-Hans-CN →
-  en-US → 任意可用语言），超过 `MaxImageDimension` 自动等比降采样。
+- **OCR**：**内置本地 ONNX 推理链**（首选）—— DB 文本检测（PP-OCRv4 det）→ 逐框 CRNN+CTC
+  识别（PP-OCRv4 rec，字典内嵌模型 metadata）→ 版面/段落聚类，全程离线、CPU 推理，并给出
+  逐行真实置信度；模型与 `onnxruntime.dll` 随包分发（见 `NOTICE`）。`onnxruntime.dll` 由
+  `ort` 在**首次识别时**惰性 `load-dynamic`、模型会话进程内只加载一次（后台线程，不阻塞 GUI）。
+  若这些文件缺失则回退系统 `Windows.Media.Ocr`（回退链：用户语言 → zh-Hans-CN → en-US →
+  任意可用语言），此时走上采样 + 多变体（原图/Otsu 二值化/深色反相）+ 启发式评分取优。
 - **PNG**：WIC 编码（`IWICImagingFactory`），无第三方图像库。
 - **DPI**：进程级 Per-Monitor-V2 感知，所有坐标/截图均为物理像素；各窗口布局按
   `GetDpiForWindow` 换算并响应 `WM_DPICHANGED`（跨不同缩放率显示器拖动时不会错位），
@@ -441,26 +466,31 @@ pwsh -File scripts\gui_e2e_test.ps1 -Exe target\release\pixshot.exe
   注入——实测稳态内存从 ~58MB 降至 ~19MB、空闲 CPU 从 ~1% 降至 0；贴图外框矩形缓存
   避免高频 `GetWindowRect` 内核调用。
 
-## 性能预算（硬性约束验收）
+## 性能与体积预算（硬性约束验收）
 
-| 指标 | 改造前基线 | Fluent 版实测 | 预算 | 判定 |
+| 指标 | Fluent 版实测（改造前） | 接入内置 ONNX OCR 后 | 预算 | 判定 |
 |---|---|---|---|---|
-| EXE 体积 | 1.97 MB | **2.17 MB（+10.2%，含嵌入图标资源、托盘/热键加固、配置与自绘菜单）** | ≤ +20%（≤2.37 MB） | ✓ |
-| 冷启动（→托盘就绪） | 63–78 ms | **78–141 ms**（含测量轮询粒度 ~60ms） | ≤ 300 ms | ✓ |
-| 稳态内存（托盘常驻） | 50.6–58.6 MB | **10.29 MB** | ≤ 50 MB | ✓ |
-| 稳态内存（全屏贴图） | 72.38 MB | **27.98 MB** | ≤ 50 MB | ✓ |
-| 空闲 CPU（无输入） | 0.78–0.94% | **0.000%**（3×10s 采样窗口） | ≈ 0 | ✓ |
-| 第三方依赖 | 0 crate | **0 新增**（图标为 build.rs 纯 Rust 生成，仅调用工具链自带 windres） | 零/极轻 | ✓ |
+| EXE 体积 | 2.17 MB | **3.12 MB**（+`ort` 绑定代码；ONNX Runtime 走 DLL 不静态链接） | ≤ 4.0 MB | ✓ |
+| 分发总体积 | 2.17 MB（单 exe） | **约 34 MB = exe 3.1 + `onnxruntime.dll` 15 + `model\*.onnx` 16** | 随包内置（离线优先） | ✓ |
+| 冷启动（→托盘就绪） | 78–141 ms | **基本不变**（ONNX 惰性加载，启动不碰 DLL/模型） | ≤ 300 ms | ✓ |
+| OCR 首次识别 | — | **约 0.4–0.6 s**（含 DLL + 两个模型加载，仅首次） | 可接受 | ✓ |
+| OCR 后续识别 | — | **百毫秒级**（会话已缓存；debug 构建单行小图约 0.4 s，release 更快） | 可接受 | ✓ |
+| 稳态内存（托盘常驻） | 10.29 MB | 不变（未识别时不含 ONNX 会话） | ≤ 50 MB | ✓ |
+| 空闲 CPU（无输入） | 0.000% | 不变 | ≈ 0 | ✓ |
+| 第三方依赖 | 0 crate | **`ort` + `windows`**（另随包 ONNX Runtime 与 PP-OCRv4 模型，见 `NOTICE`） | 明确可控 | ✓ |
 
-（实测脚本：`scripts\measure_baseline.ps1` → `perf_baseline.txt`；
-视觉像素级验证：`scripts\verify_fluent.ps1` → `fluent_verify.txt`。
-**体积回归护栏**已固化进 CI：`scripts\ci.ps1` 在 release 构建后断言
-`pixshot.exe ≤ 2.6 MB`，超出即失败并提示检查新增依赖/未裁剪的 crate feature。）
+（**体积回归护栏**已固化进 CI：`scripts\ci.ps1` 在 release 构建后断言
+`pixshot.exe ≤ 4.0 MB`，并检查 `model\det.onnx`、`model\rec.onnx`、`vendor\onnxruntime\onnxruntime.dll`
+三项随包资产齐备，任一缺失即失败。）
 
 ## 已知限制
 
 - 仅支持 Windows（任务要求；GDI/WinRT/WIC 均为 Windows API）
-- OCR 语言取决于系统语言包；无可用语言包时给出中文引导提示
+- OCR 语言：内置引擎只带 **中英** 模型（PP-OCRv4 的 ch 模型同时覆盖中英文）；其他语言需回退
+  系统 `Windows.Media.Ocr`（取决于系统语言包）。多语言模型的按需加载/下载**未实现**
+- OCR 检测框为**轴对齐**矩形（未做旋转文本的 minAreaRect/透视矫正），竖排或明显倾斜的文字
+  效果有限；多栏版面不做分栏（按单栏自上而下聚类）
+- 随包模型约 16 MB、运行时约 15 MB，分发体积从 ~2 MB 增至 ~34 MB；首次识别有 DLL/模型加载延迟
 - 多显示器：框选/贴图坐标基于虚拟屏幕，支持负坐标副屏；贴图初始缩放以主屏 85% 为上限
 - 贴图尺寸调整仅支持滚轮缩放（不提供边缘拖拽调整——为保图像像素级完整，
   窗口不再使用 WS_THICKFRAME，见设计说明）

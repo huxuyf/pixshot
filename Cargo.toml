@@ -2,9 +2,16 @@
 name = "pixshot"
 version = "0.1.0"
 edition = "2021"
-description = "PixPin 风格的 Windows 桌面工具：框选截图 / 贴图置顶 / OCR 文字识别（Rust + Win32 + Windows.Media.Ocr）"
+description = "PixPin 风格的 Windows 桌面工具：框选截图 / 贴图置顶 / OCR 文字识别（Rust + Win32 + 本地 ONNX 推理）"
 
 [dependencies]
+# OCR 本地推理：ort 绑定 onnxruntime；load-dynamic 在运行时加载 onnxruntime.dll
+# （优先 <exe目录>/onnxruntime.dll，开发期回退仓库 vendor/onnxruntime/）
+#
+# 版本必须精确固定：ort 在 load-dynamic 时按编译期 MINOR_VERSION 校验运行时次版本，
+# rc.11 对标 ONNX Runtime 1.23，与本仓库随包的 onnxruntime.dll(1.23.0) 一致；换成别版会被拒。
+# 关掉默认特性（默认会启用 download-binaries/copy-dylibs/tls-native，并拉入 ureq），只保留 load-dynamic。
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 # 与本仓库 screen_recorder 工程相同的 Windows API 绑定（Win32 GUI + WinRT OCR）
 windows = { version = "0.58", features = [
     "Win32_Foundation",

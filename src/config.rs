@@ -61,8 +61,78 @@ pub struct Config {
     pub save_dir: Option<String>,
     /// 首选 OCR 语言标签（如 `zh-Hans-CN`）；空 = 按系统语言自动回退。
     pub ocr_lang: Option<String>,
+    /// OCR 版面类型（对应 PixPin `Ocr.LayoutType`）。
+    pub ocr_layout: OcrLayout,
+    /// OCR 标点转换（对应 PixPin `Ocr.PunctuationType`）。
+    pub ocr_punctuation: OcrPunctuation,
+    /// 是否删除空格（对应 PixPin `Ocr.RemoveSpaces`，保留换行）。
+    pub ocr_remove_spaces: bool,
+    /// 行置信度下限（0.0–1.0）：低于它的行不输出（仅对自带置信度的 ONNX 引擎生效）。
+    pub ocr_confidence: f32,
     /// 轻提示停留时长（毫秒）。
     pub toast_ms: u32,
+}
+
+/// OCR 版面类型（`ocr_layout_type`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OcrLayout {
+    /// 自动：多行时按段落输出。
+    #[default]
+    Auto,
+    /// 单行：所有内容拼成一行。
+    Single,
+    /// 多行：每行一行文本，段落间空行分隔。
+    Multi,
+}
+
+impl OcrLayout {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "single" | "one" => Some(Self::Single),
+            "multi" | "multiple" => Some(Self::Multi),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Single => "single",
+            Self::Multi => "multi",
+        }
+    }
+}
+
+/// OCR 标点转换（`ocr_punctuation_type`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OcrPunctuation {
+    /// 不转换。
+    #[default]
+    None,
+    /// 半角 → 全角。
+    Full,
+    /// 全角 → 半角。
+    Half,
+}
+
+impl OcrPunctuation {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "none" => Some(Self::None),
+            "full" | "fullwidth" => Some(Self::Full),
+            "half" | "halfwidth" => Some(Self::Half),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Full => "full",
+            Self::Half => "half",
+        }
+    }
 }
 
 impl Default for Config {
@@ -72,6 +142,10 @@ impl Default for Config {
             format: SaveFormat::Png,
             save_dir: None,
             ocr_lang: None,
+            ocr_layout: OcrLayout::Auto,
+            ocr_punctuation: OcrPunctuation::None,
+            ocr_remove_spaces: false,
+            ocr_confidence: 0.0,
             toast_ms: 1600,
         }
     }
@@ -184,7 +258,19 @@ pub fn render(c: &Config) -> String {
     s.push_str("# 上次保存目录（程序自动维护，也可手工指定）\n");
     s.push_str(&format!("save_dir = {}\n\n", c.save_dir.as_deref().unwrap_or("")));
     s.push_str("# OCR 首选语言（留空则按系统语言自动回退），例：zh-Hans-CN\n");
+    s.push_str("# 注：内置 ONNX 引擎使用自带的中英模型，此项仅在回退到系统 OCR 时生效。\n");
     s.push_str(&format!("ocr_lang = {}\n\n", c.ocr_lang.as_deref().unwrap_or("")));
+    s.push_str("# OCR 版面：auto（自动）/ single（单行）/ multi（多行，段落空行分隔）\n");
+    s.push_str(&format!("ocr_layout_type = {}\n\n", c.ocr_layout.label()));
+    s.push_str("# OCR 标点：none（不转换）/ full（半角→全角）/ half（全角→半角）\n");
+    s.push_str(&format!("ocr_punctuation_type = {}\n\n", c.ocr_punctuation.label()));
+    s.push_str("# 是否删除空格（保留换行）：0 / 1\n");
+    s.push_str(&format!(
+        "ocr_remove_spaces = {}\n\n",
+        if c.ocr_remove_spaces { 1 } else { 0 }
+    ));
+    s.push_str("# 行置信度下限 0.0-1.0（仅内置 ONNX 引擎生效，低于它的行不输出）\n");
+    s.push_str(&format!("ocr_confidence = {:.2}\n\n", c.ocr_confidence));
     s.push_str("# 成功提示停留时长（毫秒，300-10000）\n");
     s.push_str(&format!("toast_ms = {}\n", c.toast_ms));
     s
@@ -237,6 +323,22 @@ pub fn parse_detailed(text: &str) -> (Config, Vec<String>) {
                     c.ocr_lang = Some(val.to_string());
                 }
             }
+            "ocr_layout_type" => match OcrLayout::parse(val) {
+                Some(v) => c.ocr_layout = v,
+                None => warnings.push(format!("无法识别的版面类型 {val:?}，沿用默认 auto")),
+            },
+            "ocr_punctuation_type" => match OcrPunctuation::parse(val) {
+                Some(v) => c.ocr_punctuation = v,
+                None => warnings.push(format!("无法识别的标点类型 {val:?}，沿用默认 none")),
+            },
+            "ocr_remove_spaces" => match parse_bool(val) {
+                Some(v) => c.ocr_remove_spaces = v,
+                None => warnings.push(format!("无法识别的 ocr_remove_spaces {val:?}，沿用默认 0")),
+            },
+            "ocr_confidence" => match val.parse::<f32>() {
+                Ok(v) => c.ocr_confidence = v.clamp(0.0, 1.0),
+                Err(_) => warnings.push(format!("无法识别的置信度阈值 {val:?}，沿用默认 0")),
+            },
             "toast_ms" => {
                 if let Ok(n) = val.parse::<u32>() {
                     c.toast_ms = n.clamp(300, 10_000);
@@ -246,6 +348,15 @@ pub fn parse_detailed(text: &str) -> (Config, Vec<String>) {
         }
     }
     (c, warnings)
+}
+
+/// 解析布尔开关：接受 1/0、true/false、yes/no、on/off（大小写无关）。
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// 解析热键字符串 → (修饰键位, 虚拟键码)。
@@ -376,13 +487,43 @@ mod tests {
         c.format = SaveFormat::Bmp;
         c.save_dir = Some(r"C:\temp".into());
         c.ocr_lang = Some("en-US".into());
+        c.ocr_layout = OcrLayout::Multi;
+        c.ocr_punctuation = OcrPunctuation::Half;
+        c.ocr_remove_spaces = true;
+        c.ocr_confidence = 0.35;
         c.toast_ms = 2000;
         let back = parse(&render(&c));
         assert_eq!(back.hotkey, c.hotkey);
         assert_eq!(back.format, c.format);
         assert_eq!(back.save_dir, c.save_dir);
         assert_eq!(back.ocr_lang, c.ocr_lang);
+        assert_eq!(back.ocr_layout, c.ocr_layout);
+        assert_eq!(back.ocr_punctuation, c.ocr_punctuation);
+        assert_eq!(back.ocr_remove_spaces, c.ocr_remove_spaces);
+        assert!((back.ocr_confidence - c.ocr_confidence).abs() < 1e-6);
         assert_eq!(back.toast_ms, c.toast_ms);
+    }
+
+    #[test]
+    fn parse_ocr_options_and_fallbacks() {
+        let c = parse(
+            "ocr_layout_type = single\n\
+             ocr_punctuation_type = full\n\
+             ocr_remove_spaces = yes\n\
+             ocr_confidence = 0.5\n",
+        );
+        assert_eq!(c.ocr_layout, OcrLayout::Single);
+        assert_eq!(c.ocr_punctuation, OcrPunctuation::Full);
+        assert!(c.ocr_remove_spaces);
+        assert!((c.ocr_confidence - 0.5).abs() < 1e-6);
+
+        // 非法值 → 默认
+        let c = parse("ocr_layout_type = bad\nocr_remove_spaces = maybe\nocr_confidence = abc\n");
+        assert_eq!(c.ocr_layout, OcrLayout::Auto);
+        assert!(!c.ocr_remove_spaces);
+        assert_eq!(c.ocr_confidence, 0.0);
+        // 越界置信度被钳制
+        assert!((parse("ocr_confidence = 5\n").ocr_confidence - 1.0).abs() < 1e-6);
     }
 
     #[test]

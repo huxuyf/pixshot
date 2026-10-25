@@ -27,3 +27,5 @@ desktop.ini
 # 工具数据目录（会话记录与记忆）
 # 注意：.workbuddy/ 是项目数据目录，不是缓存——只做「不入库」，绝不删除。
 .workbuddy/
+# ZCode 规划/会话数据（不入库，勿删）
+.zcode/

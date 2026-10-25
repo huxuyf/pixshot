@@ -1,15 +1,20 @@
-//! OCR：识别管线 + 可插拔引擎。
+//! OCR：识别管线 + 可插拔引擎（本地 ONNX 优先，系统 WinRT 回退）。
 //!
-//! 识别前处理链（见 `recognize_inner`）：小图上采样到引擎偏好的字高 → 生成若干候选图
-//! （原图 / Otsu 二值化 / 深色反相）→ 各跑一次识别 → 用启发式评分取最优 → 逐行重建并
-//! 清理中文假空格。引擎返回的是无置信度的纯文本，故用「有意义字符占比 × log(长度)」来代替。
+//! 管线分两条路径，取决于引擎是否「自包含」（见 [`engine::OcrEngineImpl::self_contained`]）：
+//! - **自包含引擎（内置 ONNX）**：引擎自带检测 + 识别 + 置信度，管线直接取行结构做版面聚类
+//!   （[`layout::assemble`]），再按配置做标点全/半角与去空格；
+//! - **非自包含引擎（系统 WinRT）**：引擎只给无置信度的纯文本，走上采样 → 多变体
+//!   （原图 / Otsu 二值化 / 深色反相）→ 启发式评分取优的老路。
 //!
-//! 引擎本身与管线解耦，见 [`engine`]：当前唯一实现是系统自带的 Windows.Media.Ocr
-//! （[`winrt`]，无需安装、不打包模型）。将来接入内置高精度引擎时只改 [`engine::create`]。
+//! 引擎挑选见 [`engine::create`]：内置 ONNX（`onnxruntime.dll` + `model/*.onnx` 齐备）优先，
+//! 缺失时回退系统 OCR。
 //!
-//! 本模块不含 GUI，可在任意后台线程调用（自行初始化 COM/MTA）。
+//! 本模块不含 GUI，可在任意后台线程调用（WinRT 路径自行初始化 COM/MTA）。
 
 mod engine;
+mod layout;
+mod onnx;
+mod onnx_image;
 mod winrt;
 
 use engine::OcrEngineImpl;
@@ -75,8 +80,9 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
     }
     let engine = engine::create().ok_or_else(|| {
         AppError::Ocr(
-            "系统未安装可用的 OCR 语言包。请在 设置 → 时间和语言 → 语言和区域 中添加\
-             中文（简体）或英文语言，并包含“文字识别”可选功能。"
+            "未找到可用的 OCR 引擎。内置引擎需要与 pixshot.exe 同目录的 onnxruntime.dll 与 \
+             model/{det,rec}.onnx；回退引擎需要系统安装中文（简体）或英文语言包并包含\
+             “文字识别”可选功能。"
                 .into(),
         )
     })?;
@@ -85,6 +91,32 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
         engine.id(),
         engine.max_dimension()
     ));
+    let cfg = crate::config::get();
+
+    // 自包含引擎（ONNX）：自带检测+识别+版面，直接取行结构做聚类与后处理，不走多候选启发式。
+    if engine.self_contained() {
+        let lines = engine.recognize_lines(bgra, w, h)?;
+        let total = lines.len();
+        let kept: Vec<engine::TextLine> = lines
+            .into_iter()
+            .filter(|l| l.conf >= cfg.ocr_confidence)
+            .collect();
+        let mean_conf = if kept.is_empty() {
+            0.0
+        } else {
+            kept.iter().map(|l| l.conf).sum::<f32>() / kept.len() as f32
+        };
+        crate::diag::log(&format!(
+            "[ocr] ONNX 检测行={total} 保留={} 平均置信度={mean_conf:.2} 阈值={:.2}",
+            kept.len(),
+            cfg.ocr_confidence
+        ));
+        if kept.is_empty() {
+            return Ok(String::new());
+        }
+        let text = layout::assemble(&kept, cfg.ocr_layout);
+        return Ok(finish(&text, &cfg));
+    }
 
     // 引擎对 20–40px 的字高最准：小图先放大，超限大图再等比缩小。
     let max = engine.max_dimension();
@@ -107,8 +139,19 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
             try_candidate(engine.as_ref(), "inverted", &invert(&base), sw, sh, &mut best);
         }
     }
-    best.map(|(_, t)| t)
+    best.map(|(_, t)| finish(&t, &cfg))
         .ok_or_else(|| AppError::Ocr("所有候选识别均失败".into()))
+}
+
+/// 统一的文本后处理：按配置做标点全/半角转换与去空格，并去掉首尾空白。
+fn finish(text: &str, cfg: &crate::config::Config) -> String {
+    let t = layout::apply_punctuation(text, cfg.ocr_punctuation);
+    let t = if cfg.ocr_remove_spaces {
+        layout::remove_spaces(&t)
+    } else {
+        t
+    };
+    t.trim().to_string()
 }
 
 /// 对一幅候选图跑一次识别，并把结果按启发式评分并入 `best`（更高分才替换）。
