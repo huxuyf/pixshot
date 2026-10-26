@@ -35,6 +35,12 @@ pub enum Icon {
     Copy,
     Ocr,
     Close,
+    /// 标注：矩形。
+    Rect,
+    /// 标注：箭头。
+    Arrow,
+    /// 标注：步骤序号。
+    StepNo,
 }
 
 /// 图标对应的 Lucide 路径数据（24×24 viewBox，`stroke-width: 2`）。
@@ -63,6 +69,12 @@ fn lucide_paths(icon: Icon) -> &'static [&'static str] {
         "M7 16h6",
     ];
     const X: [&str; 2] = ["M18 6 6 18", "m6 6 12 12"];
+    // square（圆角矩形，等价 lucide `square`）
+    const SQUARE: &str = "m5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-14a2 2 0 0 1-2-2v-14a2 2 0 0 1 2-2z";
+    // arrow-up-right
+    const ARROW_UP_RIGHT: [&str; 2] = ["M7 7h10v10", "M7 17 17 7"];
+    // circle + 数字 "1"（步骤序号）
+    const STEP_NO: [&str; 3] = ["M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20z", "M12 8v8", "M10 10l2-2"];
 
     match icon {
         Icon::Pin => std::slice::from_ref(&PIN),
@@ -70,11 +82,14 @@ fn lucide_paths(icon: Icon) -> &'static [&'static str] {
         Icon::Copy => &COPY,
         Icon::Ocr => &SCAN_TEXT,
         Icon::Close => &X,
+        Icon::Rect => std::slice::from_ref(&SQUARE),
+        Icon::Arrow => &ARROW_UP_RIGHT,
+        Icon::StepNo => &STEP_NO,
     }
 }
 
-/// 惰性初始化 GDI+（进程级一次）。
-fn gdiplus_ready() -> bool {
+/// 惰性初始化 GDI+（进程级一次）。供标注引擎（`annot::render_gdiplus`）复用。
+pub(crate) fn gdiplus_ready() -> bool {
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| unsafe {
         let input = GdiplusStartupInput {
@@ -178,7 +193,7 @@ mod preview {
     #[ignore = "仅在需要人工核对图标外观（抗锯齿）时运行：--ignored render_preview"]
     fn render_preview() {
         // 与真实工具条一致：32 逻辑像素方形按钮（此处按 3x 渲染便于观察锯齿）
-        let (cell, w, h) = (96i32, 96 * 5, 96 * 2);
+        let (cell, w, h) = (96i32, 96 * 8, 96 * 2);
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
                 None,
@@ -208,7 +223,16 @@ mod preview {
             let card = COLORREF(0x00FF_FFFF);
             let hover = COLORREF(0x00EC_ECEC);
             let ink = COLORREF(0x0000_0000);
-            let all = [Icon::Pin, Icon::Save, Icon::Copy, Icon::Ocr, Icon::Close];
+            let all = [
+                Icon::Pin,
+                Icon::Save,
+                Icon::Copy,
+                Icon::Ocr,
+                Icon::Rect,
+                Icon::Arrow,
+                Icon::StepNo,
+                Icon::Close,
+            ];
             for (i, icon) in all.iter().enumerate() {
                 for row in 0..2 {
                     let bg = if row == 0 { card } else { hover };

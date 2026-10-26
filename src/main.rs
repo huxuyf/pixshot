@@ -16,6 +16,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod annot;
 mod autostart;
 mod capture;
 mod clipboard;
@@ -259,12 +260,11 @@ unsafe fn flow_impl() -> error::Result<()> {
     };
     // 2. 成品已在框选确认时从整屏快照裁好（`sel.image`），整屏快照也在那一刻随之释放。
     //    这里不再重新截屏，也不等待遮罩消失（遮罩与工具栏都设了 WDA_EXCLUDEFROMCAPTURE）。
-    //    `Selection` 实现了 Drop（关闭红框窗口），故只能 clone 出 Arc 而不能移出字段。
-    let image = sel.image.clone();
-    // 3. 操作工具栏：贴图 / 复制 / 保存 / OCR。
+    // 3. 操作工具栏：贴图 / 复制 / 保存 / OCR（均在导出前合成标注）+ 标注工具。
     //    工具条一旦关闭（点任一图标 / Esc / 关闭按钮），`sel` 在函数返回时析构，
-    //    红框随之消失。
-    toolbar::run(image)
+    //    冻结层随之消失。标注编辑挂在冻结层窗口过程上（sel 仍存活），故须把 &sel 传入。
+    let image = sel.image.clone();
+    toolbar::run(image, &sel)
 }
 
 // ─── smoke 冒烟测试 ──────────────────────────────────────────────

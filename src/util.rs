@@ -513,15 +513,15 @@ pub fn btn_colors(
 
 /// WM_DRAWITEM 绘制：Win11 风格圆角按钮（含悬停过渡/按下态）。
 /// `t` 为该窗口的皮肤（支持每个窗口独立主题，如工具栏固定深色）。
+/// `v` 为悬停插值（0..1），由调用方从 [`HoverFx`] 取（或对选中态直接给 1.0）。
 /// `Icon`/`IconClose` 只画底色、不画文本，供图标按钮在宿主里叠加矢量图标。
 pub unsafe fn draw_od_button(
     parent: HWND,
     dis: &DRAWITEMSTRUCT,
-    fx: &HoverFx,
+    v: f32,
     style: BtnStyle,
     t: crate::theme::Theme,
 ) {
-    let v = fx.val(dis.hwndItem);
     let pressed = (dis.itemState.0 & ODS_SELECTED.0) != 0;
     let (fill, txt) = btn_colors(style, t, v, pressed);
     let weight = if matches!(style, BtnStyle::Accent) {

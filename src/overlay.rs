@@ -28,24 +28,45 @@
 //! **窗口保留到会话结束**：拖动确认后窗口**不销毁**，冻结画面与红框继续显示，直到用户
 //! 点击工具条任一图标或关闭截图。此时 `run()` 结束模态循环但保留窗口与 `State`，
 //! 交由 [`Selection`] 持有；`Selection` 析构（或显式 [`Selection::dismiss`]）
-//! 时才真正拆窗、释放 GDI 资源。为了让保留期间仍能操作工具条，确认后窗口转为
-//! 鼠标穿透（`WS_EX_TRANSPARENT`）；工具条/贴图/菜单都是 `WS_EX_TOPMOST` 且在其后
-//! 创建，会压在冻结层之上。
+//! 时才真正拆窗、释放 GDI 资源。
+//!
+//! **确认后进入标注模式**（见设计文档《标注引擎 MVP 设计文档》1.2 A）：窗口**不再**
+//! 转为鼠标穿透（`WS_EX_TRANSPARENT`），而是继续接收鼠标消息用于矩形/箭头/步骤序号
+//! 标注；键盘消息由工具条经自定义消息（`WM_APP_KEY` / `WM_APP_SET_TOOL`）转发。
+//! 工具条/贴图/菜单都是 `WS_EX_TOPMOST` 且在其后创建，会压在冻结层之上；
+//! 标注期间冻结层对 `WM_MOUSEACTIVATE` 返回 `MA_NOACTIVATE`，不抢工具条的焦点与 z 序。
 
 use std::sync::Arc;
 
+use crate::annot::{self, AnnotDoc, AnnotSession, CursorKind, DibSurface, Pt, Rect, Tool};
 use crate::capture::{self, CapturedImage};
 use crate::util::{self, register_class_w, to_wide};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint, GetDC,
-    ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT,
+    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
+    GetDC, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
+    BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// 自定义消息：工具条 → 冻结层（设置当前工具）。`wp` = [`Tool`] 判别值。
+pub const WM_APP_SET_TOOL: u32 = WM_APP + 1;
+/// 自定义消息：工具条 → 冻结层（转发按键）。`wp` = VK，`lp` = Ctrl 是否按下。
+pub const WM_APP_KEY: u32 = WM_APP + 2;
+/// 自定义消息：请求重绘标注层（预留；当前未使用，收到即整选区重绘）。
+pub const WM_APP_ANNOT_DIRTY: u32 = WM_APP + 3;
+/// 自定义消息：冻结层 → 工具条（工具已变化）。`wp` = [`Tool`] 判别值。
+pub const WM_APP_TOOL_CHANGED: u32 = WM_APP + 4;
+/// 自定义消息：冻结层 → 工具条（Esc 交还，关闭会话）。
+pub const WM_APP_ESC_CLOSE: u32 = WM_APP + 5;
+
+/// 冻结层窗口类名（供冻结层反向定位工具条窗口）。
+const TOOLBAR_CLASS: &str = "PixShotToolbar";
 
 /// 选区（虚拟屏幕坐标，物理像素）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +96,19 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// 冻结层窗口句柄（工具条向其转发工具切换/按键，见设计文档 5.5）。
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    /// 只读借用标注文档（供合成导出，见设计文档 6）。
+    ///
+    /// **调用方必须立即使用、不得跨消息持有**：标注编辑发生在冻结层窗口过程里，
+    /// 长借会与 `overlay_proc` 的写入别名。
+    pub fn doc(&self) -> &AnnotDoc {
+        unsafe { &(*self.state).annot.doc }
+    }
+
     /// 收掉红框窗口并释放其 GDI 资源。幂等（`Drop` 会再调一次也无害）。
     pub fn dismiss(&mut self) {
         if self.hwnd.is_invalid() {
@@ -111,6 +145,15 @@ const BG_PX: u32 = 1 << 24;
 /// 纯红 = R=0xFF、G=0、B=0，alpha=255（预乘后颜色不变）。
 const FRAME_PX: u32 = 0xFFFF_0000;
 
+/// 冻结层所处阶段（替代原 `locked: bool`，见设计文档 1.2 F）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverlayMode {
+    /// 框选中（含确认前的拖动）。
+    Selecting,
+    /// 选区已确认：进入标注模式（窗口不再鼠标穿透）。
+    Annotating,
+}
+
 struct State {
     /// 确认时从整屏快照裁出的成品（小图）；`Some` 即表示"选区已确认"，
     /// `run()` 结尾取出交给 [`Selection`]。
@@ -119,8 +162,14 @@ struct State {
     /// **选区确认后立即置 `None` 释放**（不占整屏内存）。
     snapshot: Option<Arc<CapturedImage>>,
     dragging: bool,
-    /// 选区已确认：红框保留显示中，忽略此后的一切框选交互（窗口已鼠标穿透）。
-    locked: bool,
+    /// 当前阶段（框选中 / 标注中）。
+    mode: OverlayMode,
+    /// 已确认的选区（虚拟屏幕坐标，物理像素）。
+    region: SelectedRegion,
+    /// 标注会话（逻辑状态机）；确认后以真实选区尺寸重建。
+    annot: AnnotSession,
+    /// 标注底图：确认时从冻结表面复制选区（底图快照 + 红框），此后不可变。
+    annot_base: Option<DibSurface>,
     /// 由 `Selection` 主动拆窗：「是」则在 `WM_DESTROY` 里跳过 `PostQuitMessage`。
     quiet_destroy: bool,
     start: POINT, // 屏幕坐标
@@ -210,7 +259,15 @@ unsafe fn run() -> Option<Selection> {
         result_image: None,
         snapshot: Some(shot),
         dragging: false,
-        locked: false,
+        mode: OverlayMode::Selecting,
+        region: SelectedRegion {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        annot: AnnotSession::new(Rect::new(0, 0, 0, 0), overlay_dpi()),
+        annot_base: None,
         quiet_destroy: false,
         start: POINT::default(),
         cur: POINT::default(),
@@ -390,7 +447,15 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 
         WM_LBUTTONDOWN => {
             if let Some(s) = state_of(hwnd) {
-                if s.locked {
+                if s.mode == OverlayMode::Annotating {
+                    let p = annot_local_from_lparam(lp, s);
+                    let shift = shift_down();
+                    let a = s.annot.on_l_down(p, shift);
+                    // 进入绘制/拖动/缩放即捕获鼠标（见 5.1）
+                    if s.annot.capturing() {
+                        SetCapture(hwnd);
+                    }
+                    annot_apply(hwnd, s, a);
                     return LRESULT(0);
                 }
                 SetCapture(hwnd);
@@ -404,7 +469,14 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 
         WM_MOUSEMOVE => {
             if let Some(s) = state_of(hwnd) {
-                if s.dragging && !s.locked {
+                if s.mode == OverlayMode::Annotating {
+                    let p = annot_local_from_lparam(lp, s);
+                    let shift = shift_down();
+                    let a = s.annot.on_mouse_move(p, shift);
+                    annot_apply(hwnd, s, a);
+                    return LRESULT(0);
+                }
+                if s.dragging {
                     s.cur = point_from_lparam(lp, s.vx, s.vy);
                     repaint_frame(hwnd, s);
                 }
@@ -413,18 +485,99 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         }
 
         WM_LBUTTONUP => {
-            if !state_of(hwnd).map(|s| s.locked).unwrap_or(true) {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    let p = annot_local_from_lparam(lp, s);
+                    let shift = shift_down();
+                    let a = s.annot.on_l_up(p, shift);
+                    let _ = ReleaseCapture();
+                    annot_apply(hwnd, s, a);
+                    return LRESULT(0);
+                }
+            }
+            if !state_of(hwnd)
+                .map(|s| s.mode == OverlayMode::Annotating)
+                .unwrap_or(true)
+            {
                 finish_selection(hwnd, lp);
             }
             LRESULT(0)
         }
 
+        WM_SETCURSOR => {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating && (lp.0 & 0xFFFF) as u32 == HTCLIENT {
+                    let mut cpt = POINT::default();
+                    if GetCursorPos(&mut cpt).is_ok() {
+                        let p = Pt::new(cpt.x - s.region.x, cpt.y - s.region.y);
+                        set_annot_cursor(s.annot.cursor_at(p));
+                    }
+                    return LRESULT(1);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+
+        // 标注期间不抢焦点：保持工具条为前台窗口（键盘消息继续由工具条转发），
+        // 同时冻结层仍能收到鼠标消息用于标注。
+        WM_MOUSEACTIVATE => {
+            if state_of(hwnd)
+                .map(|s| s.mode == OverlayMode::Annotating)
+                .unwrap_or(false)
+            {
+                return LRESULT(MA_NOACTIVATE as isize);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+
         WM_KEYDOWN => {
-            if wp.0 == VK_ESCAPE {
-                // 选区确认后窗口只是保留显示的视觉层，Esc 已归工具条管；
-                // 此时若仍响应会拆掉红框并让 run() 误判为"已确认"。
-                if !state_of(hwnd).map(|s| s.locked).unwrap_or(true) {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    let ctrl = ctrl_down();
+                    annot_key(hwnd, s, wp.0, ctrl);
+                    return LRESULT(0);
+                }
+                if wp.0 == VK_ESCAPE {
+                    // 选区确认前：Esc 取消框选拆窗（确认后由工具条/标注侧处理）。
                     let _ = DestroyWindow(hwnd);
+                }
+            }
+            LRESULT(0)
+        }
+
+        // 工具条 → 冻结层：切换工具
+        WM_APP_SET_TOOL => {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    let tool = tool_from_usize(wp.0);
+                    let (a, cur_tool) = {
+                        let sess = &mut s.annot;
+                        let a = sess.set_tool(tool);
+                        (a, sess.tool())
+                    };
+                    annot_apply(hwnd, s, a);
+                    post_to_toolbar(WM_APP_TOOL_CHANGED, cur_tool as usize, 0);
+                }
+            }
+            LRESULT(0)
+        }
+
+        // 工具条 → 冻结层：转发按键（wp = VK，lp = Ctrl）
+        WM_APP_KEY => {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    annot_key(hwnd, s, wp.0, lp.0 != 0);
+                }
+            }
+            LRESULT(0)
+        }
+
+        // 预留：请求整选区重绘
+        WM_APP_ANNOT_DIRTY => {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    let sel = Rect::new(0, 0, s.region.width, s.region.height);
+                    repaint_annot(hwnd, s, sel);
                 }
             }
             LRESULT(0)
@@ -433,7 +586,10 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         // 确认后保留的窗口不接受关闭请求（否则红框提前消失、run() 误判为已确认）；
         // 它的生命周期由调用方持有的 Selection 决定。
         WM_CLOSE => {
-            if !state_of(hwnd).map(|s| s.locked).unwrap_or(true) {
+            if !state_of(hwnd)
+                .map(|s| s.mode == OverlayMode::Annotating)
+                .unwrap_or(true)
+            {
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
@@ -489,24 +645,24 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
         commit(hwnd, s, (0, 0, s.vw, s.vh));
         s.last = Some(sel_c);
         s.result_image = cropped;
-        s.locked = true;
+        // 进入标注模式（见设计文档 1.2 A）：不转鼠标穿透，冻结层继续接收鼠标用于标注。
+        s.region = region;
+        s.annot = AnnotSession::new(
+            Rect::new(0, 0, region.width, region.height),
+            overlay_dpi(),
+        );
+        s.annot_base = DibSurface::new(region.width, region.height);
+        if let Some(base) = &s.annot_base {
+            // 底图 = 冻结画面 + 选区红框（此后不可变）
+            base.blit_from(s.surface_dc, sel_c.0, sel_c.1, sel_c.2, sel_c.3);
+        }
+        s.mode = OverlayMode::Annotating;
         crate::diag::log(&format!(
-            "[overlay] 选区确认 {}×{} @ {},{}：已裁出成品并释放整屏快照（冻结画面保持到工具条关闭）",
+            "[overlay] 选区确认 {}×{} @ {},{}：已裁出成品、建立标注底图（进入标注模式）",
             region.width, region.height, region.x, region.y
         ));
-        // 红框保留显示：窗口转为鼠标穿透（纯视觉提示），不再接收框选交互；
-        // 结束模态循环但**不拆窗**，由调用方持有的 Selection 负责后续关闭。
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as isize);
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
+        // 结束框选模态循环但**不拆窗**，由调用方持有的 Selection 负责后续关闭；
+        // 冻结层继续显示（不再是鼠标穿透），标注交互挂在其窗口过程上。
         PostQuitMessage(0);
         return;
     }
@@ -518,6 +674,112 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
         }
         commit(hwnd, s, last);
     }
+}
+
+// ─── 标注集成（见设计文档 1.2 / 4.1 / 5.5 / 5.6） ───────────────────
+
+/// 鼠标位置 → 选区局部坐标。
+unsafe fn annot_local_from_lparam(lp: LPARAM, s: &State) -> Pt {
+    let sp = point_from_lparam(lp, s.vx, s.vy);
+    Pt::new(sp.x - s.region.x, sp.y - s.region.y)
+}
+
+unsafe fn shift_down() -> bool {
+    (GetKeyState(VK_SHIFT.0 as i32) as u16) & 0x8000 != 0
+}
+
+unsafe fn ctrl_down() -> bool {
+    (GetKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 != 0
+}
+
+/// `WM_APP_SET_TOOL` 的 WPARAM → [`Tool`]。
+fn tool_from_usize(v: usize) -> Tool {
+    match v {
+        1 => Tool::Rect,
+        2 => Tool::Arrow,
+        3 => Tool::StepNo,
+        _ => Tool::None,
+    }
+}
+
+unsafe fn set_annot_cursor(kind: CursorKind) {
+    let id = match kind {
+        CursorKind::Arrow => IDC_ARROW,
+        CursorKind::Cross => IDC_CROSS,
+        CursorKind::SizeAll => IDC_SIZEALL,
+        CursorKind::SizeNS => IDC_SIZENS,
+        CursorKind::SizeWE => IDC_SIZEWE,
+        CursorKind::SizeNESW => IDC_SIZENESW,
+        CursorKind::SizeNWSE => IDC_SIZENWSE,
+    };
+    if let Ok(c) = LoadCursorW(None, id) {
+        SetCursor(c);
+    }
+}
+
+/// 消费一次标注事件结果：光标、重绘、Esc 交还工具条。
+unsafe fn annot_apply(hwnd: HWND, s: &State, a: annot::Action) {
+    if let Some(c) = a.cursor {
+        set_annot_cursor(c);
+    }
+    if let Some(d) = a.redraw {
+        repaint_annot(hwnd, s, d);
+    }
+    if a.esc_passthrough {
+        post_to_toolbar(WM_APP_ESC_CLOSE, 0, 0);
+    }
+}
+
+/// 处理一次标注按键并把（可能变化的）工具同步给工具条。
+unsafe fn annot_key(hwnd: HWND, s: &mut State, vk: usize, ctrl: bool) {
+    let a = s.annot.on_key(vk, ctrl);
+    let tool = s.annot.tool();
+    annot_apply(hwnd, s, a);
+    post_to_toolbar(WM_APP_TOOL_CHANGED, tool as usize, 0);
+}
+
+/// 向工具条窗口投递消息（用类名定位；找不到则忽略）。
+unsafe fn post_to_toolbar(msg: u32, wp: usize, lp: isize) {
+    let name = to_wide(TOOLBAR_CLASS);
+    if let Ok(h) = FindWindowW(PCWSTR::from_raw(name.as_ptr()), PCWSTR::null()) {
+        if !h.is_invalid() {
+            let _ = PostMessageW(h, msg, WPARAM(wp), LPARAM(lp));
+        }
+    }
+}
+
+/// 局部脏区裁剪到选区；完全在外返回 None。
+fn clip_local(r: Rect, sel: Rect) -> Option<Rect> {
+    let x0 = r.x.max(0);
+    let y0 = r.y.max(0);
+    let x1 = r.right().min(sel.w);
+    let y1 = r.bottom().min(sel.h);
+    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
+}
+
+/// 标注层重绘（局部坐标脏区）：恢复底图 → 重画标注 → alpha 防御 → 提交脏区（见 4.1）。
+unsafe fn repaint_annot(hwnd: HWND, s: &State, dirty: Rect) {
+    let Some(base) = &s.annot_base else {
+        return;
+    };
+    let ox = s.region.x - s.vx;
+    let oy = s.region.y - s.vy;
+    let sel = Rect::new(0, 0, s.region.width, s.region.height);
+    // 外扩余量覆盖描边半宽与 GDI+ 抗锯齿溢出，避免残留旧像素
+    let pad = util::scaled(10, overlay_dpi()) + 2;
+    let Some(d) = clip_local(dirty.inflate(pad), sel) else {
+        return;
+    };
+
+    // 1. 恢复底图
+    let _ = BitBlt(s.surface_dc, ox + d.x, oy + d.y, d.w, d.h, base.dc, d.x, d.y, SRCCOPY);
+    // 2. 全量重画标注 + 预览 + 选中态（render_into 内部按选区裁剪）
+    annot::render_into(s.surface_dc, Pt::new(ox, oy), &s.annot, overlay_dpi());
+    // 3. alpha 防御（表面坐标）
+    let sr = Rect::new(ox + d.x, oy + d.y, d.w, d.h);
+    crate::annot::session::alpha_fix(s.surface_bits, s.vw, sr);
+    // 4. 提交脏区
+    commit(hwnd, s, (sr.x, sr.y, sr.w, sr.h));
 }
 
 /// 框选层横跨整个虚拟屏幕，用系统 DPI 作为框线粗细/拖动阈值的换算基准。

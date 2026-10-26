@@ -8,13 +8,21 @@
 //! 悬停延时后在图标上方弹出提示气泡（[`crate::tooltip`]）。
 //!
 //! 控件 ID 保持稳定（E2E 用 `Find-ChildById` 定位，见 `scripts/gui_e2e_*.ps1`）：
-//! 1=贴图 / 2=复制 / 3=保存 / 4=OCR / 5=关闭。
+//! 1=贴图 / 2=复制 / 3=保存 / 4=OCR / 5=关闭；标注工具 6=矩形 / 7=箭头 / 8=步骤序号。
+//!
+//! 标注（见设计文档 1.2 D/E / 5.5）：新增的三个工具按钮把当前工具经
+//! `WM_APP_SET_TOOL` 投递给冻结层，并按冻结层回传的 `WM_APP_TOOL_CHANGED` 高亮；
+//! 贴图/复制/保存三个动作在导出前先经 [`crate::annot::composite`] 合成标注。
 
 use std::sync::Arc;
 
+use crate::annot;
 use crate::capture::{self, CapturedImage};
 use crate::config;
 use crate::error::{AppError, Result};
+use crate::overlay::{
+    Selection, WM_APP_ESC_CLOSE, WM_APP_KEY, WM_APP_SET_TOOL, WM_APP_TOOL_CHANGED,
+};
 use crate::theme;
 use crate::util::{self, add_button, raw, register_class_w, BtnStyle};
 use crate::{clipboard, icons, imageio, ocr, pin, tooltip};
@@ -36,12 +44,34 @@ const BTN_COPY: usize = 2;
 const BTN_SAVE: usize = 3;
 const BTN_OCR: usize = 4;
 const BTN_CLOSE: usize = 5;
+/// 标注工具按钮 ID（见 5.5）。
+const BTN_RECT: usize = 6;
+const BTN_ARROW: usize = 7;
+const BTN_STEP: usize = 8;
 /// 按钮在窗口内的从左到右排列顺序（图标顺序 = 需求给定顺序）
-const BTN_ORDER: [usize; 5] = [BTN_PIN, BTN_SAVE, BTN_COPY, BTN_OCR, BTN_CLOSE];
+const BTN_ORDER: [usize; 8] = [
+    BTN_PIN,
+    BTN_SAVE,
+    BTN_COPY,
+    BTN_OCR,
+    BTN_RECT,
+    BTN_ARROW,
+    BTN_STEP,
+    BTN_CLOSE,
+];
 /// 各按钮的悬停提示文字（与 [`BTN_ORDER`] 一一对应）
-const TIP_TEXTS: [&str; 5] = ["贴图", "保存图像", "复制并关闭", "复制识别到的文字", "关闭"];
+const TIP_TEXTS: [&str; 8] = [
+    "贴图",
+    "保存图像",
+    "复制并关闭",
+    "复制识别到的文字",
+    "矩形",
+    "箭头",
+    "步骤序号",
+    "关闭",
+];
 /// 各按钮的快捷键（与 [`BTN_ORDER`] 一一对应，显示在提示文字之后）
-const SHORTCUTS: [&str; 5] = ["Ctrl+T", "Ctrl+S", "Ctrl+C", "Ctrl+O", "Esc"];
+const SHORTCUTS: [&str; 8] = ["Ctrl+T", "Ctrl+S", "Ctrl+C", "Ctrl+O", "R", "A", "N", "Esc"];
 /// 悬停后弹出提示气泡的延时（毫秒）
 const TIP_DELAY_MS: u32 = 450;
 /// 提示气泡定时器 ID
@@ -52,6 +82,14 @@ const VK_T: usize = 0x54;
 const VK_S: usize = 0x53;
 const VK_C: usize = 0x43;
 const VK_O: usize = 0x4F;
+/// 标注工具键：R=矩形 / A=箭头 / N=步骤序号（无 Ctrl，见 5.5）
+const VK_R: usize = 0x52;
+const VK_A: usize = 0x41;
+const VK_N: usize = 0x4E;
+/// 撤销/重做/删除：Ctrl+Z / Ctrl+Y / Delete（转发给冻结层，见 5.5）
+const VK_Z: usize = 0x5A;
+const VK_Y: usize = 0x59;
+const VK_DELETE: usize = 0x2E;
 /// VK_CONTROL（GetKeyState 读物理按键状态）
 const VK_CONTROL: i32 = 0x11;
 
@@ -64,7 +102,8 @@ const TB_PAD_V: i32 = 6;
 /// 按钮到窗口左右边缘的内边距（逻辑像素）。
 const TB_PAD_H: i32 = 6;
 /// 逻辑客户区尺寸（96 DPI 基准）：仅容纳一行方形图标按钮，力求紧凑。
-const TB_W: i32 = TB_BTN_SZ * 5 + TB_GAP * 4 + TB_PAD_H * 2; // 180
+/// （设计文档 5.5 记为 286，按同一常量公式计算实为 282，此处以公式为准。）
+const TB_W: i32 = TB_BTN_SZ * 8 + TB_GAP * 7 + TB_PAD_H * 2; // 282
 /// 高度 = 上内边距 + 按钮 + 下内边距。
 const TB_H: i32 = TB_PAD_V * 2 + TB_BTN_SZ; // 44
 /// 窗口圆角半径（逻辑像素）。
@@ -72,8 +111,8 @@ const TB_RADIUS: i32 = 8;
 
 struct ToolbarData {
     image: Arc<CapturedImage>,
-    /// 五个图标按钮，顺序见 [`BTN_ORDER`]
-    buttons: [HWND; 5],
+    /// 八个图标按钮，顺序见 [`BTN_ORDER`]
+    buttons: [HWND; 8],
     /// 工具栏皮肤：固定深色
     skin: theme::Theme,
     /// Mica 背景是否启用（工具栏固定深色为纯色面，恒为 false）
@@ -86,6 +125,12 @@ struct ToolbarData {
     tip_for: usize,
     /// 提示气泡当前是否可见
     tip_shown: bool,
+    /// 冻结层窗口（转发工具切换/按键；见 5.5）
+    overlay: HWND,
+    /// 冻结层 [`Selection`]（只读借用其标注文档做导出合成；见 6）
+    sel: *const Selection,
+    /// 当前激活的标注工具按钮 ID（0 = 无），用于高亮
+    active_tool: usize,
 }
 
 unsafe fn data_of(hwnd: HWND) -> Option<&'static mut ToolbarData> {
@@ -98,11 +143,13 @@ unsafe fn data_of(hwnd: HWND) -> Option<&'static mut ToolbarData> {
 }
 
 /// 进入工具栏（模态，直到用户选择操作或关闭）。须在 GUI 线程调用。
-pub fn run(image: Arc<CapturedImage>) -> Result<()> {
-    unsafe { run_impl(image) }
+///
+/// `overlay`：确认后的冻结层（提供窗口句柄用于消息转发、标注文档用于导出合成）。
+pub fn run(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()> {
+    unsafe { run_impl(image, overlay) }
 }
 
-unsafe fn run_impl(image: Arc<CapturedImage>) -> Result<()> {
+unsafe fn run_impl(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()> {
     register_class_w("PixShotToolbar", toolbar_proc, false, false, false);
 
     let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as i32;
@@ -115,13 +162,16 @@ unsafe fn run_impl(image: Arc<CapturedImage>) -> Result<()> {
 
     let data = Box::into_raw(Box::new(ToolbarData {
         image,
-        buttons: [HWND::default(); 5],
+        buttons: [HWND::default(); 8],
         skin: theme::toolbar_skin(),
         backdrop: false,
         fx: util::HoverFx::new(),
         tip: tooltip::Tip::none(),
         tip_for: 0,
         tip_shown: false,
+        overlay: overlay.hwnd(),
+        sel: overlay as *const Selection,
+        active_tool: 0,
     }));
 
     // WS_THICKFRAME 供 DWM 绘制阴影；WM_NCCALCSIZE(0) 去除边框（全客户区）
@@ -309,7 +359,8 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     } else {
                         BtnStyle::Icon
                     };
-                    draw_icon_frame(hwnd, &*dis, style, d.skin, &d.fx, icon_of(id));
+                    let selected = d.active_tool != 0 && id == d.active_tool;
+                    draw_icon_frame(hwnd, &*dis, style, d.skin, &d.fx, icon_of(id), selected);
                 }
             }
             LRESULT(1)
@@ -394,6 +445,21 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             PostQuitMessage(0);
             LRESULT(0)
         }
+
+        // 冻结层 → 工具条：工具已变化（点击工具按钮/Esc/工具键后回传真实工具）
+        WM_APP_TOOL_CHANGED => {
+            if let Some(d) = data_of(hwnd) {
+                d.active_tool = tool_button_id_from_wp(wp.0);
+            }
+            refresh_buttons(hwnd);
+            LRESULT(0)
+        }
+
+        // 冻结层 → 工具条：Esc 交还，关闭会话
+        WM_APP_ESC_CLOSE => {
+            close_bar(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             let p = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             if p != 0 {
@@ -438,13 +504,15 @@ unsafe fn draw_icon_frame(
     skin: theme::Theme,
     fx: &util::HoverFx,
     icon: icons::Icon,
+    selected: bool,
 ) {
     let r = dis.rcItem;
     let (bw, bh) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
-    let v = fx.val(dis.hwndItem);
+    // 激活的工具按钮恒以"悬停底 + 强调色图标"高亮
+    let v = if selected { 1.0 } else { fx.val(dis.hwndItem) };
     let pressed = (dis.itemState.0 & ODS_SELECTED.0) != 0;
-    // 只需前景（描边）色：底色由 util::draw_od_button 画，图标不再需要底色遮罩
     let (_, ink) = util::btn_colors(style, skin, v, pressed);
+    let ink = if selected { skin.accent } else { ink };
 
     let mem = CreateCompatibleDC(dis.hDC);
     let bmp = CreateCompatibleBitmap(dis.hDC, bw, bh);
@@ -464,7 +532,7 @@ unsafe fn draw_icon_frame(
         let mut dis2 = *dis;
         dis2.hDC = mem;
         dis2.rcItem = full;
-        util::draw_od_button(parent, &dis2, fx, style, skin);
+        util::draw_od_button(parent, &dis2, v, style, skin);
         icons::draw(mem, full, icon, ink);
 
         let _ = BitBlt(dis.hDC, r.left, r.top, bw, bh, mem, 0, 0, SRCCOPY);
@@ -479,30 +547,72 @@ unsafe fn draw_icon_frame(
         if !mem.is_invalid() {
             let _ = DeleteDC(mem);
         }
-        util::draw_od_button(parent, dis, fx, style, skin);
+        util::draw_od_button(parent, dis, v, style, skin);
         icons::draw(dis.hDC, r, icon, ink);
     }
 }
 
 /// 处理工具条快捷键。返回 true 表示已消费该按键。
-/// 映射见 [`SHORTCUTS`]：Esc=关闭，Ctrl+T=贴图，Ctrl+S=保存，Ctrl+C=复制，Ctrl+O=OCR。
+///
+/// 映射（见 5.5）：Esc / Ctrl+Z / Ctrl+Y / Delete → 转发冻结层 `WM_APP_KEY`；
+/// R/A/N（无 Ctrl）→ 工具切换；Ctrl+T/S/C/O → 贴图/保存/复制/OCR。
 unsafe fn handle_shortcut(hwnd: HWND, vk: usize) -> bool {
-    let (id, need_ctrl) = match vk {
-        VK_ESCAPE => return {
-            close_bar(hwnd);
-            true
-        },
-        VK_T => (BTN_PIN, true),
-        VK_S => (BTN_SAVE, true),
-        VK_C => (BTN_COPY, true),
-        VK_O => (BTN_OCR, true),
-        _ => return false,
-    };
-    if need_ctrl && !ctrl_down() {
+    let Some(d) = data_of(hwnd) else {
         return false;
+    };
+    let overlay = d.overlay;
+    match vk {
+        // Esc 不再本地直接关闭：交由冻结层按标注状态决定（取消绘制/取消选中/交还关闭）
+        VK_ESCAPE => {
+            if PostMessageW(overlay, WM_APP_KEY, WPARAM(VK_ESCAPE), LPARAM(0)).is_err() {
+                close_bar(hwnd); // 冻结层不可达时兜底关闭
+            }
+            true
+        }
+        VK_T if ctrl_down() => {
+            handle_command(hwnd, BTN_PIN);
+            true
+        }
+        VK_S if ctrl_down() => {
+            handle_command(hwnd, BTN_SAVE);
+            true
+        }
+        VK_C if ctrl_down() => {
+            handle_command(hwnd, BTN_COPY);
+            true
+        }
+        VK_O if ctrl_down() => {
+            handle_command(hwnd, BTN_OCR);
+            true
+        }
+        // 标注工具键（无 Ctrl）
+        VK_R if !ctrl_down() => {
+            handle_command(hwnd, BTN_RECT);
+            true
+        }
+        VK_A if !ctrl_down() => {
+            handle_command(hwnd, BTN_ARROW);
+            true
+        }
+        VK_N if !ctrl_down() => {
+            handle_command(hwnd, BTN_STEP);
+            true
+        }
+        // 撤销/重做：Ctrl+Z / Ctrl+Y（转发冻结层）
+        VK_Z | VK_Y => {
+            if !ctrl_down() {
+                return false;
+            }
+            let _ = PostMessageW(overlay, WM_APP_KEY, WPARAM(vk), LPARAM(1));
+            true
+        }
+        // 删除选中标注：Delete（转发冻结层，无 Ctrl）
+        VK_DELETE => {
+            let _ = PostMessageW(overlay, WM_APP_KEY, WPARAM(VK_DELETE), LPARAM(0));
+            true
+        }
+        _ => false,
     }
-    handle_command(hwnd, id);
-    true
 }
 
 /// 控件 ID → 图标。
@@ -512,8 +622,49 @@ fn icon_of(id: usize) -> icons::Icon {
         BTN_SAVE => icons::Icon::Save,
         BTN_COPY => icons::Icon::Copy,
         BTN_OCR => icons::Icon::Ocr,
+        BTN_RECT => icons::Icon::Rect,
+        BTN_ARROW => icons::Icon::Arrow,
+        BTN_STEP => icons::Icon::StepNo,
         _ => icons::Icon::Close,
     }
+}
+
+/// 工具按钮 ID → [`annot::Tool`]。
+fn button_id_tool(id: usize) -> annot::Tool {
+    match id {
+        BTN_RECT => annot::Tool::Rect,
+        BTN_ARROW => annot::Tool::Arrow,
+        BTN_STEP => annot::Tool::StepNo,
+        _ => annot::Tool::None,
+    }
+}
+
+/// [`annot::Tool`] 判别值（`WM_APP_TOOL_CHANGED` 的 WPARAM）→ 工具按钮 ID。
+fn tool_button_id_from_wp(v: usize) -> usize {
+    match v {
+        1 => BTN_RECT,
+        2 => BTN_ARROW,
+        3 => BTN_STEP,
+        _ => 0,
+    }
+}
+
+/// 重绘全部工具按钮（激活工具变化时同步高亮）。
+unsafe fn refresh_buttons(hwnd: HWND) {
+    if let Some(d) = data_of(hwnd) {
+        for b in d.buttons {
+            let _ = raw::InvalidateRect(b, std::ptr::null(), 1);
+        }
+    }
+}
+
+/// 导出前把标注合成进成品图（无标注时零拷贝，见 6）。
+unsafe fn compose(d: &ToolbarData) -> Arc<CapturedImage> {
+    if d.sel.is_null() {
+        return Arc::clone(&d.image);
+    }
+    let doc = (*d.sel).doc(); // 短借用：立即使用，不跨消息持有
+    Arc::new(annot::composite(&d.image, doc))
 }
 
 /// 控件 ID → 在 [`BTN_ORDER`] 中的下标。
@@ -600,17 +751,25 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
     match id {
         // 关闭：不执行任何操作，直接收起工具条（与按 Esc 等价）
         BTN_CLOSE => close_bar(hwnd),
+        // 工具按钮：把工具投递给冻结层；高亮由冻结层回传的 TOOL_CHANGED 同步
+        BTN_RECT | BTN_ARROW | BTN_STEP => {
+            let Some(d) = data_of(hwnd) else { return };
+            let tool = button_id_tool(id);
+            let _ = PostMessageW(d.overlay, WM_APP_SET_TOOL, WPARAM(tool as usize), LPARAM(0));
+        }
         BTN_PIN => {
             let Some(d) = data_of(hwnd) else { return };
-            match pin::create(&d.image) {
+            let img = compose(d);
+            match pin::create(&img) {
                 Ok(_) => close_bar(hwnd),
                 Err(e) => util::error_msgbox(&format!("贴图失败：{e}")),
             }
         }
         BTN_COPY => {
             let Some(d) = data_of(hwnd) else { return };
+            let img = compose(d);
             // Arc 共享像素，copy_image 直接读切片，不再整幅复制
-            match clipboard::copy_image(&d.image.data, d.image.width, d.image.height) {
+            match clipboard::copy_image(&img.data, img.width, img.height) {
                 Ok(()) => {
                     crate::toast::show("已复制图像到剪贴板");
                     close_bar(hwnd);
@@ -621,11 +780,12 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         BTN_SAVE => {
             let Some(d) = data_of(hwnd) else { return };
             let cfg = config::get();
+            let img = compose(d);
             match imageio::save_with_dialog(
                 hwnd,
-                &d.image.data,
-                d.image.width,
-                d.image.height,
+                &img.data,
+                img.width,
+                img.height,
                 cfg.format,
                 cfg.save_dir.as_deref(),
             ) {
@@ -726,7 +886,7 @@ mod preview {
                         hwndItem: fake,
                         ..Default::default()
                     };
-                    draw_icon_frame(HWND::default(), &dis, *style, skin, &fx, icon_of(id));
+                    draw_icon_frame(HWND::default(), &dis, *style, skin, &fx, icon_of(id), false);
                 }
             }
 
