@@ -1,9 +1,11 @@
-//! 区域框选：按下热键后**整屏冻结**（显示进入时捕获的整屏快照），在冻结画面上拖动
-//! 框选 / Esc 取消（只保留区域截图，不支持选窗口与全屏）。
+//! 区域框选：按下热键后**整屏冻结 + 暗化**（选区遮罩，参照 SnowShot 的遮罩：
+//! 背景每通道 >>1 变暗、拖动时选区内还原为原始亮度、实时显示「宽 × 高」），
+//! 在冻结画面上拖动框选 / Esc 取消。
 //!
-//! **不做暗化**：冻结画面就是原始像素，不叠暗色，只在其上叠加一圈红色框线。
-//! 实现方式是逐像素 alpha 的分层窗口（`UpdateLayeredWindow`）：表面用整屏快照
-//! 铺满（BGRA、alpha=255），红框直接写进同一表面。
+//! **实现方式是逐像素 alpha 的分层窗口**（`UpdateLayeredWindow`）：表面用整屏快照
+//! 铺满后原位暗化（BGRA、alpha=255），拖动中每帧把选区矩形还原为原始像素（提亮）、
+//! 画红框、画尺寸标签（GDI+ + alpha 防御）。原位暗化不多占一张整屏位图——擦帧时
+//! 从快照取像素按暗化值写回即可。
 //!
 //! **冻结持续到工具条关闭**：松开鼠标（选区确认）后表面**保持冻结画面不变**，
 //! 屏幕继续呈冻结状态，直到用户点了工具条任一图标 / 按 Esc / 点关闭 —— 也就是
@@ -52,12 +54,12 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
-    GetDC, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
-    BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
+    GdiFlush, GetDC, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
+    BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_SHIFT,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -166,16 +168,17 @@ impl Drop for Selection {
 }
 
 const VK_ESCAPE: usize = 0x1B;
-/// 小于该边长的拖动视为无效框选（忽略，继续等待用户框选）。
-const MIN_DRAG_LOGICAL: i32 = 3;
-/// 框线粗细（逻辑像素）。
-const FRAME_W_LOGICAL: i32 = 2;
 /// 透明底的像素值（预乘 BGRA）。alpha 取 1 而非 0：分层窗口按 alpha 命中鼠标，
 /// alpha=0 会让点击穿透到桌面（拖拽无法发起）；1/255 视觉上不可察觉。
 const BG_PX: u32 = 1 << 24;
-/// 框线像素值（预乘 BGRA，小端 u32 → 字节序为 B,G,R,A）。
-/// 纯红 = R=0xFF、G=0、B=0，alpha=255（预乘后颜色不变）。
-const FRAME_PX: u32 = 0xFFFF_0000;
+
+/// 把 [`crate::annot::style::Rgba`] 打成预乘 BGRA u32（小端 → 字节序 B,G,R,A）。
+/// 分层窗口要求预乘；不透明色（a=255）预乘后即原始通道值。
+fn packed(c: crate::annot::style::Rgba) -> u32 {
+    let a = c.a as u32;
+    let pm = |v: u8| (v as u32) * a / 255;
+    (a << 24) | (pm(c.r) << 16) | (pm(c.g) << 8) | pm(c.b)
+}
 
 /// 冻结层所处阶段（替代原 `locked: bool`，见设计文档 1.2 F）。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -221,6 +224,11 @@ struct State {
     surface_bits: *mut u32,
     /// 上一帧框线矩形（客户区坐标），用于只重绘变动区域。
     last: Option<Rect4>,
+    /// 上一帧尺寸标签矩形（客户区坐标）：擦标签时还原为暗化像素。
+    last_label: Option<Rect4>,
+    /// 当前文字输入子进程所服务的**标注锚点**（选区局部坐标）。`Some` 表示子进程
+    /// 正在运行；锚点变化（点别处重新落点）时重挂子进程。`None` 表示未在输入。
+    text_helper_anchor: Option<Pt>,
 }
 
 
@@ -259,11 +267,13 @@ unsafe fn run() -> Option<Selection> {
     // 屏幕 DC 与整屏绘制表面（32bpp 预乘 BGRA）
     let screen_dc = GetDC(HWND::default());
     if screen_dc.is_invalid() {
+        crate::diag::log("[overlay] GetDC(屏幕) 失败 -> 框选取消");
         return None;
     }
     let surface_dc = CreateCompatibleDC(screen_dc);
     if surface_dc.is_invalid() {
         let _ = ReleaseDC(HWND::default(), screen_dc);
+        crate::diag::log("[overlay] CreateCompatibleDC 失败 -> 框选取消");
         return None;
     }
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -279,6 +289,7 @@ unsafe fn run() -> Option<Selection> {
         _ => {
             let _ = DeleteDC(surface_dc);
             let _ = ReleaseDC(HWND::default(), screen_dc);
+            crate::diag::log("[overlay] CreateDIBSection 失败 -> 框选取消");
             return None;
         }
     };
@@ -313,6 +324,8 @@ unsafe fn run() -> Option<Selection> {
         surface_old,
         surface_bits: bits as *mut u32,
         last: None,
+        last_label: None,
+        text_helper_anchor: None,
     }));
 
     // 不带 WS_VISIBLE：先提交一次"全透明"内容，避免显示瞬间出现不透明黑屏
@@ -335,6 +348,7 @@ unsafe fn run() -> Option<Selection> {
     if hwnd.is_invalid() {
         let s = Box::from_raw(state);
         cleanup(&s);
+        crate::diag::log("[overlay] 创建冻结层窗口失败 -> 框选取消");
         return None;
     }
 
@@ -345,19 +359,24 @@ unsafe fn run() -> Option<Selection> {
         let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
     }
     // 表面先用透明底铺一遍（兜底：万一快照比虚拟屏幕小，也不会留下 alpha=0 的像素，
-    // 那种像素会让点击穿透、拖拽发不起来），再用整屏快照覆盖。
-    // 窗口一显示就是"冻结"的整屏画面（不叠暗色），所见即所得。
+    // 那种像素会让点击穿透、拖拽发不起来），再用整屏快照覆盖并**原位暗化**（选区
+    // 遮罩，每通道 >>1）：拖动中再把选区矩形还原为原始亮度。窗口一显示就是
+    // "暗化的冻结"整屏画面。
     {
         let s = &*state;
         clear_rect(s.surface_bits, vw, vh, (0, 0, vw, vh));
         if let Some(shot) = &s.snapshot {
             copy_snapshot_into_surface(s.surface_bits, vw, vh, shot);
         }
+            dim_surface(s.surface_bits, vw, vh, crate::config::get().ui_overlay_dim);
         commit(hwnd, s, (0, 0, vw, vh));
     }
     let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
     let _ = SetForegroundWindow(hwnd);
+    // 显示后**再次**置顶：显示前的那次 SetWindowPos 可能已被其他置顶窗口
+    // （如锁屏兜底窗口、其他截图工具）压回，重申一次确保处于最顶层。
+    let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 
     let mut msg = MSG::default();
     while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
@@ -690,21 +709,30 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
     let _ = ReleaseCapture();
 
     let r = norm_rect(s.start, s.cur);
-    let min_side = util::scaled(MIN_DRAG_LOGICAL, overlay_dpi());
+    let cfg = crate::config::get();
+    let (dim, frame_px) = (cfg.ui_overlay_dim, packed(cfg.ui_overlay_frame_color));
+    let min_side = util::scaled(cfg.ui_overlay_min_drag, overlay_dpi());
     if r.2 >= min_side && r.3 >= min_side {
         let region = clamp_region(r, s.vx, s.vy, s.vw, s.vh);
         let sel_c = (region.x - s.vx, region.y - s.vy, region.width, region.height);
-        let width = util::scaled(FRAME_W_LOGICAL, overlay_dpi());
-        // 把框线收敛到最终选区；表面底图仍是"冻结画面"、保持不动 ——
-        // 因此松手后屏幕**继续冻结**，直到工具条关闭（见 [`Selection::dismiss`]）。
+        let width = util::scaled(cfg.ui_overlay_frame_width, overlay_dpi());
+        // 收敛到最终选区：擦上一帧与标签（还原为暗化像素）、提亮最终选区（快照
+        // 原像素）、画框线 —— 表面此后保持"暗化周边 + 提亮选区"，屏幕**继续冻结**，
+        // 直到工具条关闭（见 [`Selection::dismiss`]）。
         if let Some(shot) = &s.snapshot {
+            // 防御路径（last != sel_c）：旧提亮区必须一并还原为暗化
             if let Some(last) = s.last {
                 if last != sel_c {
-                    restore_rect(s.surface_bits, s.vw, s.vh, shot, last);
+                    restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, last, dim);
                 }
             }
-            draw_frame(s.surface_bits, s.vw, s.vh, sel_c, width);
+            if let Some(ll) = s.last_label.take() {
+                restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, ll, dim);
+            }
+            restore_rect(s.surface_bits, s.vw, s.vh, shot, sel_c);
+            draw_frame(s.surface_bits, s.vw, s.vh, sel_c, width, frame_px);
         }
+        s.last_label = None;
         // 成品从整屏快照裁出后**立即释放快照**（用于裁剪的整屏资源及时回收）。
         // 显示中的冻结画面留在窗口表面上（不额外占内存），随窗口在会话结束时一并销毁。
         let cropped = s
@@ -737,10 +765,14 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
         return;
     }
 
-    // 单击 / 过小的拖动：不产生选区，擦掉已画的框线（恢复冻结底图），继续等待框选
+    // 单击 / 过小的拖动：不产生选区，擦掉已画的框线与标签（还原为暗化像素），
+    // 继续等待框选
     if let Some(last) = s.last.take() {
         if let Some(shot) = &s.snapshot {
-            restore_rect(s.surface_bits, s.vw, s.vh, shot, last);
+            restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, last, dim);
+            if let Some(ll) = s.last_label.take() {
+                restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, ll, dim);
+            }
         }
         commit(hwnd, s, last);
     }
@@ -874,32 +906,116 @@ fn overlay_dpi() -> i32 {
     unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as i32 }
 }
 
-/// 重画框线：清掉上一帧、画上当前帧，再把脏区提交给分层窗口。
+/// 重画选区遮罩帧：擦上一帧（还原为**暗化**像素）→ 提亮当前选区（快照原像素）
+/// → 画框线 → 尺寸标签（GDI+ + alpha 防御）→ 提交脏区并集。
 /// 只提交变动区域而非整屏，避免每帧整屏重合成。
 unsafe fn repaint_frame(hwnd: HWND, s: &mut State) {
+    let cfg = crate::config::get();
+    let (dim, frame_px) = (cfg.ui_overlay_dim, packed(cfg.ui_overlay_frame_color));
     let cur = norm_rect(s.start, s.cur);
     let cur_c = (cur.0 - s.vx, cur.1 - s.vy, cur.2, cur.3);
-    let width = util::scaled(FRAME_W_LOGICAL, overlay_dpi());
+    let width = util::scaled(cfg.ui_overlay_frame_width, overlay_dpi());
     let has = cur_c.2 > 0 && cur_c.3 > 0;
+    let prev_rect = s.last;
+    let prev_label = s.last_label;
 
-    // 先清上一帧（恢复冻结底图原像素）、再画当前帧：顺序保证两帧重叠时结果正确
-    if let Some(last) = s.last {
-        if let Some(shot) = &s.snapshot {
-            restore_rect(s.surface_bits, s.vw, s.vh, shot, last);
+    // Arc 克隆避免持有借用（后续还要写 s.last / s.last_label）
+    let shot = s.snapshot.clone();
+    if let Some(shot) = &shot {
+        // 1) 擦上一帧整矩形与上一帧标签区：还原为暗化像素（选区遮罩语义）
+        if let Some(last) = prev_rect {
+            restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, last, dim);
+        }
+        if let Some(ll) = prev_label {
+            restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, ll, dim);
+        }
+        // 2) 当前选区提亮（写快照原像素）+ 框线
+        if has {
+            restore_rect(s.surface_bits, s.vw, s.vh, shot, cur_c);
+            draw_frame(s.surface_bits, s.vw, s.vh, cur_c, width, frame_px);
         }
     }
-    if has {
-        draw_frame(s.surface_bits, s.vw, s.vh, cur_c, width);
-    }
-
-    let dirty = match (s.last, has) {
-        (Some(a), true) => union_rect(a, cur_c),
-        (Some(a), false) => a,
-        (None, true) => cur_c,
-        (None, false) => return,
-    };
     s.last = has.then_some(cur_c);
-    commit(hwnd, s, dirty);
+
+    // 3) 尺寸标签（画后记录标签区，供下一帧擦除）
+    let label = if has {
+        let text = format!("{} × {}", cur_c.2, cur_c.3);
+        let r = label_rect(
+            s.vw,
+            cur_c,
+            &text,
+            util::scaled(cfg.ui_overlay_label_px, overlay_dpi()),
+        );
+        draw_size_label(s, &r, &text, cfg.ui_overlay_label_px);
+        Some(r)
+    } else {
+        None
+    };
+    s.last_label = label;
+
+    // 4) 脏区 = 上一帧 + 当前帧 + 两帧标签的并集
+    let mut dirty: Option<Rect4> = None;
+    for r in [prev_rect, has.then_some(cur_c), prev_label, label]
+        .into_iter()
+        .flatten()
+    {
+        dirty = Some(match dirty {
+            Some(d) => union_rect(d, r),
+            None => r,
+        });
+    }
+    if let Some(d) = dirty {
+        commit(hwnd, s, d);
+    }
+}
+
+/// 选区尺寸标签："宽 × 高" GDI+ 白字，画在标签矩形处。
+/// GDI+ 文字不写 alpha：画后 `GdiFlush` + `alpha_fix` 强制不透明
+/// （分层窗口上 alpha<255 的像素会显示为半透明并穿透点击）。
+unsafe fn draw_size_label(s: &State, r: &Rect4, text: &str, label_px: i32) {
+    let Some(g) = crate::annot::render_gdiplus::graphics_from(s.surface_dc) else {
+        return;
+    };
+    let cfg = crate::config::get();
+    let px = util::scaled(label_px, overlay_dpi()) as f32;
+    crate::annot::render_gdiplus::draw_label_string(
+        g,
+        r.0 as f32,
+        r.1 as f32,
+        text,
+        px,
+        cfg.ui_overlay_label_color,
+    );
+    crate::annot::render_gdiplus::free_graphics(g);
+    let _ = GdiFlush();
+    // alpha 防御：标签矩形（外扩 2px 覆盖抗锯齿边缘）强制不透明
+    if let Some((x, y, w, h)) = clip_rect((r.0 - 2, r.1 - 2, r.2 + 4, r.3 + 4), s.vw, s.vh) {
+        crate::annot::session::alpha_fix(s.surface_bits, s.vw, Rect::new(x, y, w, h));
+    }
+}
+
+/// 标签宽度估算（数字/×/空格，按字符数近似；仅供脏区计算与定位）。
+fn label_w(text: &str, px: i32) -> i32 {
+    (text.chars().count() as i32) * px * 62 / 100 + 8
+}
+
+/// 标签矩形：选区上方（贴顶则移到下方），左对齐选区左缘（钳回屏幕内）。
+/// `sel_c` 为表面（客户区）坐标，返回同坐标系。
+fn label_rect(vw: i32, sel_c: Rect4, text: &str, px: i32) -> Rect4 {
+    let w = label_w(text, px);
+    let h = (px as f32 * 1.4).ceil() as i32;
+    let mut x = sel_c.0;
+    let mut y = sel_c.1 - h - 4;
+    if y < 0 {
+        y = sel_c.1 + sel_c.3 + 4;
+    }
+    if x + w > vw {
+        x = vw - w;
+    }
+    if x < 0 {
+        x = 0;
+    }
+    (x, y, w, h)
 }
 
 /// 两矩形的最小并集。
@@ -946,6 +1062,8 @@ unsafe fn copy_snapshot_into_surface(bits: *mut u32, vw: i32, vh: i32, shot: &Ca
 ///
 /// 与 [`clear_rect`] 的区别：框选期间表面底图是"冻结的整屏快照"而非透明底，
 /// 擦帧必须还原快照像素，否则会擦出一块透明空洞。
+///
+/// 遮罩语义下本函数同时承担**选区提亮**：快照原像素 = 原始亮度。
 unsafe fn restore_rect(bits: *mut u32, vw: i32, vh: i32, shot: &CapturedImage, r: Rect4) {
     let Some((x, y, w, h)) = clip_rect(r, vw, vh) else {
         return;
@@ -963,15 +1081,57 @@ unsafe fn restore_rect(bits: *mut u32, vw: i32, vh: i32, shot: &CapturedImage, r
     }
 }
 
-/// 在矩形四条边内侧画 `width` 像素宽的框线。
+/// 暗化像素：每通道 `× factor`（alpha 不变；参照 SnowShot 的遮罩暗化）。
+/// 默认 factor=0.5 时等价于整数 `>>1`。
+fn dim_px(px: u32, factor: f32) -> u32 {
+    let f = factor.clamp(0.0, 1.0);
+    let b = ((px & 0xFF) as f32 * f) as u32;
+    let g = (((px >> 8) & 0xFF) as f32 * f) as u32;
+    let r = (((px >> 16) & 0xFF) as f32 * f) as u32;
+    (px & 0xFF00_0000) | (r << 16) | (g << 8) | b
+}
+
+/// 表面**原位**暗化（每通道 `× factor`，alpha 不变）——选区遮罩的初始底图。
+/// 原位进行，不多占一张整屏位图；擦帧时由 [`restore_dim_rect`] 从快照重算暗化像素。
+unsafe fn dim_surface(bits: *mut u32, vw: i32, vh: i32, factor: f32) {
+    let n = (vw.max(0) as usize) * (vh.max(0) as usize);
+    for i in 0..n {
+        *bits.add(i) = dim_px(*bits.add(i), factor);
+    }
+}
+
+/// 把表面上某矩形区域还原为**暗化**的快照像素（遮罩语义的擦帧/擦标签）。
+///
+/// 与 [`restore_rect`]（提亮，写快照原像素）的区别：像素按每通道 `× factor` 暗化，
+/// 与 [`dim_surface`] 的初始底图一致——否则擦过的区域会比遮罩亮一截。
+unsafe fn restore_dim_rect(bits: *mut u32, vw: i32, vh: i32, shot: &CapturedImage, r: Rect4, factor: f32) {
+    let Some((x, y, w, h)) = clip_rect(r, vw, vh) else {
+        return;
+    };
+    let src_stride = shot.width.max(1) as usize;
+    let src = shot.data.as_ptr() as *const u32;
+    for row in 0..h as usize {
+        let sy = y as usize + row;
+        let off = sy * src_stride + x as usize;
+        if (off + w as usize) * 4 > shot.data.len() {
+            break; // 越界保护（快照尺寸异常时宁可留原样也不越界读）
+        }
+        let dst = sy * vw as usize + x as usize;
+        for col in 0..w as usize {
+            *bits.add(dst + col) = dim_px(*src.add(off + col), factor);
+        }
+    }
+}
+
+/// 在矩形四条边内侧画 `width` 像素宽的框线（`frame_px` 为预乘 BGRA 像素值）。
 ///
 /// 直接写预乘 BGRA，不经 GDI：GDI 往 32bpp DIB 绘制时**不写 alpha 字节**，
 /// 画面会因 alpha=0 而全透明 —— 这正是"无遮罩分层窗口"最常见的坑。
-unsafe fn draw_frame(bits: *mut u32, vw: i32, vh: i32, r: Rect4, width: i32) {
-    fill(bits, vw, vh, (r.0, r.1, r.2, width), FRAME_PX); // 上
-    fill(bits, vw, vh, (r.0, r.1 + r.3 - width, r.2, width), FRAME_PX); // 下
-    fill(bits, vw, vh, (r.0, r.1, width, r.3), FRAME_PX); // 左
-    fill(bits, vw, vh, (r.0 + r.2 - width, r.1, width, r.3), FRAME_PX); // 右
+unsafe fn draw_frame(bits: *mut u32, vw: i32, vh: i32, r: Rect4, width: i32, frame_px: u32) {
+    fill(bits, vw, vh, (r.0, r.1, r.2, width), frame_px); // 上
+    fill(bits, vw, vh, (r.0, r.1 + r.3 - width, r.2, width), frame_px); // 下
+    fill(bits, vw, vh, (r.0, r.1, width, r.3), frame_px); // 左
+    fill(bits, vw, vh, (r.0 + r.2 - width, r.1, width, r.3), frame_px); // 右
 }
 
 /// 把表面某矩形区域填成指定像素值（自动裁剪越界部分）。
@@ -1019,6 +1179,21 @@ fn clamp_region(r: Rect4, vx: i32, vy: i32, vw: i32, vh: i32) -> SelectedRegion 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用固定框线像素（纯红不透明，预乘 BGRA 小端）。
+    const FRAME_PX: u32 = 0xFFFF_0000;
+
+    /// 测试用固定暗化系数（与默认配置 ui_overlay_dim=0.5 一致）。
+    const DIM: f32 = 0.5;
+
+    /// 颜色 → 预乘 BGRA 打包（不透明时等于原始通道；半透明时 RGB 按 alpha 预乘）。
+    #[test]
+    fn packed_is_premultiplied_bgra() {
+        use crate::annot::style::Rgba;
+        assert_eq!(packed(Rgba::new(0xFF, 0x00, 0x00, 0xFF)), FRAME_PX);
+        assert_eq!(packed(Rgba::new(0xFF, 0xFF, 0xFF, 0x00)), 0);
+        assert_eq!(packed(Rgba::new(0xFF, 0x00, 0x00, 0x80)), 0x8080_0000);
+    }
 
     fn p(x: i32, y: i32) -> POINT {
         POINT { x, y }
@@ -1123,7 +1298,7 @@ mod tests {
         unsafe { copy_snapshot_into_surface(buf.as_mut_ptr(), vw, vh, &shot) };
 
         let rect = (2, 2, 6, 6);
-        unsafe { draw_frame(buf.as_mut_ptr(), vw, vh, rect, 2) };
+        unsafe { draw_frame(buf.as_mut_ptr(), vw, vh, rect, 2, FRAME_PX) };
         assert_eq!(buf[(2 * vw + 2) as usize], FRAME_PX, "应先画出框线");
 
         unsafe { restore_rect(buf.as_mut_ptr(), vw, vh, &shot, rect) };
@@ -1154,7 +1329,7 @@ mod tests {
         let (vw, vh) = (20i32, 12i32);
         let mut buf = vec![BG_PX; (vw * vh) as usize];
         let rect = (3, 2, 10, 6); // x, y, w, h
-        unsafe { draw_frame(buf.as_mut_ptr(), vw, vh, rect, 2) };
+        unsafe { draw_frame(buf.as_mut_ptr(), vw, vh, rect, 2, FRAME_PX) };
         let at = |x: i32, y: i32| buf[(y * vw + x) as usize];
 
         // 四条边都是不透明红
@@ -1176,7 +1351,7 @@ mod tests {
         let (vw, vh) = (16i32, 16i32);
         let mut buf = vec![BG_PX; (vw * vh) as usize];
         let rect = (2, 2, 8, 8);
-        unsafe { draw_frame(buf.as_mut_ptr(), vw, vh, rect, 2) };
+        unsafe { draw_frame(buf.as_mut_ptr(), vw, vh, rect, 2, FRAME_PX) };
         assert_eq!(buf[(2 * vw + 2) as usize], FRAME_PX);
         unsafe { clear_rect(buf.as_mut_ptr(), vw, vh, rect) };
         assert!(buf.iter().all(|&px| px == BG_PX), "清帧后应恢复全透明底");
@@ -1188,17 +1363,17 @@ mod tests {
         let (vw, vh) = (10i32, 10i32);
         let mut buf = vec![BG_PX; (vw * vh) as usize];
         // 部分越界：右/下超出
-        unsafe { draw_frame(buf.as_mut_ptr(), vw, vh, (8, 8, 6, 6), 2) };
+        unsafe { draw_frame(buf.as_mut_ptr(), vw, vh, (8, 8, 6, 6), 2, FRAME_PX) };
         assert_eq!(buf[(8 * vw + 8) as usize], FRAME_PX, "界内像素应被绘制");
         assert_eq!(buf[(9 * vw + 9) as usize], FRAME_PX);
         // 完全在外：什么都不画
         let mut buf2 = vec![BG_PX; (vw * vh) as usize];
-        unsafe { draw_frame(buf2.as_mut_ptr(), vw, vh, (-50, -50, 4, 4), 2) };
+        unsafe { draw_frame(buf2.as_mut_ptr(), vw, vh, (-50, -50, 4, 4), 2, FRAME_PX) };
         assert!(buf2.iter().all(|&px| px == BG_PX));
         // 负坐标 / 零尺寸矩形不 panic
         unsafe {
-            draw_frame(buf2.as_mut_ptr(), vw, vh, (-3, -3, 8, 8), 2);
-            draw_frame(buf2.as_mut_ptr(), vw, vh, (4, 4, 0, 0), 2);
+            draw_frame(buf2.as_mut_ptr(), vw, vh, (-3, -3, 8, 8), 2, FRAME_PX);
+            draw_frame(buf2.as_mut_ptr(), vw, vh, (4, 4, 0, 0), 2, FRAME_PX);
             clear_rect(buf2.as_mut_ptr(), vw, vh, (99, 99, 5, 5));
         }
     }
@@ -1209,5 +1384,88 @@ mod tests {
         assert_eq!(union_rect((10, 10, 5, 5), (20, 30, 4, 4)), (10, 10, 14, 24));
         // 一帧为空时退化为另一帧
         assert_eq!(union_rect((3, 4, 0, 0), (3, 4, 7, 7)), (3, 4, 7, 7));
+    }
+
+    /// 暗化像素：每通道 >>1，alpha 不变（选区遮罩的核心语义）。
+    #[test]
+    fn dim_px_halves_channels_keeps_alpha() {
+        // 预乘 BGRA u32：低字节 B，然后 G、R，最高字节 A
+        let px = 0xFF80_4020u32; // B=0x20, G=0x40, R=0x80, A=0xFF
+        let d = dim_px(px, DIM);
+        assert_eq!(d >> 24, 0xFF, "alpha 不变");
+        assert_eq!(d & 0xFF, 0x10, "蓝 >>1");
+        assert_eq!((d >> 8) & 0xFF, 0x20, "绿 >>1");
+        assert_eq!((d >> 16) & 0xFF, 0x40, "红 >>1");
+        // 纯红框线暗化后仍不透明
+        assert_eq!(dim_px(FRAME_PX, DIM) >> 24, 0xFF);
+    }
+
+    /// 遮罩语义：擦帧必须还原为**暗化**像素；提亮区与遮罩区必须可区分。
+    #[test]
+    fn restore_dim_matches_initial_mask() {
+        let (vw, vh) = (8i32, 6i32);
+        let shot = fake_shot(vw, vh);
+        // 1. 铺快照 + 原位暗化（与 run() 的初始化一致）
+        let mut buf = vec![BG_PX; (vw * vh) as usize];
+        unsafe {
+            copy_snapshot_into_surface(buf.as_mut_ptr(), vw, vh, &shot);
+            dim_surface(buf.as_mut_ptr(), vw, vh, DIM);
+        }
+        let mask: Vec<u32> = buf.clone();
+        // 2. 模拟拖动：提亮选区 + 画框线
+        let rect = (2, 1, 4, 3);
+        unsafe {
+            restore_rect(buf.as_mut_ptr(), vw, vh, &shot, rect);
+            draw_frame(buf.as_mut_ptr(), vw, vh, rect, 2, FRAME_PX);
+        }
+        assert_eq!(buf[(1 * vw + 2) as usize], FRAME_PX, "框线已画");
+        // 3. 擦帧（还原为暗化像素）后必须与初始遮罩逐像素一致
+        unsafe { restore_dim_rect(buf.as_mut_ptr(), vw, vh, &shot, rect, DIM) };
+        assert_eq!(buf, mask, "擦帧后必须还原为暗化遮罩");
+        // 4. 提亮区必须比遮罩亮（快照原像素 ≠ 暗化像素）
+        unsafe { restore_rect(buf.as_mut_ptr(), vw, vh, &shot, rect) };
+        let px_at = |x: i32, y: i32| buf[(y * vw + x) as usize];
+        assert_eq!(
+            px_at(4, 2),
+            {
+                let c = u32::from_le_bytes([
+                    shot.data[((2 * shot.width + 4) * 4) as usize],
+                    shot.data[((2 * shot.width + 4) * 4 + 1) as usize],
+                    shot.data[((2 * shot.width + 4) * 4 + 2) as usize],
+                    shot.data[((2 * shot.width + 4) * 4 + 3) as usize],
+                ]);
+                c
+            },
+            "提亮区 = 快照原像素"
+        );
+        assert_ne!(
+            px_at(4, 2),
+            mask[(2 * vw + 4) as usize],
+            "提亮区必须不同于暗化遮罩"
+        );
+    }
+
+    /// 标签定位：默认在选区上方；贴顶移到下方；水平钳回屏幕内。
+    #[test]
+    fn label_rect_positioning() {
+        // 常规：上方
+        let r = label_rect(1000, (100, 200, 300, 100), "1920 × 1080", 13);
+        assert_eq!(r.0, 100, "左对齐选区左缘");
+        assert!(r.1 + r.3 <= 200 - 4, "标签在选区上方");
+        // 贴顶：移到下方
+        let r = label_rect(1000, (100, 2, 300, 100), "1920 × 1080", 13);
+        assert!(r.1 >= 2 + 100 + 4, "贴顶时标签在选区下方");
+        // 左缘贴屏右：钳回屏幕内
+        let r = label_rect(1000, (990, 200, 8, 8), "1920 × 1080", 13);
+        assert!(r.0 + r.2 <= 1000, "标签不得超出屏幕");
+        assert!(r.0 >= 0);
+    }
+
+    #[test]
+    fn label_w_is_positive_and_proportional() {
+        assert!(label_w("", 13) > 0, "空文本也有兜底宽度");
+        let w1 = label_w("10 × 20", 13);
+        let w2 = label_w("1920 × 1080", 13);
+        assert!(w2 > w1, "更长的文本更宽");
     }
 }
