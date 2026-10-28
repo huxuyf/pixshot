@@ -44,15 +44,27 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     # 单实例互斥体（CreateMutexW 依赖 SECURITY_ATTRIBUTES）
     "Win32_Security",
-    # WinRT（OCR 用）
-    "Foundation",
-    "Foundation_Collections",
-    "Globalization",
-    "Graphics_Imaging",
-    "Media_Ocr",
-    "Security_Cryptography",
-    "Storage_Streams",
 ] }
+
+[features]
+default = []
+# 系统 WinRT OCR 回退（Windows.Media.Ocr，见 src/ocr/winrt.rs）。
+#
+# 关闭（默认）时进程**不导入** WinRT 运行库（windows.storage.dll / CoreUIComponents.dll /
+# CRYPT32.dll / WINHTTP.dll 等，实测常驻十几 MB）——ONNX 引擎才是一直在用的那条路径，
+# WinRT 只是「模型缺失」时的兜底。开启后恢复该回退：
+#   cargo build --release --features winrt-ocr
+# 下面用 `windows/<feature>` 按需打开依赖的 windows crate 特性（等价于原先把它们直接
+# 写在依赖 features 里，只是改为由本 feature 控制）。
+winrt-ocr = [
+    "windows/Foundation",
+    "windows/Foundation_Collections",
+    "windows/Globalization",
+    "windows/Graphics_Imaging",
+    "windows/Media_Ocr",
+    "windows/Security_Cryptography",
+    "windows/Storage_Streams",
+]
 
 [profile.release]
 opt-level = 2

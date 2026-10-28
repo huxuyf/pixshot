@@ -7,14 +7,17 @@
 //!   （原图 / Otsu 二值化 / 深色反相）→ 启发式评分取优的老路。
 //!
 //! 引擎挑选见 [`engine::create`]：内置 ONNX（`onnxruntime.dll` + `model/*.onnx` 齐备）优先，
-//! 缺失时回退系统 OCR。
+//! 缺失时回退系统 OCR（该回退需 `winrt-ocr` feature，默认关闭）。
 //!
-//! 本模块不含 GUI，可在任意后台线程调用（WinRT 路径自行初始化 COM/MTA）。
+//! 本模块不含 GUI，可在任意后台线程调用。
 
 mod engine;
 mod layout;
 mod onnx;
 mod onnx_image;
+// 系统 WinRT 回退引擎：仅 `winrt-ocr` feature 开启时编译（默认关闭，避免进程
+// 静态导入整条 WinRT 运行库，见 Cargo.toml 该 feature 的说明）。
+#[cfg(feature = "winrt-ocr")]
 mod winrt;
 
 use engine::OcrEngineImpl;

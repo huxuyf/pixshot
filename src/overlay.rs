@@ -671,6 +671,25 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
 
+        // 文字输入子进程 → 冻结层：正文变化 / 结束输入（`dwData` 0=变化 1=结束）。
+        // 变化只更新"输入中的正文"（不重绘，正文显示在子进程的输入窗里）；结束时提交落图。
+        WM_COPYDATA => {
+            if let Some((commit, text)) = crate::textinput::parse_payload(lp) {
+                if let Some(s) = state_of(hwnd) {
+                    if s.mode == OverlayMode::Annotating && s.annot.typing() {
+                        let a = if commit {
+                            s.annot.commit_typing_with(text)
+                        } else {
+                            s.annot.set_typing_text(text)
+                        };
+                        annot_apply(hwnd, s, a);
+                    }
+                }
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+
         // 确认后保留的窗口不接受关闭请求（否则红框提前消失、run() 误判为已确认）；
         // 它的生命周期由调用方持有的 Selection 决定。
         WM_CLOSE => {
@@ -684,6 +703,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         }
 
         WM_DESTROY => {
+            // 会话结束：确保文字输入子进程随之退出（不再等待 owner 轮询）
+            crate::textinput::stop();
             // State 由 run()/Selection 释放（需要读回选区结果），这里只断开引用。
             // 注意：由 Selection 主动拆窗时不能再 PostQuitMessage —— 那时已不在
             // 框选消息循环内，多出来的 WM_QUIT 会被主循环当成"退出程序"。
@@ -819,22 +840,58 @@ unsafe fn set_annot_cursor(kind: CursorKind) {
         CursorKind::SizeWE => IDC_SIZEWE,
         CursorKind::SizeNESW => IDC_SIZENESW,
         CursorKind::SizeNWSE => IDC_SIZENWSE,
+        CursorKind::IBeam => IDC_IBEAM,
     };
     if let Ok(c) = LoadCursorW(None, id) {
         SetCursor(c);
     }
 }
 
-/// 消费一次标注事件结果：光标、重绘、Esc 交还工具条。
-unsafe fn annot_apply(hwnd: HWND, s: &State, a: annot::Action) {
+/// 消费一次标注事件结果：光标、重绘、Esc 交还工具条，以及文字输入的焦点/IME 管理。
+unsafe fn annot_apply(hwnd: HWND, s: &mut State, a: annot::Action) {
     if let Some(c) = a.cursor {
         set_annot_cursor(c);
     }
     if let Some(d) = a.redraw {
         repaint_annot(hwnd, s, d);
     }
+    // 文字输入的子进程管理（见模块头「文字输入与 IME」）。
+    sync_text_helper(hwnd, s);
     if a.esc_passthrough {
         post_to_toolbar(WM_APP_ESC_CLOSE, 0, 0);
+    }
+}
+
+/// 同步文字输入子进程：
+/// - 进入输入 / 切换落点 → 拉起（或重挂）子进程，输入窗贴在锚点上；
+/// - 离开输入 → 收掉子进程并把焦点还给工具条（工具条快捷键恢复可用）。
+///
+/// 幂等：供 [`annot_apply`] 与 [`Selection::commit_typing`] 共用。
+unsafe fn sync_text_helper(hwnd: HWND, s: &mut State) {
+    if s.annot.typing() {
+        if let Some((anchor, _text, style)) = s.annot.typing_state() {
+            if s.text_helper_anchor != Some(anchor) {
+                crate::textinput::stop();
+                // 锚点是选区局部坐标 → 加选区原点得到虚拟屏幕（物理像素）坐标
+                let sx = s.region.x + anchor.x;
+                let sy = s.region.y + anchor.y;
+                if !crate::textinput::start(hwnd, sx, sy, style.font_px) {
+                    // 子进程起不来时的兜底：进程内输入（主进程已禁用 IME，仅 ASCII 可用）
+                    crate::diag::log("[overlay] 文字输入子进程启动失败 -> 进程内兜底输入");
+                    let _ = SetFocus(hwnd);
+                }
+                s.text_helper_anchor = Some(anchor);
+            }
+        }
+    } else if s.text_helper_anchor.is_some() {
+        crate::textinput::stop();
+        s.text_helper_anchor = None;
+        let name = to_wide(TOOLBAR_CLASS);
+        if let Ok(tb) = FindWindowW(PCWSTR::from_raw(name.as_ptr()), PCWSTR::null()) {
+            if !tb.is_invalid() {
+                let _ = SetFocus(tb);
+            }
+        }
     }
 }
 

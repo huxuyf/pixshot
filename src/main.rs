@@ -34,6 +34,7 @@ mod pin;
 mod rtfimg;
 mod svgpath;
 mod textimg;
+mod textinput;
 mod theme;
 mod toast;
 mod toolbar;
@@ -56,6 +57,14 @@ fn main() {
     // panic 可见性：本程序是 windows 子系统（无控制台），默认 panic 完全静默。
     install_panic_hook();
 
+    let args: Vec<String> = std::env::args().collect();
+
+    // 文字输入子进程模式：主进程按需拉起（见 `textinput` 模块）。必须**先于**单实例
+    // 检查与 GUI 初始化处理，否则子进程会被主进程的单实例互斥体挡掉。
+    if args.iter().any(|a| a == "--text-input") {
+        std::process::exit(textinput::run_helper(&args));
+    }
+
     // 单实例保护（先于日志初始化，避免第二实例截断第一实例的诊断日志）。
     // 若允许多开：后启动的实例 RegisterHotKey 必然失败（旧实例占用），
     // 用户会看到「进程在、但按键无反应」的困惑局面。
@@ -71,22 +80,29 @@ fn main() {
     diag::log(&format!(
         "[boot] main() 进入，exe={:?}, args={:?}",
         std::env::current_exe(),
-        std::env::args().collect::<Vec<_>>()
+        args
     ));
 
-    // 本应用无任何文本输入（框选/贴图/只读 OCR 结果），在首个窗口创建前禁用
-    // 当前线程 IME，阻止输入法 DLL 注入（实测可省 ~34MB 内存、消除 ~1% 空闲 CPU）
+    // 主进程**彻底禁用 IME**：文字标注需要的中文输入已隔离到临时子进程
+    // （见 `textinput` 模块）。若不禁用，系统会在本进程首次成为输入激活目标时
+    // 注入用户输入法 DLL（第三方输入法实测可达数十 MB），且装入后无法卸载。
+    // 必须在「第一个顶层窗口收到 WM_CREATE 之前」调用 —— 见 MSDN ImmDisableIME。
+    // 参数 -1（DWORD 0xFFFFFFFF）= 对进程内所有线程禁用。
     unsafe {
-        use windows::Win32::System::Threading::GetCurrentThreadId;
-        use windows::Win32::UI::Input::Ime::ImmDisableIME;
-        let _ = ImmDisableIME(GetCurrentThreadId());
-        diag::log("[boot] ImmDisableIME 已调用");
+        if windows::Win32::UI::Input::Ime::ImmDisableIME(u32::MAX).as_bool() {
+            diag::log("[boot] ImmDisableIME(-1) 成功：本进程不加载输入法");
+        } else {
+            diag::log("[boot] ImmDisableIME(-1) 失败（不影响功能，仅内存）");
+        }
     }
 
     // 每显示器 DPI 感知：保证截屏/窗口坐标为物理像素
     unsafe {
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_err() {
             let _ = SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+            diag::log("[boot] SetProcessDpiAwarenessContext(V2) 失败 -> 回退 SetProcessDpiAwareness");
+        } else {
+            diag::log("[boot] SetProcessDpiAwarenessContext(V2) 成功");
         }
     }
 
@@ -94,7 +110,6 @@ fn main() {
     let _ = config::get();
 
     // --smoke：无 GUI 冒烟测试（全屏截图 → 保存 → OCR），用于验证核心链路
-    let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--smoke" || a == "smoke") {
         std::process::exit(run_smoke());
     }

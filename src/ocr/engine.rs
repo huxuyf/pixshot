@@ -60,8 +60,8 @@ pub trait OcrEngineImpl {
 
 /// 选择并创建可用引擎；无可用引擎时返回 `None`（调用方转成面向用户的提示）。
 ///
-/// 挑选顺序：本地 ONNX（`onnxruntime.dll` 与 `model/` 齐备）→ 系统 WinRT。
-/// 这是唯一的引擎挑选点。
+/// 挑选顺序：本地 ONNX（`onnxruntime.dll` 与 `model/` 齐备）→ 系统 WinRT
+/// （仅 `winrt-ocr` feature 开启时存在）。这是唯一的引擎挑选点。
 pub fn create() -> Option<Box<dyn OcrEngineImpl>> {
     match super::onnx::create() {
         Ok(e) => {
@@ -72,5 +72,13 @@ pub fn create() -> Option<Box<dyn OcrEngineImpl>> {
             crate::diag::log(&format!("[ocr] 本地 ONNX 引擎不可用（回退系统 OCR）：{e}"));
         }
     }
-    super::winrt::create().map(|e| Box::new(e) as Box<dyn OcrEngineImpl>)
+    #[cfg(feature = "winrt-ocr")]
+    {
+        return super::winrt::create().map(|e| Box::new(e) as Box<dyn OcrEngineImpl>);
+    }
+    #[cfg(not(feature = "winrt-ocr"))]
+    {
+        crate::diag::log("[ocr] 未启用 winrt-ocr feature，无系统 OCR 回退可用");
+        None
+    }
 }
