@@ -30,7 +30,10 @@ use crate::util;
 
 const WM_APP_TRAY: u32 = WM_USER + 1;
 const TRAY_UID: u32 = 1;
+/// 截图热键 id。
 const HOTKEY_ID: i32 = 1;
+/// 剪贴板贴图热键 id（F3）。
+const HOTKEY_ID_PIN: i32 = 2;
 /// NIN_SELECT / NIN_KEYSELECT（V4 通知事件；右键事件即 WM_CONTEXTMENU 0x7B）
 const NIN_SELECT: u32 = 0x0400;
 const NIN_KEYSELECT: u32 = 0x0401;
@@ -51,9 +54,12 @@ static TRAY_V4: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// 钩子宿主窗口
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0);
-/// 钩子要匹配的虚拟键码与修饰键
+/// 钩子要匹配的虚拟键码与修饰键（截图热键）
 static HOOK_VK: AtomicU32 = AtomicU32::new(0);
 static HOOK_MODS: AtomicU32 = AtomicU32::new(0);
+/// 钩子要匹配的虚拟键码与修饰键（贴图热键）
+static HOOK_VK_PIN: AtomicU32 = AtomicU32::new(0);
+static HOOK_MODS_PIN: AtomicU32 = AtomicU32::new(0);
 /// 已安装的钩子句柄
 static LL_HOOK: AtomicIsize = AtomicIsize::new(0);
 /// 单实例互斥体句柄（进程存活期间保持；进程退出由系统释放）
@@ -125,9 +131,11 @@ pub fn acquire_single_instance() -> bool {
 
 /// 托盘提示文本（含当前热键）
 fn tray_tip() -> String {
+    let cfg = config::get();
     format!(
-        "PixShot：按 {} 截图（右键退出）",
-        config::get().hotkey_label()
+        "PixShot：{} 截图 / {} 贴图（右键退出）",
+        cfg.hotkey_label(),
+        cfg.pin_hotkey_label()
     )
 }
 
@@ -261,14 +269,29 @@ fn hotkey_binding() -> (u32, u32) {
     }
 }
 
-fn register_hotkey(hwnd: HWND, mods: u32, vk: u32) -> bool {
+/// 剪贴板贴图热键绑定；无法解析时回退 F3。
+fn pin_hotkey_binding() -> (u32, u32) {
+    let cfg = config::get();
+    match config::parse_hotkey(&cfg.pin_hotkey) {
+        Some(b) => b,
+        None => {
+            diag::log(&format!(
+                "[hotkey] 配置贴图热键 {:?} 无法解析 -> 回退 F3",
+                cfg.pin_hotkey
+            ));
+            (config::MOD_NOREPEAT, 0x72)
+        }
+    }
+}
+
+fn register_hotkey(hwnd: HWND, id: i32, mods: u32, vk: u32) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS;
     unsafe {
-        let r = RegisterHotKey(hwnd, HOTKEY_ID, HOT_KEY_MODIFIERS(mods), vk);
+        let r = RegisterHotKey(hwnd, id, HOT_KEY_MODIFIERS(mods), vk);
         diag::log(&format!(
             "[hotkey] RegisterHotKey(hwnd=0x{:X}, id={}, mods=0x{mods:X}, vk=0x{vk:X}) -> {}, GetLastError={}",
             hwnd.0 as usize,
-            HOTKEY_ID,
+            id,
             r.is_ok(),
             windows::Win32::Foundation::GetLastError().0
         ));
@@ -372,20 +395,23 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
         let is_down = wp.0 == WM_KEYDOWN as usize || wp.0 == WM_SYSKEYDOWN as usize;
         let injected = (kb.flags.0 & LLKHF_INJECTED) != 0;
         let allow_injected = ALLOW_INJECTED.load(Ordering::Relaxed);
-        let want_vk = HOOK_VK.load(Ordering::Relaxed);
-        if is_down && (allow_injected || !injected) && want_vk != 0 && kb.vkCode == want_vk {
-            if modifiers_match(HOOK_MODS.load(Ordering::Relaxed)) {
-                // 先抓整屏：此刻按键还没经 CallNextHookEx 投递给前台窗口
+        if is_down && (allow_injected || !injected) {
+            // 截图热键：命中后先抓整屏（此刻按键还没经 CallNextHookEx 投递给前台窗口）
+            let want_vk = HOOK_VK.load(Ordering::Relaxed);
+            if want_vk != 0
+                && kb.vkCode == want_vk
+                && modifiers_match(HOOK_MODS.load(Ordering::Relaxed))
+            {
                 precapture();
-                let p = HOOK_HWND.load(Ordering::Relaxed);
-                if p != 0 {
-                    // 钩子回调必须尽快返回，避免拖慢全系统输入
-                    let _ = PostMessageW(
-                        HWND(p as *mut core::ffi::c_void),
-                        WM_HOTKEY,
-                        WPARAM(HOTKEY_ID as usize),
-                        LPARAM(0),
-                    );
+                post_hotkey(HOTKEY_ID);
+            } else {
+                // 贴图热键：无截屏需求，直接投递
+                let pin_vk = HOOK_VK_PIN.load(Ordering::Relaxed);
+                if pin_vk != 0
+                    && kb.vkCode == pin_vk
+                    && modifiers_match(HOOK_MODS_PIN.load(Ordering::Relaxed))
+                {
+                    post_hotkey(HOTKEY_ID_PIN);
                 }
             }
         }
@@ -393,8 +419,24 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
     CallNextHookEx(HHOOK::default(), code, wp, lp)
 }
 
-/// 安装低级键盘钩子作为热键兜底。返回是否成功。
-fn install_keyboard_hook(hwnd: HWND, mods: u32, vk: u32) -> bool {
+/// 向钩子宿主窗口投递一次 WM_HOTKEY（钩子回调必须尽快返回，避免拖慢全系统输入）。
+fn post_hotkey(id: i32) {
+    let p = HOOK_HWND.load(Ordering::Relaxed);
+    if p != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                HWND(p as *mut core::ffi::c_void),
+                WM_HOTKEY,
+                WPARAM(id as usize),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// 安装低级键盘钩子作为热键兜底。`bindings` 为 (id, 修饰键, 虚拟键码) 列表
+/// （只需兜底的热键才放入；未使用的槽位 vk 置 0 表示不匹配）。返回是否成功。
+fn install_keyboard_hook(hwnd: HWND, bindings: &[(i32, u32, u32)]) -> bool {
     unsafe {
         // 仅测试用：显式设置该环境变量时，注入按键也能触发（见 ALLOW_INJECTED 注释）
         ALLOW_INJECTED.store(
@@ -402,16 +444,34 @@ fn install_keyboard_hook(hwnd: HWND, mods: u32, vk: u32) -> bool {
             Ordering::SeqCst,
         );
         HOOK_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
-        HOOK_VK.store(vk, Ordering::SeqCst);
-        HOOK_MODS.store(mods, Ordering::SeqCst);
+        // 先清零，再按传入列表填入（未传入的热键不走钩子）
+        HOOK_VK.store(0, Ordering::SeqCst);
+        HOOK_MODS.store(0, Ordering::SeqCst);
+        HOOK_VK_PIN.store(0, Ordering::SeqCst);
+        HOOK_MODS_PIN.store(0, Ordering::SeqCst);
+        for &(id, mods, vk) in bindings {
+            match id {
+                HOTKEY_ID => {
+                    HOOK_VK.store(vk, Ordering::SeqCst);
+                    HOOK_MODS.store(mods, Ordering::SeqCst);
+                }
+                HOTKEY_ID_PIN => {
+                    HOOK_VK_PIN.store(vk, Ordering::SeqCst);
+                    HOOK_MODS_PIN.store(mods, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
         let hinst =
             windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
         match SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), HINSTANCE(hinst.0), 0) {
             Ok(h) => {
                 LL_HOOK.store(h.0 as isize, Ordering::SeqCst);
                 diag::log(&format!(
-                    "[hotkey] 低级键盘钩子已安装 hhook=0x{:X}（vk=0x{vk:X} mods=0x{mods:X}）",
-                    h.0 as isize
+                    "[hotkey] 低级键盘钩子已安装 hhook=0x{:X}（截图 vk=0x{:X} 贴图 vk=0x{:X}）",
+                    h.0 as isize,
+                    HOOK_VK.load(Ordering::SeqCst),
+                    HOOK_VK_PIN.load(Ordering::SeqCst)
                 ));
                 true
             }
@@ -430,21 +490,48 @@ pub fn init(hwnd: HWND) -> (bool, u32, bool) {
     let (tray_ok, tray_err) = add_tray_icon(hwnd);
 
     let (mods, vk) = hotkey_binding();
+    let (pin_mods, pin_vk) = pin_hotkey_binding();
     let force_hook = std::env::var_os("PIXSHOT_FORCE_HOOK").is_some();
-    let hotkey_ok = if force_hook {
+
+    // 逐步注册：失败的绑定改走钩子兜底（一个钩子同时覆盖两个热键）
+    let mut hook_bindings: Vec<(i32, u32, u32)> = Vec::new();
+    let mut shot_ok;
+    let mut pin_ok;
+    if force_hook {
         diag::log("[hotkey] PIXSHOT_FORCE_HOOK 已设置 -> 跳过 RegisterHotKey，直接使用钩子");
-        install_keyboard_hook(hwnd, mods, vk)
-    } else if register_hotkey(hwnd, mods, vk) {
-        true
+        hook_bindings.push((HOTKEY_ID, mods, vk));
+        hook_bindings.push((HOTKEY_ID_PIN, pin_mods, pin_vk));
+        shot_ok = true;
+        pin_ok = true;
     } else {
-        diag::log("[hotkey] RegisterHotKey 失败 -> 改用低级键盘钩子兜底");
-        install_keyboard_hook(hwnd, mods, vk)
-    };
+        shot_ok = register_hotkey(hwnd, HOTKEY_ID, mods, vk);
+        if !shot_ok {
+            diag::log("[hotkey] 截图 RegisterHotKey 失败 -> 改用低级键盘钩子兜底");
+            hook_bindings.push((HOTKEY_ID, mods, vk));
+        }
+        pin_ok = register_hotkey(hwnd, HOTKEY_ID_PIN, pin_mods, pin_vk);
+        if !pin_ok {
+            diag::log("[hotkey] 贴图 RegisterHotKey 失败 -> 改用低级键盘钩子兜底");
+            hook_bindings.push((HOTKEY_ID_PIN, pin_mods, pin_vk));
+        }
+    }
+
+    if force_hook {
+        let ok = install_keyboard_hook(hwnd, &hook_bindings);
+        shot_ok = ok;
+        pin_ok = ok;
+    } else if !hook_bindings.is_empty() {
+        // 钩子安装成功即视失败的两个热键为可用
+        if install_keyboard_hook(hwnd, &hook_bindings) {
+            shot_ok = true;
+            pin_ok = true;
+        }
+    }
 
     diag::log(&format!(
-        "[boot] 集成状态: 托盘={tray_ok}(err={tray_err}), 热键可用={hotkey_ok}"
+        "[boot] 集成状态: 托盘={tray_ok}(err={tray_err}), 截图热键={shot_ok}, 贴图热键={pin_ok}"
     ));
-    (tray_ok, tray_err, hotkey_ok)
+    (tray_ok, tray_err, shot_ok)
 }
 
 // ─── 主窗口消息过程 ──────────────────────────────────────────────
@@ -462,11 +549,13 @@ pub unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     match msg {
         WM_HOTKEY => {
             diag::log(&format!(
-                "[hotkey] 收到 WM_HOTKEY: wp={} (期待 {})",
-                wp.0, HOTKEY_ID
+                "[hotkey] 收到 WM_HOTKEY: wp={} (截图={}, 贴图={})",
+                wp.0, HOTKEY_ID, HOTKEY_ID_PIN
             ));
-            if wp.0 == HOTKEY_ID as usize {
-                crate::screenshot_flow();
+            match wp.0 as i32 {
+                HOTKEY_ID => crate::screenshot_flow(),
+                HOTKEY_ID_PIN => crate::pin_from_clipboard(),
+                _ => {}
             }
             LRESULT(0)
         }
@@ -549,7 +638,7 @@ pub unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     }
 }
 
-/// 托盘右键菜单：「开机启动」（可勾选）与「退出」。`(x,y)` 为回调携带的屏幕坐标。
+/// 托盘右键菜单：「截取全屏」/「开机启动」（可勾选）/「退出」。`(x,y)` 为回调携带的屏幕坐标。
 ///
 /// 使用自绘 Fluent 弹窗而非系统 `TrackPopupMenuEx`：后者要求宿主窗口能成为
 /// 前台窗口，而托盘宿主是隐藏窗口，实测会**立即返回 0 且不显示菜单**。
@@ -563,6 +652,7 @@ unsafe fn tray_menu(hwnd: HWND, x: i32, y: i32) {
     let autostart_on = crate::autostart::is_enabled();
     let autostart_label = if autostart_on { "√ 开机启动" } else { "开机启动" };
     let items = [
+        menu::Item::new("截取全屏"),
         menu::Item::new(autostart_label),
         menu::Item::sep("退出"),
     ];
@@ -571,8 +661,10 @@ unsafe fn tray_menu(hwnd: HWND, x: i32, y: i32) {
     diag::log(&format!("[tray] 自绘菜单返回 choice={choice:?}"));
 
     match choice {
+        // 静默整屏截图：存盘 + 复制到剪贴板（不进入框选/工具条）
+        Some(0) => crate::capture_fullscreen_silent(),
         // 切换开机自启（点击项后菜单关闭，不退出程序）
-        Some(0) => {
+        Some(1) => {
             let target = !autostart_on;
             match crate::autostart::set_enabled(target) {
                 Ok(()) => crate::toast::show(if target {
@@ -584,7 +676,7 @@ unsafe fn tray_menu(hwnd: HWND, x: i32, y: i32) {
             }
         }
         // 完全退出：置退出标志（截图流程进行中时向外层传播）并结束主循环
-        Some(1) => {
+        Some(2) => {
             util::request_quit();
             // 先清掉托盘图标，避免进程退出后留下"幽灵图标"
             remove_tray_icon(hwnd);

@@ -1,4 +1,4 @@
-//! Win32 剪贴板：图像（CF_DIB）与文本（CF_UNICODETEXT）。
+//! Win32 剪贴板：图像（CF_DIB + 注册的 "PNG" 格式）与文本（CF_UNICODETEXT）。
 //!
 //! 资源收尾是本模块的关键：剪贴板是**全系统共享**的独占资源 ——
 //! 一旦 `OpenClipboard` 之后没有 `CloseClipboard`，在进程退出前
@@ -6,26 +6,41 @@
 //!
 //! 因此这里用 `ClipboardGuard`（RAII）保证任何返回路径都会关闭剪贴板，
 //! 并用 `GlobalFree` 保证 `SetClipboardData` 失败时不泄漏全局内存块。
+//!
+//! **双格式**（参照 SnowShot `copyToClipboard`）：图像先写经典 `CF_DIB`
+//! （Paint/Word/Discord 等通用），再注册 "PNG" 格式附加编码好的 PNG
+//! （Chrome/Slack/Figma 等现代应用粘贴更可靠）；PNG 为附加格式，
+//! 写入失败不影响已成功的 DIB。
+
+use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use crate::error::{AppError, Result};
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
-use windows::Win32::Graphics::Gdi::BITMAPINFOHEADER;
-use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits, GetObjectW,
+    PlayEnhMetaFile, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+    ENHMETAHEADER, GdiFlush, HBITMAP, HENHMETAFILE, HGDIOBJ,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_ENHMETAFILE, CF_UNICODETEXT};
 
 /// 剪贴板打开守卫：`Drop` 时无条件关闭。
 struct ClipboardGuard;
 
 impl ClipboardGuard {
-    /// 打开剪贴板。剪贴板可能被其他程序短暂占用，重试 5 次（共约 200ms）。
+    /// 打开剪贴板。剪贴板可能被其他程序短暂占用，重试 15 次（共约 375ms，
+    /// 与 SnowShot 的容错窗口一致）。
     fn open() -> Result<Self> {
-        for _ in 0..5 {
+        for _ in 0..15 {
             match unsafe { OpenClipboard(HWND::default()) } {
                 Ok(()) => return Ok(Self),
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(40)),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
             }
         }
         Err(AppError::Config(
@@ -42,8 +57,19 @@ impl Drop for ClipboardGuard {
     }
 }
 
-/// 复制 BGRA 图像到剪贴板（CF_DIB，底向上行序）。
+/// 复制 BGRA 图像到剪贴板（CF_DIB，底向上行序）。兼容入口：不附加 PNG 格式。
 pub fn copy_image(bgra_top_down: &[u8], w: i32, h: i32) -> Result<()> {
+    copy_image_with_png(bgra_top_down, w, h, None)
+}
+
+/// 同 [`copy_image`]，`png` 为 `Some` 时额外注册 "PNG" 格式并写入编码好的
+/// PNG 字节（现代应用粘贴优先取用）。PNG 写入失败不影响 DIB。
+pub fn copy_image_with_png(
+    bgra_top_down: &[u8],
+    w: i32,
+    h: i32,
+    png: Option<&[u8]>,
+) -> Result<()> {
     if w <= 0 || h <= 0 {
         return Err(AppError::Config("图像尺寸无效".into()));
     }
@@ -96,7 +122,40 @@ pub fn copy_image(bgra_top_down: &[u8], w: i32, h: i32) -> Result<()> {
             return Err(e.into());
         }
     }
+
+    // 附加 PNG 格式（尽力而为：任何失败都不影响已写入的 DIB）
+    if let Some(png) = png.filter(|p| !p.is_empty()) {
+        set_png_data(png);
+    }
     Ok(())
+}
+
+/// 注册 "PNG" 剪贴板格式并写入数据（须在剪贴板已打开时调用）。
+fn set_png_data(png: &[u8]) {
+    static PNG_FMT: OnceLock<u32> = OnceLock::new();
+    let fmt = *PNG_FMT.get_or_init(|| unsafe {
+        let name = crate::util::to_wide("PNG");
+        RegisterClipboardFormatW(PCWSTR::from_raw(name.as_ptr()))
+    });
+    if fmt == 0 {
+        return;
+    }
+    unsafe {
+        let hmem = match GlobalAlloc(GMEM_MOVEABLE, png.len()) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let p = GlobalLock(hmem);
+        if p.is_null() {
+            let _ = GlobalFree(hmem);
+            return;
+        }
+        std::ptr::copy_nonoverlapping(png.as_ptr(), p as *mut u8, png.len());
+        let _ = GlobalUnlock(hmem);
+        if SetClipboardData(fmt, HANDLE(hmem.0)).is_err() {
+            let _ = GlobalFree(hmem); // Windows 未接受，内存块仍归我们
+        }
+    }
 }
 
 /// 复制文本到剪贴板（CF_UNICODETEXT）。
@@ -140,6 +199,399 @@ fn copy_rows_flipped(src: &[u8], stride: usize, h: usize, dst: &mut [u8]) {
         if s + stride <= src.len() && d + stride <= dst.len() {
             dst[d..d + stride].copy_from_slice(&src[s..s + stride]);
         }
+    }
+}
+
+// ─── 读取：剪贴板 → 可贴图内容（F3 贴图，见 main::pin_from_clipboard）───────
+//
+// 与写路径相反的资源规则：`GetClipboardData` 返回的 `HANDLE` **归剪贴板所有**，
+// 调用方绝不能 `GlobalFree`；读出后立即拷进自有 `Vec`。所有读取都在同一个
+// `ClipboardGuard` 生命周期内完成（句柄在 `CloseClipboard` 后失效）。
+
+/// 剪贴板可用格式集合（供纯函数 [`classify`] 判定，便于单测）。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Formats {
+    pub png: bool,
+    pub dibv5: bool,
+    pub dib: bool,
+    pub bitmap: bool,
+    pub emf: bool,
+    pub rtf: bool,
+    pub html: bool,
+    pub text: bool,
+}
+
+/// 判定结果（按优先级）。`Empty` 表示什么都没有。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Png,
+    DibV5,
+    Dib,
+    Bitmap,
+    Emf,
+    Rtf,
+    Html,
+    Text,
+    Empty,
+}
+
+/// 格式优先级：**图像优先于文本**，保证 Excel 复制（同时带 DIB/BITMAP 与
+/// HTML/RTF/文本）走图片分支而非被当成纯文本。
+pub fn classify(f: &Formats) -> Kind {
+    if f.png {
+        Kind::Png
+    } else if f.dibv5 {
+        Kind::DibV5
+    } else if f.dib {
+        Kind::Dib
+    } else if f.bitmap {
+        Kind::Bitmap
+    } else if f.emf {
+        Kind::Emf
+    } else if f.rtf {
+        Kind::Rtf
+    } else if f.html {
+        Kind::Html
+    } else if f.text {
+        Kind::Text
+    } else {
+        Kind::Empty
+    }
+}
+
+/// 读取到的剪贴板内容（图像已统一转成 BGRA 自上而下）。
+pub enum ClipContent {
+    /// 已转换好的位图（PNG/DIB/BITMAP/EMF 统一入口）。
+    Image { w: i32, h: i32, bgra: Vec<u8> },
+    /// RTF 原始字节（交由 RichEdit 渲染）。
+    Rtf(Vec<u8>),
+    /// HTML 片段（无渲染器，主流程提取可见文本后走文本路径）。
+    Html(String),
+    /// 纯文本。
+    Text(String),
+}
+
+/// 注册并缓存一个剪贴板格式 id（0 = 注册失败）。
+fn registered_format(name: &str) -> u32 {
+    unsafe {
+        let n = crate::util::to_wide(name);
+        RegisterClipboardFormatW(PCWSTR::from_raw(n.as_ptr()))
+    }
+}
+
+fn fmt_png() -> u32 {
+    static F: OnceLock<u32> = OnceLock::new();
+    *F.get_or_init(|| registered_format("PNG"))
+}
+fn fmt_rtf() -> u32 {
+    static F: OnceLock<u32> = OnceLock::new();
+    *F.get_or_init(|| registered_format("Rich Text Format"))
+}
+fn fmt_html() -> u32 {
+    static F: OnceLock<u32> = OnceLock::new();
+    *F.get_or_init(|| registered_format("HTML Format"))
+}
+
+/// 探测当前剪贴板可用格式（须在剪贴板已打开时调用）。
+fn probe_formats() -> Formats {
+    unsafe {
+        let avail = |f: u32| f != 0 && IsClipboardFormatAvailable(f).is_ok();
+        Formats {
+            png: avail(fmt_png()),
+            dibv5: avail(CF_DIBV5.0 as u32),
+            dib: avail(CF_DIB.0 as u32),
+            bitmap: avail(CF_BITMAP.0 as u32),
+            emf: avail(CF_ENHMETAFILE.0 as u32),
+            rtf: avail(fmt_rtf()),
+            html: avail(fmt_html()),
+            text: avail(CF_UNICODETEXT.0 as u32),
+        }
+    }
+}
+
+/// 把 `HGLOBAL` 剪贴板数据整块拷进 `Vec`（不释放句柄）。
+fn read_hglobal(fmt: u32) -> Result<Vec<u8>> {
+    unsafe {
+        let h = GetClipboardData(fmt)
+            .map_err(|e| AppError::Config(format!("读取剪贴板格式 {fmt} 失败：{e}")))?;
+        if h.is_invalid() {
+            return Err(AppError::Config(format!("剪贴板格式 {fmt} 无数据")));
+        }
+        let hg = HGLOBAL(h.0);
+        let p = GlobalLock(hg);
+        if p.is_null() {
+            return Err(AppError::Config("GlobalLock 失败".into()));
+        }
+        let size = GlobalSize(hg);
+        let mut v = vec![0u8; size];
+        if size > 0 {
+            std::ptr::copy_nonoverlapping(p as *const u8, v.as_mut_ptr(), size);
+        }
+        let _ = GlobalUnlock(hg);
+        Ok(v)
+    }
+}
+
+/// 读取 UTF-16 NUL 结尾文本。
+fn read_unicode_text() -> Result<String> {
+    let bytes = read_hglobal(CF_UNICODETEXT.0 as u32)?;
+    let mut u16s: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
+    for c in bytes.chunks_exact(2) {
+        let v = u16::from_le_bytes([c[0], c[1]]);
+        if v == 0 {
+            break;
+        }
+        u16s.push(v);
+    }
+    Ok(String::from_utf16_lossy(&u16s))
+}
+
+fn u16_at(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+fn u32_at(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+fn i32_at(b: &[u8], o: usize) -> i32 {
+    u32_at(b, o) as i32
+}
+
+/// CF_DIB / CF_DIBV5 数据块 → BGRA 自上而下。
+///
+/// 手动按字节解析 `BITMAPINFOHEADER` 字段（避免依赖不同 V4/V5 结构体布局）。
+/// 支持 24/32bpp、`BI_RGB`（及 32bpp `BI_BITFIELDS` 的常见掩码），正高度行翻转。
+pub fn dib_to_bgra(blob: &[u8]) -> Result<(i32, i32, Vec<u8>)> {
+    if blob.len() < 40 {
+        return Err(AppError::Config("DIB 数据过短".into()));
+    }
+    let bi_size = u32_at(blob, 0) as usize;
+    let w = i32_at(blob, 4);
+    let h_raw = i32_at(blob, 8);
+    let bpp = u16_at(blob, 14);
+    if w <= 0 || h_raw == 0 {
+        return Err(AppError::Config("DIB 尺寸无效".into()));
+    }
+    let top_down = h_raw < 0;
+    let h = h_raw.unsigned_abs() as usize;
+    let wu = w as usize;
+
+    // 调色板（仅 ≤8bpp 有；本函数只支持 24/32bpp，其余报错）
+    if bpp != 24 && bpp != 32 {
+        return Err(AppError::Config(format!("不支持的 DIB 位深：{bpp}bpp")));
+    }
+    let pixel_off = bi_size;
+    let src_stride = ((wu * bpp as usize + 31) / 32) * 4;
+    if blob.len() < pixel_off + src_stride * h {
+        return Err(AppError::Config("DIB 像素数据不完整".into()));
+    }
+
+    let mut out = vec![0u8; wu * h * 4];
+    for row in 0..h {
+        let src_row = if top_down { row } else { h - 1 - row };
+        let s = pixel_off + src_row * src_stride;
+        let d = row * wu * 4;
+        if bpp == 32 {
+            for x in 0..wu {
+                let si = s + x * 4;
+                let di = d + x * 4;
+                out[di] = blob[si];
+                out[di + 1] = blob[si + 1];
+                out[di + 2] = blob[si + 2];
+                let a = blob[si + 3];
+                // BI_RGB 下 alpha 常为 0：当不透明处理（与 capture 一致）
+                out[di + 3] = if a == 0 { 255 } else { a };
+            }
+        } else {
+            for x in 0..wu {
+                let si = s + x * 3;
+                let di = d + x * 4;
+                out[di] = blob[si];
+                out[di + 1] = blob[si + 1];
+                out[di + 2] = blob[si + 2];
+                out[di + 3] = 255;
+            }
+        }
+    }
+    Ok((w as i32, h as i32, out))
+}
+
+/// CF_BITMAP（HBITMAP）→ BGRA 自上而下。
+pub fn hbitmap_to_bgra(hbmp: HBITMAP) -> Result<(i32, i32, Vec<u8>)> {
+    unsafe {
+        let mut bm = BITMAP::default();
+        let got = GetObjectW(
+            HGDIOBJ(hbmp.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut BITMAP as *mut c_void),
+        );
+        if got == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
+            return Err(AppError::Config("HBITMAP 尺寸无效".into()));
+        }
+        let (w, h) = (bm.bmWidth, bm.bmHeight);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // 自上而下
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bmi = bmi;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            return Err(AppError::Config("CreateCompatibleDC 失败".into()));
+        }
+        let lines = GetDIBits(
+            dc,
+            hbmp,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteDC(dc);
+        if lines == 0 {
+            return Err(AppError::Config("GetDIBits(HBITMAP) 失败".into()));
+        }
+        for px in buf.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        Ok((w, h, buf))
+    }
+}
+
+/// CF_ENHMETAFILE（HENHMETAFILE）→ BGRA 自上而下（白底播放）。
+pub fn enhmetafile_to_bgra(hemf: HENHMETAFILE) -> Result<(i32, i32, Vec<u8>)> {
+    unsafe {
+        let mut hdr = ENHMETAHEADER::default();
+        let n = windows::Win32::Graphics::Gdi::GetEnhMetaFileHeader(
+            hemf,
+            std::mem::size_of::<ENHMETAHEADER>() as u32,
+            Some(&mut hdr),
+        );
+        if n == 0 {
+            return Err(AppError::Config("GetEnhMetaFileHeader 失败".into()));
+        }
+        let w = (hdr.rclBounds.right - hdr.rclBounds.left).max(1);
+        let h = (hdr.rclBounds.bottom - hdr.rclBounds.top).max(1);
+        if w > 20000 || h > 20000 {
+            return Err(AppError::Config("增强图元文件尺寸异常".into()));
+        }
+
+        let screen = GetDC(HWND::default());
+        if screen.is_invalid() {
+            return Err(AppError::Config("GetDC 失败".into()));
+        }
+        let mem = CreateCompatibleDC(screen);
+        if mem.is_invalid() {
+            let _ = ReleaseDC(HWND::default(), screen);
+            return Err(AppError::Config("CreateCompatibleDC 失败".into()));
+        }
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let dib = match CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = DeleteDC(mem);
+                let _ = ReleaseDC(HWND::default(), screen);
+                return Err(AppError::Config(format!("CreateDIBSection 失败：{e}")));
+            }
+        };
+        if bits.is_null() {
+            let _ = DeleteObject(dib);
+            let _ = DeleteDC(mem);
+            let _ = ReleaseDC(HWND::default(), screen);
+            return Err(AppError::Config("CreateDIBSection 返回空指针".into()));
+        }
+        let old = SelectObject(mem, dib);
+        // 白底不透明打底（BGRA 全 0xFF = 白），再把图元文件播到上方
+        std::ptr::write_bytes(bits as *mut u8, 0xFF, (w as usize) * (h as usize) * 4);
+        let rect = RECT { left: 0, top: 0, right: w, bottom: h };
+        let _ = PlayEnhMetaFile(mem, hemf, &rect);
+        let _ = GdiFlush();
+        let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+        std::ptr::copy_nonoverlapping(bits as *const u8, out.as_mut_ptr(), out.len());
+        SelectObject(mem, old);
+        let _ = DeleteObject(dib);
+        let _ = DeleteDC(mem);
+        let _ = ReleaseDC(HWND::default(), screen);
+        for px in out.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        Ok((w, h, out))
+    }
+}
+
+/// 读取剪贴板并转成可贴图内容。`Ok(None)` 表示剪贴板为空/无可贴内容。
+///
+/// 全部读取在同一个 `ClipboardGuard` 内完成（句柄在关闭后失效）。
+pub fn read_clipboard() -> Result<Option<ClipContent>> {
+    let _guard = ClipboardGuard::open()?;
+    let f = probe_formats();
+    match classify(&f) {
+        Kind::Empty => Ok(None),
+        Kind::Png => {
+            let bytes = read_hglobal(fmt_png())?;
+            let (w, h, bgra) = crate::imageio::decode_png(&bytes)?;
+            Ok(Some(ClipContent::Image { w, h, bgra }))
+        }
+        Kind::DibV5 => {
+            let blob = read_hglobal(CF_DIBV5.0 as u32)?;
+            let (w, h, bgra) = dib_to_bgra(&blob)?;
+            Ok(Some(ClipContent::Image { w, h, bgra }))
+        }
+        Kind::Dib => {
+            let blob = read_hglobal(CF_DIB.0 as u32)?;
+            let (w, h, bgra) = dib_to_bgra(&blob)?;
+            Ok(Some(ClipContent::Image { w, h, bgra }))
+        }
+        Kind::Bitmap => {
+            let h = unsafe {
+                GetClipboardData(CF_BITMAP.0 as u32)
+                    .map_err(|e| AppError::Config(format!("读取 CF_BITMAP 失败：{e}")))?
+            };
+            if h.is_invalid() {
+                return Ok(None);
+            }
+            let (w, hh, bgra) = hbitmap_to_bgra(HBITMAP(h.0))?;
+            Ok(Some(ClipContent::Image { w, h: hh, bgra }))
+        }
+        Kind::Emf => {
+            let h = unsafe {
+                GetClipboardData(CF_ENHMETAFILE.0 as u32)
+                    .map_err(|e| AppError::Config(format!("读取 CF_ENHMETAFILE 失败：{e}")))?
+            };
+            if h.is_invalid() {
+                return Ok(None);
+            }
+            let (w, hh, bgra) = enhmetafile_to_bgra(HENHMETAFILE(h.0))?;
+            Ok(Some(ClipContent::Image { w, h: hh, bgra }))
+        }
+        Kind::Rtf => Ok(Some(ClipContent::Rtf(read_hglobal(fmt_rtf())?))),
+        Kind::Html => {
+            let bytes = read_hglobal(fmt_html())?;
+            Ok(Some(ClipContent::Html(
+                String::from_utf8_lossy(&bytes).into_owned(),
+            )))
+        }
+        Kind::Text => Ok(Some(ClipContent::Text(read_unicode_text()?))),
     }
 }
 
@@ -188,5 +640,104 @@ mod tests {
         let r = early();
         assert!(r.is_err());
         assert!(CLOSED.with(|c| c.get()), "提前返回时必须执行收尾");
+    }
+
+    /// 图像格式必须优先于文本/富文本——否则 Excel 复制（同时带 DIB 与 HTML/RTF）
+    /// 会被误判为纯文本。
+    #[test]
+    fn classify_prefers_image_over_text() {
+        let excel = Formats {
+            dib: true,
+            bitmap: true,
+            html: true,
+            rtf: true,
+            text: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&excel), Kind::Dib);
+
+        // PNG 优先级最高
+        let all = Formats {
+            png: true,
+            dibv5: true,
+            dib: true,
+            bitmap: true,
+            emf: true,
+            rtf: true,
+            html: true,
+            text: true,
+        };
+        assert_eq!(classify(&all), Kind::Png);
+
+        // 无图像时才落到富文本，再无才落到纯文本
+        assert_eq!(
+            classify(&Formats { rtf: true, text: true, ..Default::default() }),
+            Kind::Rtf
+        );
+        assert_eq!(
+            classify(&Formats { text: true, ..Default::default() }),
+            Kind::Text
+        );
+        assert_eq!(classify(&Formats::default()), Kind::Empty);
+    }
+
+    /// 构造一个最小 2×2 的 32bpp 自下而上 DIB（BI_RGB，alpha=0）。
+    fn make_dib_2x2() -> Vec<u8> {
+        let mut b = vec![0u8; 40 + 2 * 8]; // header + 2 行 × stride8
+        b[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        b[4..8].copy_from_slice(&2i32.to_le_bytes()); // width
+        b[8..12].copy_from_slice(&2i32.to_le_bytes()); // height（正=自下而上）
+        b[12..14].copy_from_slice(&1u16.to_le_bytes()); // planes
+        b[14..16].copy_from_slice(&32u16.to_le_bytes()); // bpp
+        // 行0（DIB 底行）在文件里先出现 → 翻转后应成为输出最后一行
+        // DIB 行序：先是 image 底行(y=1)，再是顶行(y=0)
+        // 底行像素：B=0x10；顶行像素：B=0x20
+        b[40] = 0x10;
+        b[48] = 0x20;
+        b
+    }
+
+    #[test]
+    fn dib_bottom_up_is_flipped_and_alpha_opaque() {
+        let (w, h, out) = dib_to_bgra(&make_dib_2x2()).unwrap();
+        assert_eq!((w, h), (2, 2));
+        // 顶行（输出第一行）应来自 DIB 的最后一行 0x20
+        assert_eq!(out[0], 0x20);
+        // 底行（输出最后一行）应来自 DIB 的第一行 0x10
+        assert_eq!(out[(1 * 2) * 4], 0x10);
+        // alpha=0 时按不透明处理
+        assert_eq!(out[3], 255);
+    }
+
+    /// 真实剪贴板往返（会覆盖用户剪贴板，故标记 ignore，供显式运行）。
+    /// 图像与文本合并为一个用例：剪贴板是全系统共享资源，两个用例并行会互相覆盖。
+    #[test]
+    #[ignore = "会占用系统剪贴板，供显式运行验证"]
+    fn clipboard_roundtrip_real() {
+        // 图像：copy_image → read_clipboard 应取回同尺寸像素
+        let (w, h) = (4, 3);
+        let bgra: Vec<u8> = (0..(w * h)).flat_map(|i| [i as u8, 0x80, 0x40, 0xFF]).collect();
+        copy_image(&bgra, w, h).expect("写入图像");
+        match read_clipboard().expect("读取剪贴板") {
+            Some(ClipContent::Image { w: rw, h: rh, bgra: back }) => {
+                assert_eq!((rw, rh), (w, h));
+                assert_eq!(back, bgra, "DIB 往返像素应一致");
+            }
+            _ => panic!("应为图像"),
+        }
+
+        // 文本：copy_text → read_clipboard 应取回同文本
+        copy_text("你好 PixShot\nline2").expect("写入文本");
+        match read_clipboard().expect("读取剪贴板") {
+            Some(ClipContent::Text(t)) => assert_eq!(t, "你好 PixShot\nline2"),
+            _ => panic!("应为纯文本"),
+        }
+    }
+
+    #[test]
+    fn dib_rejects_unsupported_bitdepth() {
+        let mut b = make_dib_2x2();
+        b[14..16].copy_from_slice(&8u16.to_le_bytes());
+        assert!(dib_to_bgra(&b).is_err());
     }
 }

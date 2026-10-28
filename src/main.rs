@@ -31,7 +31,9 @@ mod menu;
 mod ocr;
 mod overlay;
 mod pin;
+mod rtfimg;
 mod svgpath;
+mod textimg;
 mod theme;
 mod toast;
 mod toolbar;
@@ -253,9 +255,146 @@ pub(crate) fn screenshot_flow() {
     }
 }
 
-unsafe fn flow_impl() -> error::Result<()> {
-    // 1. 框选屏幕区域（模态）。返回「已裁好的成品 + 仍在显示的红框」。
-    //    红框窗口在工具条关闭前一直保留，用户操作期间能看到自己框选的范围。
+// ─── 剪贴板贴图（F3）────────────────────────────────────────────
+
+/// F3：把剪贴板内容以图片形式置顶。图片/文本/Excel/富文本四类都出图，
+/// 统一复用既有贴图窗口（[`pin::create`]），不另写置顶实现。
+///
+/// 与截图流程同款双层保护：`BusyGuard` 拒绝重入，`catch_unwind` 防止 panic
+/// 穿过 `extern "system"` 窗口过程边界。
+pub(crate) fn pin_from_clipboard() {
+    let Some(_guard) = util::BusyGuard::acquire() else {
+        return;
+    };
+    let r = std::panic::catch_unwind(AssertUnwindSafe(pin_from_clipboard_impl));
+    match r {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => util::error_msgbox(&format!("贴图失败：{e}")),
+        Err(_) => util::error_msgbox(
+            "贴图流程遇到内部错误并已中止（详情见诊断日志）。\n\n程序仍可继续使用。",
+        ),
+    }
+    if util::quit_requested() {
+        unsafe { PostQuitMessage(0) };
+    }
+}
+
+fn pin_from_clipboard_impl() -> error::Result<()> {
+    let Some(content) = clipboard::read_clipboard()? else {
+        crate::toast::show("剪贴板没有可贴的内容");
+        return Ok(());
+    };
+
+    let (w, h, bgra): (i32, i32, Vec<u8>) = match content {
+        clipboard::ClipContent::Image { w, h, bgra } => (w, h, bgra),
+        clipboard::ClipContent::Text(t) => {
+            textimg::render_text_to_bgra(&t, &textimg::TextOptions::default())?
+        }
+        // 富文本 HTML 分支：项目无 HTML 渲染器，提取可见文本后走文本渲染（明确降级）
+        clipboard::ClipContent::Html(html) => {
+            let t = rtfimg::html_to_text(&html);
+            if t.trim().is_empty() {
+                crate::toast::show("剪贴板没有可贴的内容");
+                return Ok(());
+            }
+            textimg::render_text_to_bgra(&t, &textimg::TextOptions::default())?
+        }
+        // RTF 分支：优先保真渲染；失败则降级为提取纯文本，保证「有图可贴」
+        clipboard::ClipContent::Rtf(rtf) => match rtfimg::render_rtf_to_bgra(&rtf) {
+            Ok(v) => v,
+            Err(e) => {
+                diag::log(&format!("[pin] RTF 渲染失败({e}) -> 降级为纯文本"));
+                let t = rtfimg::rtf_to_text(&rtf);
+                if t.trim().is_empty() {
+                    return Err(e);
+                }
+                textimg::render_text_to_bgra(&t, &textimg::TextOptions::default())?
+            }
+        },
+    };
+
+    let (x, y) = pin_position_at_cursor(w, h);
+    let img = capture::CapturedImage {
+        x,
+        y,
+        width: w,
+        height: h,
+        data: std::sync::Arc::from(bgra),
+    };
+    pin::create(&img)?;
+    Ok(())
+}
+
+/// 贴图落点：以光标为左上角，按光标所在显示器工作区钳制（保证完整可见）。
+fn pin_position_at_cursor(w: i32, h: i32) -> (i32, i32) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    unsafe {
+        let mut pt = POINT::default();
+        if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).is_err() {
+            return (0, 0);
+        }
+        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let wa = mi.rcWork;
+            let max_x = (wa.right - w).max(wa.left);
+            let max_y = (wa.bottom - h).max(wa.top);
+            (pt.x.clamp(wa.left, max_x), pt.y.clamp(wa.top, max_y))
+        } else {
+            (pt.x, pt.y)
+        }
+    }
+}
+
+/// 托盘「截取全屏」：静默抓整屏 → 复制到剪贴板（双格式）→ 存盘 → Toast。
+///
+/// 不进入框选/工具条（无交互），直接落盘到默认目录（见 `imageio::autosave_dir`）。
+pub(crate) fn capture_fullscreen_silent() {
+    let Some(_guard) = util::BusyGuard::acquire() else {
+        return;
+    };
+    let (vx, vy, vw, vh) = capture::virtual_screen_rect();
+    let img = match capture::capture_region_ex(vx, vy, vw, vh, config::get().capture_cursor) {
+        Ok(i) => i,
+        Err(e) => {
+            util::error_msgbox(&format!("全屏截图失败：{e}"));
+            return;
+        }
+    };
+    // 先复制到剪贴板（与工具条「复制」同一条双格式路径），失败不阻断存盘
+    let png = imageio::encode_png(&img.data, img.width, img.height).ok();
+    let copied =
+        clipboard::copy_image_with_png(&img.data, img.width, img.height, png.as_deref()).is_ok();
+    match imageio::autosave(&img.data, img.width, img.height, config::get().format) {
+        Ok(path) => {
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(path);
+            crate::toast::show(&format!(
+                "全屏截图已保存{}{name}",
+                if copied { "并复制：" } else { "：" }
+            ));
+        }
+        Err(e) => {
+            diag::log(&format!("[tray] 全屏截图存盘失败: {e}"));
+            crate::toast::show(if copied {
+                "已复制全屏截图到剪贴板（存盘失败）"
+            } else {
+                "全屏截图失败"
+            });
+        }
+    }
+}
+
+unsafe fn flow_impl() -> error::Result<()> {    // 1. 框选屏幕区域（模态，遮罩暗化 + 选区提亮 + 实时尺寸）。
+    //    返回「已裁好的成品 + 仍在显示的冻结层」。
     let Some(sel) = overlay::select_region() else {
         return Ok(()); // 用户取消
     };

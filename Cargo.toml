@@ -39,6 +39,8 @@ windows = { version = "0.58", features = [
     # Fluent 视觉（theme.rs）：DWM 圆角/描边/Mica、深色滚动条、注册表读主题
     "Win32_Graphics_Dwm",
     "Win32_UI_Controls",
+    # RichEdit 控件（富文本贴图：EM_FORMATRANGE 离屏渲染 RTF）
+    "Win32_UI_Controls_RichEdit",
     "Win32_System_Registry",
     # 单实例互斥体（CreateMutexW 依赖 SECURITY_ATTRIBUTES）
     "Win32_Security",

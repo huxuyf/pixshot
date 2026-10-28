@@ -6,18 +6,29 @@
 //! - JPEG：不支持 alpha，先转 24bppBGR 再写。
 //!
 //! 保存成功后把所在目录写回配置，下次对话框默认打开同一目录。
+//!
+//! [`encode_png`]：内存内 PNG 编码（WIC 内存流），供剪贴板附加
+//! 注册的 "PNG" 格式使用（见 `clipboard::copy_image_with_png`）。
 
 use crate::config::SaveFormat;
 use crate::error::{AppError, Result};
 use crate::util::to_wide;
+use std::ffi::c_void;
+use std::path::PathBuf;
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HGLOBAL, HWND};
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_ContainerFormatBmp, GUID_ContainerFormatJpeg,
     GUID_ContainerFormatPng, GUID_WICPixelFormat24bppBGR, GUID_WICPixelFormat32bppBGRA,
-    IWICBitmapEncoder, IWICBitmapFrameEncode, IWICImagingFactory, WICBitmapEncoderNoCache,
+    IWICBitmapDecoder, IWICBitmapEncoder, IWICBitmapFrameDecode, IWICBitmapFrameEncode,
+    IWICFormatConverter, IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapEncoderNoCache,
+    WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CLSCTX_INPROC_SERVER, STREAM_SEEK_SET,
+};
+use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream};
+use windows::Win32::System::Memory::GlobalSize;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
@@ -29,6 +40,104 @@ use windows::Win32::UI::Controls::Dialogs::{
 #[allow(dead_code)]
 pub fn save_png(path: &str, bgra: &[u8], w: i32, h: i32) -> Result<()> {
     save(path, bgra, w, h, SaveFormat::Png)
+}
+
+/// 内存内 PNG 编码（WIC 内存流，不经磁盘）。供剪贴板附加注册的
+/// "PNG" 格式使用；与文件保存共用同一条 WIC 编码路径。
+pub fn encode_png(bgra: &[u8], w: i32, h: i32) -> Result<Vec<u8>> {
+    if w <= 0 || h <= 0 {
+        return Err(AppError::Config("图像尺寸无效".into()));
+    }
+    let stride = (w as usize) * 4;
+    if bgra.len() < stride * h as usize {
+        return Err(AppError::Config("图像数据不完整".into()));
+    }
+    unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        // fDeleteOnRelease=true：IStream 释放时回收全局内存
+        let stream = CreateStreamOnHGlobal(HGLOBAL::default(), true)?;
+        let container = GUID_ContainerFormatPng;
+        let encoder: IWICBitmapEncoder = factory.CreateEncoder(&container, std::ptr::null())?;
+        encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+
+        let mut frame_opt: Option<IWICBitmapFrameEncode> = None;
+        encoder.CreateNewFrame(&mut frame_opt, std::ptr::null_mut())?;
+        let frame =
+            frame_opt.ok_or_else(|| AppError::Config("WIC CreateNewFrame 返回空".into()))?;
+        frame.Initialize(None)?;
+        frame.SetSize(w as u32, h as u32)?;
+        let mut pf = GUID_WICPixelFormat32bppBGRA;
+        frame.SetPixelFormat(&mut pf)?;
+        if pf != GUID_WICPixelFormat32bppBGRA {
+            return Err(AppError::Config("WIC 编码器未采用 BGRA 像素格式".into()));
+        }
+        frame.WritePixels(h as u32, (w as u32) * 4, bgra)?;
+        frame.Commit()?;
+        encoder.Commit()?;
+
+        // 读回编码结果：经 GetHGlobalFromStream 拿到内存块尺寸，先回到流起点
+        // （编码后位置在末尾，直接 Read 会得到 0 字节）再整块读出
+        let hg = GetHGlobalFromStream(&stream)?;
+        let size = GlobalSize(hg) as usize;
+        stream.Seek(0, STREAM_SEEK_SET, None)?;
+        if size == 0 {
+            return Err(AppError::Config("PNG 编码结果为空".into()));
+        }
+        let mut out = vec![0u8; size];
+        let mut read: u32 = 0;
+        let hr = stream.Read(
+            out.as_mut_ptr() as *mut core::ffi::c_void,
+            size as u32,
+            Some(&mut read),
+        );
+        // ISequentialStream::Read 返回 HRESULT（非 Result），手动检查
+        if hr.is_err() {
+            return Err(AppError::Config("读取 PNG 编码结果失败".into()));
+        }
+        out.truncate(read as usize);
+        if out.is_empty() {
+            return Err(AppError::Config("PNG 编码结果为空".into()));
+        }
+        Ok(out)
+    }
+}
+
+/// 内存内 PNG 解码（WIC 内存流）→ BGRA 自上而下。供剪贴板注册的 "PNG" 格式
+/// （现代应用复制图像时优先提供的格式）使用，见 `clipboard::read_clipboard`。
+pub fn decode_png(png: &[u8]) -> Result<(i32, i32, Vec<u8>)> {
+    if png.is_empty() {
+        return Err(AppError::Config("PNG 数据为空".into()));
+    }
+    unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let stream = CreateStreamOnHGlobal(HGLOBAL::default(), true)?;
+        let _ = stream.Write(png.as_ptr() as *const c_void, png.len() as u32, None);
+        stream.Seek(0, STREAM_SEEK_SET, None)?;
+
+        let decoder: IWICBitmapDecoder =
+            factory.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)?;
+        let frame: IWICBitmapFrameDecode = decoder.GetFrame(0)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h)?;
+        if w == 0 || h == 0 {
+            return Err(AppError::Config("PNG 尺寸无效".into()));
+        }
+        let conv: IWICFormatConverter = factory.CreateFormatConverter()?;
+        conv.Initialize(
+            &frame,
+            &GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )?;
+        let stride = (w as usize) * 4;
+        let mut buf = vec![0u8; stride * h as usize];
+        conv.CopyPixels(std::ptr::null(), stride as u32, &mut buf)?;
+        Ok((w as i32, h as i32, buf))
+    }
 }
 
 /// 按指定格式保存。
@@ -174,22 +283,55 @@ pub fn save_with_dialog(
     Ok(Some(path))
 }
 
-/// 默认文件名：`截图_YYYYMMDD_NN.<ext>`（本地时间，Win32 GetLocalTime，零依赖）。
-///
+/// 静默保存目录：优先配置里的 `imageio_autosave_dir`，其次 `save_dir`，
+/// 否则 `%USERPROFILE%\Pictures\PixShot`（取不到用户目录时回退当前目录）。
+/// 用于托盘「截取全屏」等无对话框保存。
+pub fn autosave_dir() -> PathBuf {
+    let cfg = crate::config::get();
+    if let Some(d) = cfg.imageio_autosave_dir.filter(|d| !d.is_empty()) {
+        return PathBuf::from(d);
+    }
+    if let Some(d) = cfg.save_dir.filter(|d| !d.is_empty()) {
+        return PathBuf::from(d);
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if !profile.is_empty() {
+            return PathBuf::from(profile).join("Pictures").join("PixShot");
+        }
+    }
+    PathBuf::from(".")
+}
+
+/// 静默保存到 [`autosave_dir`]，文件名沿用当天递增的 `截图_YYYYMMDD_NN.<ext>`。
+/// 返回完整落盘路径（供提示展示）。
+pub fn autosave(bgra: &[u8], w: i32, h: i32, fmt: SaveFormat) -> Result<String> {
+    let dir = autosave_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Config(format!("创建目录失败 {}：{e}", dir.display())))?;
+    let dir_s = dir.to_string_lossy().into_owned();
+    let name = default_file_name(fmt, Some(&dir_s));
+    let path = dir.join(name);
+    let path_s = path.to_string_lossy().into_owned();
+    save(&path_s, bgra, w, h, fmt)?;
+    Ok(path_s)
+}
+
+/// 默认文件名：`<prefix>_YYYYMMDD_NN.<ext>`（本地时间，Win32 GetLocalTime，零依赖）。
 /// `dir` 为上次保存目录：在其中扫描当日已存的序列，取最大编号 +1，使当日截图
-/// 依次累加（`01`..`99`，满 99 后固定为 `99`，由文件覆盖提示兜底）。
+/// 依次累加（`01`..`max_seq`，满额后固定为上限，由文件覆盖提示兜底）。
 fn default_file_name(fmt: SaveFormat, dir: Option<&str>) -> String {
     let st = unsafe { GetLocalTime() };
     let ymd = format!("{:04}{:02}{:02}", st.wYear, st.wMonth, st.wDay);
     let seq = next_seq(dir, &ymd);
-    format!("截图_{ymd}_{seq:02}.{}", fmt.ext())
+    format!("{}_{ymd}_{seq:02}.{}", crate::config::get().imageio_prefix, fmt.ext())
 }
 
-/// 扫描 `dir` 下形如 `截图_<ymd>_NN.*` 的文件，返回下一个可用编号（1..=99）。
-/// `dir` 为空或不可读时按首个（1）处理。
+/// 扫描 `dir` 下形如 `<prefix>_<ymd>_NN.*` 的文件，返回下一个可用编号。
+/// 序号上限来自配置（默认 99）；`dir` 为空或不可读时按首个（1）处理。
 fn next_seq(dir: Option<&str>, ymd: &str) -> u32 {
-    const MAX: u32 = 99;
-    let prefix = format!("截图_{ymd}_");
+    let cfg = crate::config::get();
+    let max_seq = cfg.imageio_max_seq.max(1);
+    let prefix = format!("{}_{ymd}_", cfg.imageio_prefix);
     let mut max = 0u32;
     if let Some(dir) = dir.filter(|d| !d.is_empty()) {
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -206,12 +348,54 @@ fn next_seq(dir: Option<&str>, ymd: &str) -> u32 {
             }
         }
     }
-    (max + 1).min(MAX)
+    (max + 1).min(max_seq)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PNG 内存编码（WIC 内存流）冒烟：结果必须是合法 PNG（签名 + IHDR 宽高）。
+    /// 需要 COM/WIC，标记 #[ignore] 供显式运行验证（`cargo test encode_png -- --ignored`）。
+    #[test]
+    #[ignore = "需要 COM/WIC，供显式运行验证"]
+    fn encode_png_produces_valid_png() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+        // 2×2 纯色 BGRA
+        let bgra = [1u8, 2, 3, 255, 1, 2, 3, 255, 1, 2, 3, 255, 1, 2, 3, 255];
+        let out = encode_png(&bgra, 2, 2).expect("encode_png 应成功");
+        // PNG 签名
+        assert_eq!(&out[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        // IHDR 块类型 + 宽高（大端）
+        assert_eq!(&out[12..16], b"IHDR");
+        let w = u32::from_be_bytes([out[16], out[17], out[18], out[19]]);
+        let h = u32::from_be_bytes([out[20], out[21], out[22], out[23]]);
+        assert_eq!((w, h), (2, 2));
+        // 解码回读：像素应与输入一致（WIC PNG 无损）
+        // （这里只验容器正确性；像素级由 --smoke / E2E 覆盖）
+    }
+
+    /// encode→decode 往返：像素与尺寸应一致（WIC PNG 无损）。需 COM/WIC，显式运行。
+    #[test]
+    #[ignore = "需要 COM/WIC，供显式运行验证"]
+    fn decode_png_roundtrip() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+        let bgra: Vec<u8> = (0..4u8).flat_map(|i| [i, i + 10, i + 20, 255]).collect();
+        let png = encode_png(&bgra, 2, 2).expect("encode_png");
+        let (w, h, back) = decode_png(&png).expect("decode_png");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(back, bgra);
+    }
 
     #[test]
     fn bgr24_drops_alpha_and_keeps_order() {
