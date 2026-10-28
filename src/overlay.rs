@@ -31,10 +31,17 @@
 //! 时才真正拆窗、释放 GDI 资源。
 //!
 //! **确认后进入标注模式**（见设计文档《标注引擎 MVP 设计文档》1.2 A）：窗口**不再**
-//! 转为鼠标穿透（`WS_EX_TRANSPARENT`），而是继续接收鼠标消息用于矩形/箭头/步骤序号
-//! 标注；键盘消息由工具条经自定义消息（`WM_APP_KEY` / `WM_APP_SET_TOOL`）转发。
+//! 转为鼠标穿透（`WS_EX_TRANSPARENT`），而是继续接收鼠标消息用于矩形/箭头/步骤序号/
+//! 椭圆/线段/画笔/马赛克/高亮/文字标注；键盘消息由工具条经自定义消息（`WM_APP_KEY` /
+//! `WM_APP_SET_TOOL` / `WM_APP_CHAR`）转发。
 //! 工具条/贴图/菜单都是 `WS_EX_TOPMOST` 且在其后创建，会压在冻结层之上；
 //! 标注期间冻结层对 `WM_MOUSEACTIVATE` 返回 `MA_NOACTIVATE`，不抢工具条的焦点与 z 序。
+//!
+//! **文字输入与 IME**（中文输入）：主进程已 `ImmDisableIME`（见 `main.rs`），因此
+//! 本进程内**没有输入法**。进入文字输入时改为拉起**文字输入子进程**
+//! （[`crate::textinput`]）：子进程在其输入窗内用系统原生 IME 完成组字/候选，
+//! 正文经 `WM_COPYDATA` 回传（见本文件 `WM_COPYDATA` 分支）。离开输入收掉子进程、
+//! 焦点还给工具条。子进程失败时兜底回退到进程内输入（仅 ASCII 可用）。
 
 use std::sync::Arc;
 
@@ -64,6 +71,12 @@ pub const WM_APP_ANNOT_DIRTY: u32 = WM_APP + 3;
 pub const WM_APP_TOOL_CHANGED: u32 = WM_APP + 4;
 /// 自定义消息：冻结层 → 工具条（Esc 交还，关闭会话）。
 pub const WM_APP_ESC_CLOSE: u32 = WM_APP + 5;
+/// 自定义消息：工具条 → 冻结层（转发 `WM_CHAR` 字符，文字输入用）。
+/// `wp` = 字符码（UTF-32）。
+pub const WM_APP_CHAR: u32 = WM_APP + 6;
+/// 自定义消息：工具条 → 冻结层（同步查询是否处于文字输入中）。
+/// 返回 1 = 输入中（工具条的字母键应放行为正文输入，不当工具快捷键）。
+pub const WM_APP_QUERY_TYPING: u32 = WM_APP + 7;
 
 /// 冻结层窗口类名（供冻结层反向定位工具条窗口）。
 const TOOLBAR_CLASS: &str = "PixShotToolbar";
@@ -107,6 +120,25 @@ impl Selection {
     /// 长借会与 `overlay_proc` 的写入别名。
     pub fn doc(&self) -> &AnnotDoc {
         unsafe { &(*self.state).annot.doc }
+    }
+
+    /// 完成输入中的文字（若有）：把瞬态正文落入标注文档并重绘。
+    ///
+    /// 工具栏在导出（贴图/复制/保存/OCR）前调用——文字输入中的正文是瞬态
+    /// （见 `AnnotSession::commit_text`），不先提交导出就会丢文字。
+    pub fn commit_typing(&self) {
+        unsafe {
+            let s = &mut *self.state;
+            if s.mode != OverlayMode::Annotating {
+                return;
+            }
+            let a = s.annot.commit_text();
+            if let Some(d) = a.redraw {
+                repaint_annot(self.hwnd, s, d);
+            }
+            // 导出前提交后，输入已结束：同步收掉文字输入子进程（若在运行）
+            sync_text_helper(self.hwnd, s);
+        }
     }
 
     /// 收掉红框窗口并释放其 GDI 资源。幂等（`Drop` 会再调一次也无害）。
@@ -572,6 +604,43 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
 
+        // 文字输入：字符直达（焦点在冻结层，含 IME 提交的中文 —— WM_IME_CHAR
+        // 经 DefWindowProc 翻译为 WM_CHAR 到达，见模块头「文字输入与 IME」），
+        // 或经工具条转发（WM_APP_CHAR，焦点在工具条时的兜底路径）。仅输入中消费。
+        WM_CHAR => {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    if let Some(c) = char::from_u32(wp.0 as u32) {
+                        let a = s.annot.on_char(c);
+                        annot_apply(hwnd, s, a);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
+        // 工具条 → 冻结层：转发 WM_CHAR 字符（文字输入）。仅输入中消费。
+        WM_APP_CHAR => {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    if let Some(c) = char::from_u32(wp.0 as u32) {
+                        let a = s.annot.on_char(c);
+                        annot_apply(hwnd, s, a);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
+        // 工具条 → 冻结层：同步查询是否处于文字输入中。
+        // 输入中时工具条的字母键应放行为正文输入，不当工具快捷键。
+        WM_APP_QUERY_TYPING => {
+            let typing = state_of(hwnd)
+                .map(|s| s.mode == OverlayMode::Annotating && s.annot.typing())
+                .unwrap_or(false);
+            LRESULT(typing as isize)
+        }
+
         // 预留：请求整选区重绘
         WM_APP_ANNOT_DIRTY => {
             if let Some(s) = state_of(hwnd) {
@@ -647,9 +716,10 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
         s.result_image = cropped;
         // 进入标注模式（见设计文档 1.2 A）：不转鼠标穿透，冻结层继续接收鼠标用于标注。
         s.region = region;
-        s.annot = AnnotSession::new(
+        s.annot = AnnotSession::new_with_prefs(
             Rect::new(0, 0, region.width, region.height),
             overlay_dpi(),
+            crate::config::get().annot_prefs(),
         );
         s.annot_base = DibSurface::new(region.width, region.height);
         if let Some(base) = &s.annot_base {
@@ -698,6 +768,12 @@ fn tool_from_usize(v: usize) -> Tool {
         1 => Tool::Rect,
         2 => Tool::Arrow,
         3 => Tool::StepNo,
+        4 => Tool::Ellipse,
+        5 => Tool::Line,
+        6 => Tool::Pen,
+        7 => Tool::Mosaic,
+        8 => Tool::Highlight,
+        9 => Tool::Text,
         _ => Tool::None,
     }
 }
@@ -773,8 +849,19 @@ unsafe fn repaint_annot(hwnd: HWND, s: &State, dirty: Rect) {
 
     // 1. 恢复底图
     let _ = BitBlt(s.surface_dc, ox + d.x, oy + d.y, d.w, d.h, base.dc, d.x, d.y, SRCCOPY);
-    // 2. 全量重画标注 + 预览 + 选中态（render_into 内部按选区裁剪）
-    annot::render_into(s.surface_dc, Pt::new(ox, oy), &s.annot, overlay_dpi());
+    // 2. 全量重画标注 + 预览 + 选中态（render_into 内部按选区裁剪）。
+    //    base 供马赛克/高亮取样 pristine 底图（annot_base = 冻结选区 + 框线）。
+    let base_src = s.annot_base.as_ref().map(annot::BaseSource::Surface);
+    annot::render_into(
+        s.surface_dc,
+        s.surface_bits,
+        s.vw,
+        s.vh,
+        Pt::new(ox, oy),
+        &s.annot,
+        overlay_dpi(),
+        base_src.as_ref(),
+    );
     // 3. alpha 防御（表面坐标）
     let sr = Rect::new(ox + d.x, oy + d.y, d.w, d.h);
     crate::annot::session::alpha_fix(s.surface_bits, s.vw, sr);

@@ -41,6 +41,18 @@ pub enum Icon {
     Arrow,
     /// 标注：步骤序号。
     StepNo,
+    /// 标注：椭圆。
+    Ellipse,
+    /// 标注：线段。
+    Line,
+    /// 标注：自由画笔。
+    Pen,
+    /// 标注：马赛克（打码）。
+    Mosaic,
+    /// 标注：高亮（荧光笔）。
+    Highlight,
+    /// 标注：文字。
+    Text,
 }
 
 /// 图标对应的 Lucide 路径数据（24×24 viewBox，`stroke-width: 2`）。
@@ -75,6 +87,30 @@ fn lucide_paths(icon: Icon) -> &'static [&'static str] {
     const ARROW_UP_RIGHT: [&str; 2] = ["M7 7h10v10", "M7 17 17 7"];
     // circle + 数字 "1"（步骤序号）
     const STEP_NO: [&str; 3] = ["M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20z", "M12 8v8", "M10 10l2-2"];
+    // circle（椭圆；与序号外形同为整圆，语义靠提示区分）
+    const CIRCLE: &str = "M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20z";
+    // minus（线段）
+    const MINUS: &str = "M5 12h14";
+    // pencil（画笔）
+    const PENCIL: [&str; 2] = [
+        "M21.17 6.81a1 1 0 0 0-3.99-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5z",
+        "m15 5 4 4",
+    ];
+    // grid-3x3（马赛克/打码）：square + 十字网格线
+    const MOSAIC: [&str; 5] = [
+        "m5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-14a2 2 0 0 1-2-2v-14a2 2 0 0 1 2-2z",
+        "M3 9h18",
+        "M3 15h18",
+        "M9 3v18",
+        "M15 3v18",
+    ];
+    // highlighter（高亮/荧光笔）
+    const HIGHLIGHTER: [&str; 2] = [
+        "m9 11-6 6v3h9l3-3",
+        "m22 12-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4",
+    ];
+    // type（文字）
+    const TYPE: [&str; 3] = ["M4 7V4h16v3", "M9 20h6", "M12 4v16"];
 
     match icon {
         Icon::Pin => std::slice::from_ref(&PIN),
@@ -85,6 +121,12 @@ fn lucide_paths(icon: Icon) -> &'static [&'static str] {
         Icon::Rect => std::slice::from_ref(&SQUARE),
         Icon::Arrow => &ARROW_UP_RIGHT,
         Icon::StepNo => &STEP_NO,
+        Icon::Ellipse => std::slice::from_ref(&CIRCLE),
+        Icon::Line => std::slice::from_ref(&MINUS),
+        Icon::Pen => &PENCIL,
+        Icon::Mosaic => &MOSAIC,
+        Icon::Highlight => &HIGHLIGHTER,
+        Icon::Text => &TYPE,
     }
 }
 
@@ -193,7 +235,7 @@ mod preview {
     #[ignore = "仅在需要人工核对图标外观（抗锯齿）时运行：--ignored render_preview"]
     fn render_preview() {
         // 与真实工具条一致：32 逻辑像素方形按钮（此处按 3x 渲染便于观察锯齿）
-        let (cell, w, h) = (96i32, 96 * 8, 96 * 2);
+        let (cell, w, h) = (96i32, 96 * 14, 96 * 2);
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
                 None,
@@ -231,6 +273,12 @@ mod preview {
                 Icon::Rect,
                 Icon::Arrow,
                 Icon::StepNo,
+                Icon::Ellipse,
+                Icon::Line,
+                Icon::Pen,
+                Icon::Mosaic,
+                Icon::Highlight,
+                Icon::Text,
                 Icon::Close,
             ];
             for (i, icon) in all.iter().enumerate() {

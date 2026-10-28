@@ -78,6 +78,37 @@ impl Handle {
 pub fn hit_shape(shape: &Shape, p: Pt, tol: i32) -> bool {
     match shape {
         Shape::Rect { bbox, style, .. } => bbox.inflate(style.width / 2 + tol).contains(p),
+        // 椭圆：按外接盒 + 归一化椭圆方程判内部（含容差外扩）
+        Shape::Ellipse { bbox, style } => {
+            let b = bbox.inflate(style.width / 2 + tol);
+            if !b.contains(p) {
+                return false;
+            }
+            let (rx, ry) = ((b.w as f32) / 2.0, (b.h as f32) / 2.0);
+            if rx <= 0.0 || ry <= 0.0 {
+                return false;
+            }
+            let (cx, cy) = (b.x as f32 + rx, b.y as f32 + ry);
+            let nx = (p.x as f32 - cx) / rx;
+            let ny = (p.y as f32 - cy) / ry;
+            nx * nx + ny * ny <= 1.0
+        }
+        // 线段：点到线段距离
+        Shape::Line { from, to, style } => {
+            dist_point_segment(p, *from, *to) <= (style.width as f32) / 2.0 + tol as f32
+        }
+        // 画笔：命中轨迹上任意一段（含线宽与容差）
+        Shape::Pen { pts, style } => {
+            (style.width as f32) / 2.0 + tol as f32
+                >= pts
+                    .windows(2)
+                    .map(|w| dist_point_segment(p, w[0], w[1]))
+                    .fold(f32::INFINITY, f32::min)
+        }
+        // 马赛克/高亮按 bbox 命中（区域填充类标注）
+        Shape::Mosaic { bbox, .. } | Shape::Highlight { bbox, .. } => bbox.inflate(tol).contains(p),
+        // 文字按估算 bbox 命中
+        Shape::Text { bbox, .. } => bbox.inflate(tol).contains(p),
         Shape::Arrow { from, to, style, .. } => {
             dist_point_segment(p, *from, *to) <= (style.width as f32) / 2.0 + tol as f32
         }
@@ -91,9 +122,9 @@ pub fn hit_shape(shape: &Shape, p: Pt, tol: i32) -> bool {
     }
 }
 
-/// 点是否命中某个控制柄（StepNo 不参与缩放，恒 `None`）。
+/// 点是否命中某个控制柄（StepNo / Text 不参与缩放，恒 `None`）。
 pub fn hit_handle(shape: &Shape, p: Pt, tol: i32) -> Option<Handle> {
-    if matches!(shape, Shape::StepNo { .. }) {
+    if matches!(shape, Shape::StepNo { .. } | Shape::Text { .. }) {
         return None;
     }
     let bbox = shape.bbox();
@@ -176,5 +207,95 @@ mod tests {
         assert_eq!(hit_handle(&s, Pt::new(100, 50), 5), Some(Handle::SE));
         assert_eq!(hit_handle(&s, Pt::new(0, 0), 5), Some(Handle::NW));
         assert_eq!(hit_handle(&s, Pt::new(50, 25), 5), None, "中央不命中控制柄");
+    }
+
+    #[test]
+    fn mosaic_and_highlight_hit_by_bbox() {
+        let m = Shape::Mosaic {
+            bbox: Rect::new(10, 10, 40, 20),
+            mode: super::super::style::MosaicMode::Pixelate,
+        };
+        assert!(hit_shape(&m, Pt::new(30, 20), 4), "内部命中");
+        assert!(!hit_shape(&m, Pt::new(60, 20), 4), "外部不命中");
+        // 与矩形一致可缩放：角上有控制柄
+        assert_eq!(hit_handle(&m, Pt::new(50, 30), 5), Some(Handle::SE));
+
+        let h = Shape::Highlight {
+            bbox: Rect::new(10, 10, 40, 20),
+            color: super::super::style::HIGHLIGHT,
+            mode: super::super::style::HighlightMode::Marker,
+        };
+        assert!(hit_shape(&h, Pt::new(30, 20), 4));
+    }
+
+    #[test]
+    fn ellipse_hit_inside_but_not_corner() {
+        // 100×100 外接盒 → 内切圆，半径 50
+        let e = Shape::Ellipse {
+            bbox: Rect::new(0, 0, 100, 100),
+            style: StrokeStyle {
+                color: DEF_STROKE,
+                width: 2,
+            },
+        };
+        assert!(hit_shape(&e, Pt::new(50, 50), 0), "中心命中");
+        // 左上角在盒内但在椭圆外
+        assert!(!hit_shape(&e, Pt::new(3, 3), 0), "角落在椭圆外");
+    }
+
+    #[test]
+    fn line_and_pen_hit_by_distance() {
+        let line = Shape::Line {
+            from: Pt::new(0, 0),
+            to: Pt::new(100, 0),
+            style: StrokeStyle {
+                color: DEF_STROKE,
+                width: 2,
+            },
+        };
+        assert!(hit_shape(&line, Pt::new(50, 2), 4));
+        assert!(!hit_shape(&line, Pt::new(50, 20), 4));
+
+        let pen = Shape::Pen {
+            pts: vec![Pt::new(0, 0), Pt::new(50, 0), Pt::new(50, 50)],
+            style: super::super::style::PenStyle {
+                color: DEF_STROKE,
+                width: 2,
+                kind: super::super::style::PenKind::Solid,
+            },
+        };
+        assert!(hit_shape(&pen, Pt::new(25, 3), 4), "命中第一段附近");
+        assert!(hit_shape(&pen, Pt::new(52, 30), 4), "命中第二段附近");
+        assert!(!hit_shape(&pen, Pt::new(90, 90), 4), "远离轨迹不命中");
+        // 单点轨迹不 panic 且不命中
+        let dot = Shape::Pen {
+            pts: vec![Pt::new(1, 1)],
+            style: super::super::style::PenStyle {
+                color: DEF_STROKE,
+                width: 2,
+                kind: super::super::style::PenKind::Solid,
+            },
+        };
+        assert!(!hit_shape(&dot, Pt::new(1, 1), 4));
+    }
+
+    #[test]
+    fn text_hits_by_est_bbox_and_has_no_handle() {
+        let t = Shape::Text {
+            origin: Pt::new(10, 10),
+            text: "ab".into(),
+            bbox: Rect::new(10, 10, 24, 29),
+            style: super::super::style::TextStyle {
+                color: super::super::style::DEF_STROKE,
+                font_px: 20,
+                bold: false,
+                italic: false,
+            },
+            frame: super::super::style::TextFrame::None,
+            attach: None,
+        };
+        assert!(hit_shape(&t, Pt::new(20, 20), 4), "内部命中");
+        assert!(!hit_shape(&t, Pt::new(60, 20), 4), "外部不命中");
+        assert_eq!(hit_handle(&t, Pt::new(34, 39), 5), None, "文字无缩放柄");
     }
 }

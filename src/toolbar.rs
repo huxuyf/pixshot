@@ -4,15 +4,19 @@
 //! 皮肤固定深色（见 `theme::toolbar_skin`），布局按窗口 DPI 换算并在 `WM_DPICHANGED` 重排。
 //!
 //! 按钮为**纯图标**（矢量自绘，见 [`crate::icons`]），依次为
-//! 贴图 / 保存图像 / 复制并关闭 / 复制识别到的文字 / 关闭；
+//! 贴图 / 保存图像 / 复制并关闭 / 复制识别到的文字 / 矩形 / 箭头 / 步骤序号 /
+//! 椭圆 / 线段 / 画笔 / 马赛克 / 高亮 / 文字 / 关闭；
 //! 悬停延时后在图标上方弹出提示气泡（[`crate::tooltip`]）。
 //!
 //! 控件 ID 保持稳定（E2E 用 `Find-ChildById` 定位，见 `scripts/gui_e2e_*.ps1`）：
-//! 1=贴图 / 2=复制 / 3=保存 / 4=OCR / 5=关闭；标注工具 6=矩形 / 7=箭头 / 8=步骤序号。
+//! 1=贴图 / 2=复制 / 3=保存 / 4=OCR / 5=关闭；标注工具 6=矩形 / 7=箭头 / 8=步骤序号 /
+//! 9=马赛克 / 10=高亮 / 11=文字；新增图形 12=椭圆 / 13=线段 / 14=画笔。
 //!
-//! 标注（见设计文档 1.2 D/E / 5.5）：新增的三个工具按钮把当前工具经
-//! `WM_APP_SET_TOOL` 投递给冻结层，并按冻结层回传的 `WM_APP_TOOL_CHANGED` 高亮；
-//! 贴图/复制/保存三个动作在导出前先经 [`crate::annot::composite`] 合成标注。
+//! 标注（见设计文档 1.2 D/E / 5.5）：工具按钮把当前工具经 `WM_APP_SET_TOOL`
+//! 投递给冻结层，并按冻结层回传的 `WM_APP_TOOL_CHANGED` 高亮；文字输入经
+//! `WM_APP_CHAR` 转发 `WM_CHAR`（输入中字母键放行为正文，不当工具快捷键，
+//! 见 `WM_APP_QUERY_TYPING`）；贴图/复制/保存/OCR 动作在导出前先经
+//! [`crate::annot::composite`] 合成标注，且先 `commit_typing` 完成输入中的文字。
 
 use std::sync::Arc;
 
@@ -21,7 +25,8 @@ use crate::capture::{self, CapturedImage};
 use crate::config;
 use crate::error::{AppError, Result};
 use crate::overlay::{
-    Selection, WM_APP_ESC_CLOSE, WM_APP_KEY, WM_APP_SET_TOOL, WM_APP_TOOL_CHANGED,
+    Selection, WM_APP_CHAR, WM_APP_ESC_CLOSE, WM_APP_KEY, WM_APP_QUERY_TYPING, WM_APP_SET_TOOL,
+    WM_APP_TOOL_CHANGED,
 };
 use crate::theme;
 use crate::util::{self, add_button, raw, register_class_w, BtnStyle};
@@ -48,8 +53,16 @@ const BTN_CLOSE: usize = 5;
 const BTN_RECT: usize = 6;
 const BTN_ARROW: usize = 7;
 const BTN_STEP: usize = 8;
+/// 标注工具按钮 ID 扩展：马赛克 / 高亮 / 文字。
+const BTN_MOSAIC: usize = 9;
+const BTN_HIGHLIGHT: usize = 10;
+const BTN_TEXT: usize = 11;
+/// 新增图形工具按钮 ID：椭圆 / 线段 / 画笔（追加在末尾，保持既有 ID 稳定）。
+const BTN_ELLIPSE: usize = 12;
+const BTN_LINE: usize = 13;
+const BTN_PEN: usize = 14;
 /// 按钮在窗口内的从左到右排列顺序（图标顺序 = 需求给定顺序）
-const BTN_ORDER: [usize; 8] = [
+const BTN_ORDER: [usize; 14] = [
     BTN_PIN,
     BTN_SAVE,
     BTN_COPY,
@@ -57,10 +70,16 @@ const BTN_ORDER: [usize; 8] = [
     BTN_RECT,
     BTN_ARROW,
     BTN_STEP,
+    BTN_ELLIPSE,
+    BTN_LINE,
+    BTN_PEN,
+    BTN_MOSAIC,
+    BTN_HIGHLIGHT,
+    BTN_TEXT,
     BTN_CLOSE,
 ];
 /// 各按钮的悬停提示文字（与 [`BTN_ORDER`] 一一对应）
-const TIP_TEXTS: [&str; 8] = [
+const TIP_TEXTS: [&str; 14] = [
     "贴图",
     "保存图像",
     "复制并关闭",
@@ -68,12 +87,33 @@ const TIP_TEXTS: [&str; 8] = [
     "矩形",
     "箭头",
     "步骤序号",
+    "椭圆",
+    "线段",
+    "画笔",
+    "马赛克",
+    "高亮",
+    "文字",
     "关闭",
 ];
 /// 各按钮的快捷键（与 [`BTN_ORDER`] 一一对应，显示在提示文字之后）
-const SHORTCUTS: [&str; 8] = ["Ctrl+T", "Ctrl+S", "Ctrl+C", "Ctrl+O", "R", "A", "N", "Esc"];
+const SHORTCUTS: [&str; 14] = [
+    "Ctrl+T",
+    "Ctrl+S",
+    "Ctrl+C",
+    "Ctrl+O",
+    "R",
+    "A",
+    "N",
+    "E",
+    "L",
+    "P",
+    "B",
+    "H",
+    "T",
+    "Esc",
+];
 /// 悬停后弹出提示气泡的延时（毫秒）
-const TIP_DELAY_MS: u32 = 450;
+/// 悬停提示延时（毫秒）由配置提供，见 config.ini [ui] tooltip_delay_ms。
 /// 提示气泡定时器 ID
 const TIMER_TIP: usize = 779;
 /// VK_ESCAPE（关闭）/ VK_T / VK_S / VK_C / VK_O（配合 Ctrl 触发对应动作）
@@ -82,10 +122,16 @@ const VK_T: usize = 0x54;
 const VK_S: usize = 0x53;
 const VK_C: usize = 0x43;
 const VK_O: usize = 0x4F;
-/// 标注工具键：R=矩形 / A=箭头 / N=步骤序号（无 Ctrl，见 5.5）
+/// 标注工具键：R=矩形 / A=箭头 / N=步骤序号 / E=椭圆 / L=线段 / P=画笔 /
+/// B=马赛克 / H=高亮（无 Ctrl，见 5.5）；T 在无 Ctrl 时 = 文字工具（有 Ctrl 时 = 贴图）。
 const VK_R: usize = 0x52;
 const VK_A: usize = 0x41;
 const VK_N: usize = 0x4E;
+const VK_E: usize = 0x45;
+const VK_L: usize = 0x4C;
+const VK_P: usize = 0x50;
+const VK_B: usize = 0x42;
+const VK_H: usize = 0x48;
 /// 撤销/重做/删除：Ctrl+Z / Ctrl+Y / Delete（转发给冻结层，见 5.5）
 const VK_Z: usize = 0x5A;
 const VK_Y: usize = 0x59;
@@ -162,7 +208,7 @@ unsafe fn run_impl(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()>
 
     let data = Box::into_raw(Box::new(ToolbarData {
         image,
-        buttons: [HWND::default(); 8],
+        buttons: [HWND::default(); 14],
         skin: theme::toolbar_skin(),
         backdrop: false,
         fx: util::HoverFx::new(),
@@ -433,6 +479,14 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             handle_shortcut(hwnd, wp.0);
             LRESULT(0)
         }
+        // 字符输入（TranslateMessage 生成）：全部转发给冻结层（文字标注）。
+        // 冻结层仅在文字输入中消费（追加/换行/退格）；非输入时为无操作。
+        WM_CHAR => {
+            if let Some(d) = data_of(hwnd) {
+                let _ = PostMessageW(d.overlay, WM_APP_CHAR, wp, LPARAM(0));
+            }
+            LRESULT(0)
+        }
         // 拖动工具条（点在按钮行以外的 HTCAPTION 区）时立即收起气泡
         WM_NCLBUTTONDOWN => {
             if let Some(d) = data_of(hwnd) {
@@ -555,7 +609,8 @@ unsafe fn draw_icon_frame(
 /// 处理工具条快捷键。返回 true 表示已消费该按键。
 ///
 /// 映射（见 5.5）：Esc / Ctrl+Z / Ctrl+Y / Delete → 转发冻结层 `WM_APP_KEY`；
-/// R/A/N（无 Ctrl）→ 工具切换；Ctrl+T/S/C/O → 贴图/保存/复制/OCR。
+/// R/A/N/B/H/T（无 Ctrl）→ 工具切换；Ctrl+T/S/C/O → 贴图/保存/复制/OCR。
+/// **文字输入中**字母键放行（返回 false），让 WM_CHAR 流向冻结层作正文输入。
 unsafe fn handle_shortcut(hwnd: HWND, vk: usize) -> bool {
     let Some(d) = data_of(hwnd) else {
         return false;
@@ -585,17 +640,13 @@ unsafe fn handle_shortcut(hwnd: HWND, vk: usize) -> bool {
             handle_command(hwnd, BTN_OCR);
             true
         }
-        // 标注工具键（无 Ctrl）
-        VK_R if !ctrl_down() => {
-            handle_command(hwnd, BTN_RECT);
-            true
-        }
-        VK_A if !ctrl_down() => {
-            handle_command(hwnd, BTN_ARROW);
-            true
-        }
-        VK_N if !ctrl_down() => {
-            handle_command(hwnd, BTN_STEP);
+        // 标注工具键（无 Ctrl）。文字输入中放行：字母是正文，不是工具键
+        // （同步查询冻结层；输入中返回 false 不消费，WM_CHAR 随后流向冻结层）
+        VK_R | VK_A | VK_N | VK_E | VK_L | VK_P | VK_B | VK_H | VK_T if !ctrl_down() => {
+            if overlay_typing(overlay) {
+                return false;
+            }
+            handle_command(hwnd, button_id_for_key(vk));
             true
         }
         // 撤销/重做：Ctrl+Z / Ctrl+Y（转发冻结层）
@@ -615,6 +666,28 @@ unsafe fn handle_shortcut(hwnd: HWND, vk: usize) -> bool {
     }
 }
 
+/// 工具键 VK → 按钮控件 ID。
+fn button_id_for_key(vk: usize) -> usize {
+    match vk {
+        VK_R => BTN_RECT,
+        VK_A => BTN_ARROW,
+        VK_N => BTN_STEP,
+        VK_E => BTN_ELLIPSE,
+        VK_L => BTN_LINE,
+        VK_P => BTN_PEN,
+        VK_B => BTN_MOSAIC,
+        VK_H => BTN_HIGHLIGHT,
+        VK_T => BTN_TEXT,
+        _ => 0,
+    }
+}
+
+/// 冻结层是否处于文字输入中（同步查询；冻结层不可达视为否）。
+unsafe fn overlay_typing(overlay: HWND) -> bool {
+    overlay.0 as usize != 0
+        && SendMessageW(overlay, WM_APP_QUERY_TYPING, WPARAM(0), LPARAM(0)).0 != 0
+}
+
 /// 控件 ID → 图标。
 fn icon_of(id: usize) -> icons::Icon {
     match id {
@@ -625,6 +698,12 @@ fn icon_of(id: usize) -> icons::Icon {
         BTN_RECT => icons::Icon::Rect,
         BTN_ARROW => icons::Icon::Arrow,
         BTN_STEP => icons::Icon::StepNo,
+        BTN_ELLIPSE => icons::Icon::Ellipse,
+        BTN_LINE => icons::Icon::Line,
+        BTN_PEN => icons::Icon::Pen,
+        BTN_MOSAIC => icons::Icon::Mosaic,
+        BTN_HIGHLIGHT => icons::Icon::Highlight,
+        BTN_TEXT => icons::Icon::Text,
         _ => icons::Icon::Close,
     }
 }
@@ -635,6 +714,12 @@ fn button_id_tool(id: usize) -> annot::Tool {
         BTN_RECT => annot::Tool::Rect,
         BTN_ARROW => annot::Tool::Arrow,
         BTN_STEP => annot::Tool::StepNo,
+        BTN_ELLIPSE => annot::Tool::Ellipse,
+        BTN_LINE => annot::Tool::Line,
+        BTN_PEN => annot::Tool::Pen,
+        BTN_MOSAIC => annot::Tool::Mosaic,
+        BTN_HIGHLIGHT => annot::Tool::Highlight,
+        BTN_TEXT => annot::Tool::Text,
         _ => annot::Tool::None,
     }
 }
@@ -645,6 +730,12 @@ fn tool_button_id_from_wp(v: usize) -> usize {
         1 => BTN_RECT,
         2 => BTN_ARROW,
         3 => BTN_STEP,
+        4 => BTN_ELLIPSE,
+        5 => BTN_LINE,
+        6 => BTN_PEN,
+        7 => BTN_MOSAIC,
+        8 => BTN_HIGHLIGHT,
+        9 => BTN_TEXT,
         _ => 0,
     }
 }
@@ -752,13 +843,15 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         // 关闭：不执行任何操作，直接收起工具条（与按 Esc 等价）
         BTN_CLOSE => close_bar(hwnd),
         // 工具按钮：把工具投递给冻结层；高亮由冻结层回传的 TOOL_CHANGED 同步
-        BTN_RECT | BTN_ARROW | BTN_STEP => {
+        BTN_RECT | BTN_ARROW | BTN_STEP | BTN_ELLIPSE | BTN_LINE | BTN_PEN | BTN_MOSAIC
+        | BTN_HIGHLIGHT | BTN_TEXT => {
             let Some(d) = data_of(hwnd) else { return };
             let tool = button_id_tool(id);
             let _ = PostMessageW(d.overlay, WM_APP_SET_TOOL, WPARAM(tool as usize), LPARAM(0));
         }
         BTN_PIN => {
             let Some(d) = data_of(hwnd) else { return };
+            commit_typing_if_any(d);
             let img = compose(d);
             match pin::create(&img) {
                 Ok(_) => close_bar(hwnd),
@@ -767,9 +860,13 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         BTN_COPY => {
             let Some(d) = data_of(hwnd) else { return };
+            commit_typing_if_any(d);
             let img = compose(d);
+            // 双格式（参照 SnowShot）：CF_DIB（主）+ 注册的 "PNG" 格式
+            // （现代应用粘贴优先取用 PNG）；编码失败只降级为 CF_DIB。
+            let png = imageio::encode_png(&img.data, img.width, img.height).ok();
             // Arc 共享像素，copy_image 直接读切片，不再整幅复制
-            match clipboard::copy_image(&img.data, img.width, img.height) {
+            match clipboard::copy_image_with_png(&img.data, img.width, img.height, png.as_deref()) {
                 Ok(()) => {
                     crate::toast::show("已复制图像到剪贴板");
                     close_bar(hwnd);
@@ -779,6 +876,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         BTN_SAVE => {
             let Some(d) = data_of(hwnd) else { return };
+            commit_typing_if_any(d);
             let cfg = config::get();
             let img = compose(d);
             match imageio::save_with_dialog(
@@ -805,11 +903,26 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             let Some(d) = data_of(hwnd) else { return };
             // 后台识别 → 直接写剪贴板 → 由主窗口弹 Toast（不弹结果窗口）。
             // 与贴图右键菜单的「识别文字 (OCR)」共用 ocr::recognize_to_clipboard_async。
-            ocr::recognize_to_clipboard_async(Arc::clone(&d.image.data), d.image.width, d.image.height);
+            commit_typing_if_any(d);
+            let img = compose(d);
+            ocr::recognize_to_clipboard_async(
+                Arc::clone(&img.data),
+                img.width,
+                img.height,
+            );
             close_bar(hwnd);
         }
         _ => {}
     }
+}
+
+/// 导出动作前完成输入中的文字（若有）：把瞬态正文落入标注文档，避免导出丢文字。
+/// 冻结层不可达（直接模式的异常路径）时跳过。
+unsafe fn commit_typing_if_any(d: &ToolbarData) {
+    if d.sel.is_null() {
+        return;
+    }
+    (*d.sel).commit_typing();
 }
 
 #[cfg(test)]
