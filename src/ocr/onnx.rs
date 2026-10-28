@@ -21,14 +21,8 @@ use super::engine::{OcrEngineImpl, TextLine};
 use super::onnx_image as im;
 use crate::error::{AppError, Result};
 
-/// 检测输入长边上限（PaddleOCR 常用 960）。
-const DET_LIMIT: usize = 960;
-/// 概率图二值化阈值。
-const DET_THRESH: f32 = 0.3;
-/// 文本框平均概率下限。
-const BOX_THRESH: f32 = 0.6;
-/// DB unclip 扩张系数。
-const UNCLIP_RATIO: f32 = 1.5;
+// 检测输入长边上限、概率图二值化阈值、文本框平均概率下限、DB unclip 扩张系数
+// 均由配置提供（config.ini [ocr] det_limit / det_thresh / box_thresh / unclip_ratio）。
 
 // ─────────────────────────────────────────────────────────────────
 // 路径解析与运行时初始化
@@ -164,8 +158,9 @@ impl OcrEngineImpl for OnnxEngine {
         let m = models()?;
         let rgb = im::bgra_to_rgb(bgra, w, h);
 
+        let cfg = crate::config::get();
         // ① 文本检测
-        let det_in = im::det_input(&rgb, DET_LIMIT);
+        let det_in = im::det_input(&rgb, cfg.ocr_det_limit);
         let xt = Tensor::from_array((vec![1i64, 3, det_in.h as i64, det_in.w as i64], det_in.data))
             .map_err(|e| AppError::Ocr(format!("构造检测输入失败: {e}")))?;
         let boxes = {
@@ -178,7 +173,14 @@ impl OcrEngineImpl for OnnxEngine {
                 .map_err(|e| AppError::Ocr(format!("读取检测输出失败: {e}")))?;
             let dh = shape[2] as usize;
             let dw = shape[3] as usize;
-            im::det_boxes(prob, dw, dh, DET_THRESH, BOX_THRESH, UNCLIP_RATIO)
+            im::det_boxes(
+                prob,
+                dw,
+                dh,
+                cfg.ocr_det_thresh,
+                cfg.ocr_box_thresh,
+                cfg.ocr_unclip_ratio,
+            )
         };
         // 换算回原图坐标，并按行合并相邻框
         let mut rects: Vec<(i32, i32, i32, i32)> = boxes

@@ -65,8 +65,12 @@ static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// 「按下热键那一刻」的整屏预捕获快照（见 [`precapture`] 的时序说明）。
 static PRECAPTURE: Mutex<Option<(Instant, Arc<CapturedImage>)>> = Mutex::new(None);
-/// 预捕获快照的有效期：超过即视为过期（热键被流程占用时可能没人消费它）。
-const PRECAPTURE_TTL: Duration = Duration::from_secs(1);
+
+/// 预捕获快照的有效期（毫秒）来自配置（config.ini [tray] precapture_ttl_ms）；
+/// 超过即视为过期（热键被流程占用时可能没人消费它）。
+fn precapture_ttl() -> Duration {
+    Duration::from_millis(crate::config::get().tray_precapture_ttl_ms)
+}
 
 /// 工具栏「OCR 识别」完成后通知主窗口的私有消息（`WPARAM` = `OCR_DONE_*`）。
 pub const WM_APP_OCR_DONE: u32 = WM_APP + 8;
@@ -283,7 +287,7 @@ fn key_down(vk: i32) -> bool {
 pub fn take_precapture() -> Option<Arc<CapturedImage>> {
     let mut g = PRECAPTURE.lock().ok()?;
     match g.take() {
-        Some((t, img)) if t.elapsed() <= PRECAPTURE_TTL => Some(img),
+        Some((t, img)) if t.elapsed() <= precapture_ttl() => Some(img),
         _ => None,
     }
 }

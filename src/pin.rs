@@ -4,7 +4,7 @@
 //! 右键菜单（复制图像 / 保存（按配置格式）/ OCR / 重置缩放 / 关闭）、Esc 关闭。
 //!
 //! 窗口采用 `WS_EX_LAYERED` + `UpdateLayeredWindow`（逐像素 alpha）：窗口比图像
-//! 四周各多出一圈留白（[`SHADOW_MARGIN_LOGICAL`]），留白内自绘柔和投影，投影之外
+//! 四周各多出一圈留白（`pin_shadow_margin`），留白内自绘柔和投影，投影之外
 //! 完全透明（alpha=0，鼠标穿透）。之所以不用 `CS_DROPSHADOW`：其阴影由 DWM 绘制且
 //! 只在窗口处于活动状态时出现，贴图作为常驻置顶窗口绝大多数时间非活动，实测无阴影；
 //! 自绘投影不依赖系统启发式，且能与图像一起原子移动（拖动时阴影不落后）。
@@ -43,15 +43,10 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-const MIN_SCALE: f32 = 0.05;
-const MAX_SCALE: f32 = 8.0;
-
 const VK_ESCAPE: usize = 0x1B;
 
-/// 阴影留白（逻辑像素）——按窗口所在显示器 DPI 换算成设备像素。
-const SHADOW_MARGIN_LOGICAL: i32 = 16;
-/// 紧贴图像边缘处的投影峰值不透明度。
-const SHADOW_PEAK: f32 = 0.55;
+// 贴图缩放上下限、阴影留白/峰值、滚轮步进、初始贴合比例均由配置提供
+// （见 config.ini [pin]）。
 
 /// 每个贴图窗口的私有数据（指针存在 GWLP_USERDATA，WM_DESTROY 时释放）。
 pub struct PinData {
@@ -69,7 +64,7 @@ pub struct PinData {
 
 /// 逻辑留白 → 设备像素（钳制，避免极端 DPI 下留白过大/过小）。
 fn margin_for_dpi(dpi: u32) -> i32 {
-    (SHADOW_MARGIN_LOGICAL * dpi.max(96) as i32 / 96).clamp(6, 64)
+    (crate::config::get().pin_shadow_margin * dpi.max(96) as i32 / 96).clamp(6, 64)
 }
 
 /// 贴图在截图点所在显示器上的 DPI（拿不到时按 96 处理）。
@@ -101,13 +96,14 @@ unsafe fn create_impl(img: &CapturedImage) -> Result<HWND> {
     register_class_w("PixShotPin", pin_proc, false, false, true); // CS_DBLCLKS：双击退出贴图
     let hinst = GetModuleHandleW(None).unwrap_or_default();
 
-    // 初始缩放：不放大、不超过主屏 85%
+    // 初始缩放：不放大、不超过主屏配置比例（默认 85%）
+    let cfg = crate::config::get();
     let sw = GetSystemMetrics(SM_CXSCREEN).max(1);
     let sh = GetSystemMetrics(SM_CYSCREEN).max(1);
-    let fit = (sw as f32 * 0.85 / img.width as f32)
-        .min(sh as f32 * 0.85 / img.height as f32)
+    let fit = (sw as f32 * cfg.pin_fit_ratio / img.width as f32)
+        .min(sh as f32 * cfg.pin_fit_ratio / img.height as f32)
         .min(1.0)
-        .max(MIN_SCALE);
+        .max(cfg.pin_min_scale);
     let margin = margin_for_dpi(monitor_dpi_at(img.x, img.y));
 
     let data = Box::into_raw(Box::new(PinData {
@@ -289,8 +285,13 @@ unsafe fn zoom(hwnd: HWND, wp: WPARAM) {
     if delta == 0 {
         return;
     }
-    let factor = if delta > 0 { 1.1f32 } else { 1.0f32 / 1.1 };
-    let new_scale = (data.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+    let cfg = crate::config::get();
+    let factor = if delta > 0 {
+        cfg.pin_zoom_step
+    } else {
+        1.0 / cfg.pin_zoom_step
+    };
+    let new_scale = (data.scale * factor).clamp(cfg.pin_min_scale, cfg.pin_max_scale);
     if (new_scale - data.scale).abs() < 1e-4 {
         return;
     }
@@ -466,7 +467,8 @@ unsafe fn fill_shadow(bits: *mut u8, cw: i32, m: i32, iw: i32, ih: i32) {
                 };
                 let d = ((dx * dx + dy * dy) as f32).sqrt();
                 let t = (d * inv_m).min(1.0);
-                let alpha = (255.0 * SHADOW_PEAK * (1.0 - t) * (1.0 - t)).round() as u8;
+                let alpha =
+                    (255.0 * crate::config::get().pin_shadow_peak * (1.0 - t) * (1.0 - t)).round() as u8;
                 if alpha == 0 {
                     continue;
                 }
@@ -641,6 +643,12 @@ fn short_path(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 与默认配置对齐的固定值（保证测试确定性，不依赖 config.ini）。
+    const MIN_SCALE: f32 = 0.05;
+    const MAX_SCALE: f32 = 8.0;
+    const SHADOW_MARGIN_LOGICAL: i32 = 16;
+    const SHADOW_PEAK: f32 = 0.55;
 
     #[test]
     fn short_path_keeps_file_name_only() {

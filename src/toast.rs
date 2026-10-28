@@ -82,12 +82,13 @@ unsafe fn place(hwnd: HWND) {
     let text = &buf[..(n as usize).min(255)];
 
     let dpi = util::dpi_of(hwnd).max(GetDpiForSystem() as i32);
-    let pad_x = util::scaled(16, dpi);
-    let pad_y = util::scaled(9, dpi);
+    let cfg = crate::config::get();
+    let pad_x = util::scaled(cfg.ui_toast_pad_x, dpi);
+    let pad_y = util::scaled(cfg.ui_toast_pad_y, dpi);
 
     // 用 GDI 精确测量（中英文混排时按字符数估算会明显偏差）
     let hdc = GetDC(hwnd);
-    let font = util::gui_font(hwnd, 10, 400);
+    let font = util::gui_font(hwnd, cfg.ui_toast_font_pt, 400);
     let old = SelectObject(hdc, font);
     let mut r = RECT::default();
     let _ = raw::DrawTextW(
@@ -106,7 +107,7 @@ unsafe fn place(hwnd: HWND) {
     let mut pt = windows::Win32::Foundation::POINT::default();
     let _ = GetCursorPos(&mut pt);
     let (vx, vy, vw, vh) = crate::capture::virtual_screen_rect();
-    let gap = util::scaled(18, dpi);
+    let gap = util::scaled(cfg.ui_toast_gap, dpi);
     let mut x = pt.x + gap;
     let mut y = pt.y + gap;
     if x + w > vx + vw {
@@ -170,14 +171,15 @@ unsafe fn paint(hwnd: HWND) {
     let (w, h) = (cr.right, cr.bottom);
     let dpi = util::dpi_of(hwnd);
 
-    // 固定深色卡片：提示条出现在任意壁纸上，深底白字更稳
-    let bg = COLORREF(0x002B_2B2B);
+    // 固定深色卡片：提示条出现在任意壁纸上，深底白字更稳（配色见 config.ini [ui]）
+    let cfg = crate::config::get();
+    let bg = COLORREF(crate::config::colorref_raw(cfg.ui_toast_bg));
     let brush = CreateSolidBrush(bg);
-    let pen = CreatePen(PS_SOLID, 1, COLORREF(0x0045_4545));
+    let pen = CreatePen(PS_SOLID, 1, COLORREF(crate::config::colorref_raw(cfg.ui_toast_border)));
     let ob = SelectObject(hdc, brush);
     let op = SelectObject(hdc, pen);
     let _ = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    let radius = util::scaled(8, dpi);
+    let radius = util::scaled(cfg.ui_toast_radius, dpi);
     let _ = RoundRect(hdc, 0, 0, w, h, radius * 2, radius * 2);
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
@@ -187,10 +189,10 @@ unsafe fn paint(hwnd: HWND) {
     let mut buf = [0u16; 256];
     let n = GetWindowTextW(hwnd, &mut buf);
     if n > 0 {
-        let font = util::gui_font(hwnd, 10, 400);
+        let font = util::gui_font(hwnd, cfg.ui_toast_font_pt, 400);
         let old = SelectObject(hdc, font);
         raw::SetBkMode(hdc.0 as isize, 1);
-        raw::SetTextColor(hdc.0 as isize, COLORREF(0x00F5_F5F5));
+        raw::SetTextColor(hdc.0 as isize, COLORREF(crate::config::colorref_raw(cfg.ui_toast_text)));
         let mut r = RECT {
             left: 0,
             top: 0,

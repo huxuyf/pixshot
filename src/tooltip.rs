@@ -22,13 +22,17 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 气泡窗口类名。
 const CLASS: &str = "PixShotTip";
-/// 内边距（逻辑像素）。
-const PAD_X: i32 = 10;
-const PAD_Y: i32 = 6;
-/// 气泡与所指向按钮的间距（逻辑像素）。
-const GAP: i32 = 8;
-/// 文本最大宽度（逻辑像素），超出裁切。
-const MAX_W: i32 = 420;
+/// 内边距 / 与按钮间距 / 最大宽度（逻辑像素）由配置提供，见 config.ini [ui] 的
+/// tooltip_pad_x / tooltip_pad_y / tooltip_gap / tooltip_max_width。
+fn metrics() -> (i32, i32, i32, i32) {
+    let c = crate::config::get();
+    (
+        c.ui_tooltip_pad_x,
+        c.ui_tooltip_pad_y,
+        c.ui_tooltip_gap,
+        c.ui_tooltip_max_width,
+    )
+}
 
 /// 气泡窗口私有数据（经 GWLP_USERDATA 持有，WM_NCDESTROY 释放）。
 struct TipData {
@@ -99,6 +103,7 @@ impl Tip {
         let Some(d) = data_of(self.hwnd) else { return };
         let dpi = util::dpi_of(self.hwnd);
         let s = |v: i32| util::scaled(v, dpi);
+        let (pad_x, pad_y, gap, max_w) = metrics();
         d.label = util::to_wide(label);
         d.suffix = util::to_wide(&format!("（{shortcut}）"));
         // 窗口标题 = 完整文案：可访问性/自动化可直接读到气泡内容（E2E 依赖）
@@ -113,7 +118,7 @@ impl Tip {
             let mut tr = RECT {
                 left: 0,
                 top: 0,
-                right: s(MAX_W),
+                right: s(max_w),
                 bottom: 0,
             };
             let _ = raw::DrawTextW(
@@ -134,18 +139,18 @@ impl Tip {
         let tw = lw + sw;
         let th = lh.max(sh);
         let (w, h) = (
-            (tw + s(PAD_X) * 2).min(s(MAX_W)),
-            th + s(PAD_Y) * 2,
+            (tw + s(pad_x) * 2).min(s(max_w)),
+            th + s(pad_y) * 2,
         );
 
         // 优先显示在按钮上方居中；越界则改到下方；再钳制回显示器工作区
         let (mut x, mut y) = (
             anchor.left + ((anchor.right - anchor.left) - w) / 2,
-            anchor.top - s(GAP) - h,
+            anchor.top - s(gap) - h,
         );
         let mi = monitor_work(anchor);
         if y < mi.top {
-            y = anchor.bottom + s(GAP);
+            y = anchor.bottom + s(gap);
         }
         x = x.clamp(mi.left, (mi.right - w).max(mi.left));
         y = y.clamp(mi.top, (mi.bottom - h).max(mi.top));
@@ -266,8 +271,9 @@ unsafe fn paint_card(hwnd: HWND, hdc: HDC, cw: i32, ch: i32, d: &TipData) {
         let font = util::gui_font(hwnd, 9, 400);
         let old_font = SelectObject(hdc, font);
         raw::SetBkMode(hdc.0 as isize, 1);
-        let pad_x = util::scaled(PAD_X, dpi);
-        let pad_y = util::scaled(PAD_Y, dpi);
+        let (mpad_x, mpad_y, _, mmax_w) = metrics();
+        let pad_x = util::scaled(mpad_x, dpi);
+        let pad_y = util::scaled(mpad_y, dpi);
         let single = |text: &[u16], x: i32, color: windows::Win32::Foundation::COLORREF| {
             raw::SetTextColor(hdc.0 as isize, color);
             let mut tr = RECT {
@@ -288,7 +294,7 @@ unsafe fn paint_card(hwnd: HWND, hdc: HDC, cw: i32, ch: i32, d: &TipData) {
         let mut calc = RECT {
             left: 0,
             top: 0,
-            right: util::scaled(MAX_W, dpi),
+            right: util::scaled(mmax_w, dpi),
             bottom: 0,
         };
         let _ = raw::DrawTextW(

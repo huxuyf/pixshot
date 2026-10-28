@@ -139,26 +139,29 @@ const VK_DELETE: usize = 0x2E;
 /// VK_CONTROL（GetKeyState 读物理按键状态）
 const VK_CONTROL: i32 = 0x11;
 
-/// 图标按钮边长（逻辑像素）——方形，紧凑。
-const TB_BTN_SZ: i32 = 32;
-/// 按钮之间的间隔（逻辑像素）。
-const TB_GAP: i32 = 2;
-/// 按钮到窗口上下边缘的内边距（逻辑像素，上下一致，见 `layout`）。
-const TB_PAD_V: i32 = 6;
-/// 按钮到窗口左右边缘的内边距（逻辑像素）。
-const TB_PAD_H: i32 = 6;
-/// 逻辑客户区尺寸（96 DPI 基准）：仅容纳一行方形图标按钮，力求紧凑。
-/// （设计文档 5.5 记为 286，按同一常量公式计算实为 282，此处以公式为准。）
-const TB_W: i32 = TB_BTN_SZ * 8 + TB_GAP * 7 + TB_PAD_H * 2; // 282
-/// 高度 = 上内边距 + 按钮 + 下内边距。
-const TB_H: i32 = TB_PAD_V * 2 + TB_BTN_SZ; // 44
-/// 窗口圆角半径（逻辑像素）。
-const TB_RADIUS: i32 = 8;
+/// 工具栏布局尺寸来自配置（逻辑像素，96 DPI 基准），见 config.ini [ui] 段。
+fn btn_sz() -> i32 {
+    crate::config::get().ui_toolbar_btn_size
+}
+fn gap_l() -> i32 {
+    crate::config::get().ui_toolbar_gap
+}
+fn radius_l() -> i32 {
+    crate::config::get().ui_toolbar_radius
+}
+/// 逻辑客户区尺寸：仅容纳一行方形图标按钮，力求紧凑。
+fn logical_size() -> (i32, i32) {
+    let c = crate::config::get();
+    let n = BTN_ORDER.len() as i32;
+    let w = c.ui_toolbar_btn_size * n + c.ui_toolbar_gap * (n - 1) + c.ui_toolbar_pad_h * 2;
+    let h = c.ui_toolbar_pad_v * 2 + c.ui_toolbar_btn_size;
+    (w, h)
+}
 
 struct ToolbarData {
     image: Arc<CapturedImage>,
-    /// 八个图标按钮，顺序见 [`BTN_ORDER`]
-    buttons: [HWND; 8],
+    /// 图标按钮，顺序见 [`BTN_ORDER`]
+    buttons: [HWND; 14],
     /// 工具栏皮肤：固定深色
     skin: theme::Theme,
     /// Mica 背景是否启用（工具栏固定深色为纯色面，恒为 false）
@@ -199,7 +202,8 @@ unsafe fn run_impl(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()>
     register_class_w("PixShotToolbar", toolbar_proc, false, false, false);
 
     let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as i32;
-    let (tw, th) = (util::scaled(TB_W, dpi), util::scaled(TB_H, dpi));
+    let (lw, lh) = logical_size();
+    let (tw, th) = (util::scaled(lw, dpi), util::scaled(lh, dpi));
 
     // 定位在选区下方 8px，水平对齐选区中线，越界则钳制回虚拟屏幕内
     let (vx, vy, vw, vh) = capture::virtual_screen_rect();
@@ -272,12 +276,12 @@ unsafe fn layout(hwnd: HWND) {
     let dpi = util::dpi_of(hwnd);
     let s = |v: i32| util::scaled(v, dpi);
     // 窗口尚未成尺寸时先不动（避免控件堆在 (0,0)）
-    if cw < s(TB_BTN_SZ) || ch < s(TB_BTN_SZ) {
+    if cw < s(btn_sz()) || ch < s(btn_sz()) {
         return;
     }
 
-    let btn = s(TB_BTN_SZ);
-    let gap = s(TB_GAP);
+    let btn = s(btn_sz());
+    let gap = s(gap_l());
     let n = d.buttons.len() as i32;
     // 水平居中：两侧留白均分剩余空间（窗口即为按钮行量身定制，差值为取整误差）
     let used = btn * n + gap * (n - 1);
@@ -320,7 +324,7 @@ unsafe fn paint(hwnd: HWND) {
     let pen = CreatePen(PS_SOLID, 1, t.stroke);
     let ob = SelectObject(hdc, brush);
     let op = SelectObject(hdc, pen);
-    let r = util::scaled(TB_RADIUS, dpi);
+    let r = util::scaled(radius_l(), dpi);
     let _ = RoundRect(hdc, 0, 0, cw, ch, r, r);
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
@@ -343,8 +347,8 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 return LRESULT(HTCLIENT as isize);
             }
             let dpi = util::dpi_of(hwnd);
-            let btn = util::scaled(TB_BTN_SZ, dpi);
-            let gap = util::scaled(TB_GAP, dpi);
+            let btn = util::scaled(btn_sz(), dpi);
+            let gap = util::scaled(gap_l(), dpi);
             let n = BTN_ORDER.len() as i32;
             let used = btn * n + gap * (n - 1);
             let x0 = ((cr.right - used) / 2).max(0);
@@ -789,7 +793,7 @@ unsafe extern "system" fn btn_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     // 提示延时：仅首次进入某按钮时武装定时器；已显示则不动
                     if !d.tip_shown && d.tip_for != id {
                         d.tip_for = id;
-                        let _ = SetTimer(parent, TIMER_TIP, TIP_DELAY_MS, None);
+                        let _ = SetTimer(parent, TIMER_TIP, crate::config::get().ui_tooltip_delay_ms, None);
                     }
                 }
                 // 仅在**真实光标**落在按钮内时才武装离开跟踪。
@@ -944,7 +948,7 @@ mod preview {
                 windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
             );
             let dpi = 96;
-            let btn = util::scaled(TB_BTN_SZ, dpi);
+            let btn = util::scaled(btn_sz(), dpi);
             let (cols, rows) = (BTN_ORDER.len() as i32, 3);
             let (w, h) = (cols * btn, rows * btn);
             let mut bi = BITMAPINFO::default();

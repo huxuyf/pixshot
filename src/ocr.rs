@@ -120,7 +120,7 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
 
     // 引擎对 20–40px 的字高最准：小图先放大，超限大图再等比缩小。
     let max = engine.max_dimension();
-    let (sw, sh) = target_size(w, h, max);
+    let (sw, sh) = target_size(w, h, max, cfg.ocr_upsample_target, cfg.ocr_max_upscale);
     let base: Vec<u8> = if sw != w || sh != h {
         resize_bicubic(bgra, w as usize, h as usize, sw as usize, sh as usize)
     } else {
@@ -129,7 +129,7 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
 
     // 多变体跑分取优：引擎不暴露置信度，就用「有意义字符占比 × log(长度)」这套启发式
     // 在几幅候选图之间挑最优。base 已足够干净时跳过其余候选，省掉多余的一次识别。
-    let dark = mean_luma(&base) < DARK_LUMA_THRESHOLD;
+    let dark = mean_luma(&base) < cfg.ocr_dark_luma;
     let mut best: Option<(f32, String)> = None;
     try_candidate(engine.as_ref(), "base", &base, sw, sh, &mut best);
     let confident = best.as_ref().map_or(false, |(_, t)| is_confident(t));
@@ -180,26 +180,24 @@ fn try_candidate(
     }
 }
 
-/// 小图放大的目标最长边。引擎对 20–40px 字符高最准，截图正文常只有
-/// 12–16px，放大到该尺度可显著提升小字/中文的识别率。
-const OCR_UPSAMPLE_TARGET: i32 = 2400;
-/// 最大放大倍数。防止极小图被拉到天价尺寸白烧算力（放大收益在 3× 左右即饱和）。
-const OCR_MAX_UPSCALE: f32 = 3.0;
-
+/// 小图放大的目标最长边与最大放大倍数取自配置
+/// （config.ini [ocr] upsample_target / max_upscale）。
+///
 /// 依据引擎上限决定 OCR 前的目标尺寸：小图放大、超限大图等比缩小、其余原样。
 ///
-/// 放大分支的缩放系数被 `OCR_UPSAMPLE_TARGET / longest` 与 `OCR_MAX_UPSCALE` 双重约束，
+/// 放大分支的缩放系数被 `upsample_target / longest` 与 `max_upscale` 双重约束，
 /// 因此结果最长边不超过目标值；仅在引擎上限低于目标值时才需要兜底收缩。
-fn target_size(w: i32, h: i32, max: i32) -> (i32, i32) {
+fn target_size(w: i32, h: i32, max: i32, upsample_target: i32, max_upscale: f32) -> (i32, i32) {
     if w <= 0 || h <= 0 {
         return (w.max(1), h.max(1));
     }
     let longest = w.max(h) as f32;
     let max = max.max(1) as f32;
+    let target = upsample_target.max(1) as f32;
     let mut scale = if longest > max {
         max / longest
-    } else if longest < OCR_UPSAMPLE_TARGET as f32 {
-        (OCR_UPSAMPLE_TARGET as f32 / longest).min(OCR_MAX_UPSCALE)
+    } else if longest < target {
+        (target / longest).min(max_upscale.max(1.0))
     } else {
         1.0
     };
@@ -304,7 +302,6 @@ fn resize_bicubic(bgra: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<
 
 /// 判定「深色背景」的平均亮度阈值（0–255）。深色主题（IDE/终端）常见均值 30–60，
 /// 白底文档 200 以上，取中间偏暗处作为分界。
-const DARK_LUMA_THRESHOLD: f32 = 110.0;
 
 /// 按 Rec.601 计算整幅图平均亮度（0–255）。输入 BGRA。
 fn mean_luma(bgra: &[u8]) -> f32 {
@@ -496,34 +493,34 @@ mod tests {
     #[test]
     fn target_size_upscales_small_images_to_target() {
         // 1000×800：放大到最长边 2400（2.4×，未触及 3× 上限）
-        let (nw, nh) = target_size(1000, 800, 4096);
+        let (nw, nh) = target_size(1000, 800, 4096, 2400, 3.0);
         assert_eq!((nw, nh), (2400, 1920));
     }
 
     #[test]
     fn target_size_caps_upscale_factor() {
         // 200×150：3× 上限生效，而不是拉到 2400（那会是 12×）
-        let (nw, nh) = target_size(200, 150, 4096);
+        let (nw, nh) = target_size(200, 150, 4096, 2400, 3.0);
         assert_eq!((nw, nh), (600, 450));
     }
 
     #[test]
     fn target_size_shrinks_oversized() {
         // 8000×4000 超上限：等比缩到最长边 4096
-        let (nw, nh) = target_size(8000, 4000, 4096);
+        let (nw, nh) = target_size(8000, 4000, 4096, 2400, 3.0);
         assert_eq!((nw, nh), (4096, 2048));
     }
 
     #[test]
     fn target_size_keeps_mid_size_unchanged() {
         // 3000×2000 已落在 [目标, 上限] 区间：不缩放
-        assert_eq!(target_size(3000, 2000, 4096), (3000, 2000));
+        assert_eq!(target_size(3000, 2000, 4096, 2400, 3.0), (3000, 2000));
     }
 
     #[test]
     fn target_size_never_exceeds_max() {
         for (w, h) in [(10, 10), (500, 2000), (1365, 1365), (4000, 100), (9000, 9000)] {
-            let (nw, nh) = target_size(w, h, 4096);
+            let (nw, nh) = target_size(w, h, 4096, 2400, 3.0);
             assert!(nw <= 4096 && nh <= 4096, "{w}×{h} → {nw}×{nh} 超出上限");
             assert!(nw >= 1 && nh >= 1);
         }
@@ -531,10 +528,10 @@ mod tests {
 
     #[test]
     fn target_size_is_robust_on_degenerate_input() {
-        assert_eq!(target_size(0, 0, 4096), (1, 1));
-        assert_eq!(target_size(-5, 10, 4096), (1, 10));
+        assert_eq!(target_size(0, 0, 4096, 2400, 3.0), (1, 1));
+        assert_eq!(target_size(-5, 10, 4096, 2400, 3.0), (1, 10));
         // 引擎上限异常（0/负）时不得 panic
-        let (nw, nh) = target_size(100, 50, 0);
+        let (nw, nh) = target_size(100, 50, 0, 2400, 3.0);
         assert!(nw >= 1 && nh >= 1);
     }
 

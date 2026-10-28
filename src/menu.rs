@@ -220,12 +220,13 @@ fn menu_height(d: &Data, _dpi: i32) -> i32 {
 /// 用真实字体测量最宽项，得出菜单宽度与各项高度。
 unsafe fn measure(hwnd: HWND, d: &mut Data) {
     let dpi = util::dpi_of(hwnd).max(GetDpiForSystem() as i32);
-    d.item_h = util::scaled(34, dpi);
-    d.sep_h = util::scaled(9, dpi);
-    d.pad = util::scaled(6, dpi);
+    let cfg = crate::config::get();
+    d.item_h = util::scaled(cfg.ui_menu_item_h, dpi);
+    d.sep_h = util::scaled(cfg.ui_menu_sep_h, dpi);
+    d.pad = util::scaled(cfg.ui_menu_pad, dpi);
 
     let hdc = GetDC(hwnd);
-    let font = util::gui_font(hwnd, 10, 400);
+    let font = util::gui_font(hwnd, cfg.ui_menu_font_pt, 400);
     let old = SelectObject(hdc, font);
     let text_w = |s: &str| {
         let w = util::to_wide(s);
@@ -239,23 +240,20 @@ unsafe fn measure(hwnd: HWND, d: &mut Data) {
         );
         (r.right - r.left).max(1)
     };
-    let mut max_w = util::scaled(72, dpi);
+    let mut max_w = util::scaled(cfg.ui_menu_min_w, dpi);
     for it in &d.items {
         // 标签 + （有快捷键时）标签与快捷键之间的最小间隔 + 快捷键
         let mut w = text_w(&it.label);
         if let Some(sc) = &it.shortcut {
-            w += util::scaled(ACCEL_GAP, dpi) + text_w(sc);
+            w += util::scaled(cfg.ui_menu_accel_gap, dpi) + text_w(sc);
         }
         max_w = max_w.max(w);
     }
     SelectObject(hdc, old);
     let _ = ReleaseDC(hwnd, hdc);
 
-    d.width = max_w + util::scaled(44, dpi);
+    d.width = max_w + util::scaled(cfg.ui_menu_right_pad, dpi);
 }
-
-/// 标签与右对齐快捷键之间的最小间隔（逻辑像素）。
-const ACCEL_GAP: i32 = 20;
 
 unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -403,6 +401,7 @@ unsafe fn paint(hwnd: HWND) {
 /// `hwnd` 仅用于取 DPI 与主题字体。
 unsafe fn paint_into(hwnd: HWND, hdc: HDC, w: i32, h: i32, d: &Data, t: theme::Theme) {
     let dpi = util::dpi_of(hwnd);
+    let cfg = crate::config::get();
 
     // 背景卡片
     let bg = CreateSolidBrush(t.card);
@@ -417,12 +416,12 @@ unsafe fn paint_into(hwnd: HWND, hdc: HDC, w: i32, h: i32, d: &Data, t: theme::T
     let pen = CreatePen(PS_SOLID, 1, theme::edge_line(t));
     let op = SelectObject(hdc, pen);
     let _ = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    let radius = util::scaled(12, dpi);
+    let radius = util::scaled(cfg.ui_menu_radius, dpi);
     let _ = RoundRect(hdc, 0, 0, w, h, radius, radius);
     SelectObject(hdc, op);
     let _ = DeleteObject(pen);
 
-    let font = util::gui_font(hwnd, 10, 400);
+    let font = util::gui_font(hwnd, cfg.ui_menu_font_pt, 400);
     let old_font = SelectObject(hdc, font);
     raw::SetBkMode(hdc.0 as isize, 1);
 
@@ -433,7 +432,7 @@ unsafe fn paint_into(hwnd: HWND, hdc: HDC, w: i32, h: i32, d: &Data, t: theme::T
             let y = top + d.sep_h / 2;
             let sep = CreatePen(PS_SOLID, 1, t.stroke);
             let old = SelectObject(hdc, sep);
-            let inset = util::scaled(12, dpi);
+            let inset = util::scaled(cfg.ui_menu_sep_inset, dpi);
             let _ = windows::Win32::Graphics::Gdi::MoveToEx(hdc, inset, y, None);
             let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, w - inset, y);
             SelectObject(hdc, old);
@@ -450,7 +449,7 @@ unsafe fn paint_into(hwnd: HWND, hdc: HDC, w: i32, h: i32, d: &Data, t: theme::T
             let hp = CreatePen(PS_SOLID, 1, t.hover);
             let old_brush = SelectObject(hdc, hb);
             let old_pen = SelectObject(hdc, hp);
-            let r2 = util::scaled(10, dpi);
+            let r2 = util::scaled(cfg.ui_menu_hover_radius, dpi);
             let _ = RoundRect(
                 hdc,
                 d.pad,
@@ -466,12 +465,16 @@ unsafe fn paint_into(hwnd: HWND, hdc: HDC, w: i32, h: i32, d: &Data, t: theme::T
             let _ = DeleteObject(hp);
         }
         // 文本
-        let color = if it.enabled { t.text } else { COLORREF(0x0080_8080) };
-        let right = w - util::scaled(12, dpi);
+        let color = if it.enabled {
+            t.text
+        } else {
+            COLORREF(crate::config::colorref_raw(cfg.ui_menu_disabled_color))
+        };
+        let right = w - util::scaled(cfg.ui_menu_text_right, dpi);
         raw::SetTextColor(hdc.0 as isize, color);
         let tw = util::to_wide(&it.label);
         let mut tr = RECT {
-            left: util::scaled(18, dpi),
+            left: util::scaled(cfg.ui_menu_text_left, dpi),
             top,
             right,
             bottom: top + d.item_h,
@@ -491,7 +494,11 @@ unsafe fn paint_into(hwnd: HWND, hdc: HDC, w: i32, h: i32, d: &Data, t: theme::T
             let accel_w = (calc.right - calc.left).max(1);
             raw::SetTextColor(
                 hdc.0 as isize,
-                if it.enabled { t.text2 } else { COLORREF(0x0080_8080) },
+                if it.enabled {
+                    t.text2
+                } else {
+                    COLORREF(crate::config::colorref_raw(cfg.ui_menu_disabled_color))
+                },
             );
             let mut sr = RECT {
                 left: right - accel_w,

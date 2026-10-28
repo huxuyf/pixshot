@@ -29,8 +29,8 @@ use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_R
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 
-/// 一键回退开关：置 false 关闭 Mica，所有窗口使用实色表面（色值即 Mica 同色）。
-pub const USE_MICA: bool = true;
+/// Mica 一键回退开关已移至配置（config.ini [ui] mica）；此处保留说明。
+/// 置 0 时所有窗口使用实色表面（色值即 Mica 同色）。
 
 // ─────────────────────────────────────────────────────────────────
 // 色板（Win11 Fluent tokens；浅色文本不用纯黑，兼容 Mica 黑色显影区域）
@@ -341,7 +341,7 @@ pub fn apply_frame(hwnd: HWND, t: Theme, mica: bool) -> bool {
             &pref as *const i32 as *const core::ffi::c_void,
             4,
         );
-        if mica && USE_MICA {
+        if mica && crate::config::get().ui_mica {
             let bt = DWMSBT_TRANSIENTWINDOW.0;
             let a = DwmSetWindowAttribute(
                 hwnd,
