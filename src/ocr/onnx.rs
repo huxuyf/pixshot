@@ -171,6 +171,12 @@ impl OcrEngineImpl for OnnxEngine {
             let (shape, prob) = outs[0]
                 .try_extract_tensor::<f32>()
                 .map_err(|e| AppError::Ocr(format!("读取检测输出失败: {e}")))?;
+            // 模型文件被替换/损坏时 rank 可能不符：校验而非直接索引（否则 panic）
+            if shape.len() != 4 || shape[0] != 1 || shape[1] != 1 {
+                return Err(AppError::Ocr(format!(
+                    "检测模型输出形状异常（期望 [1,1,H,W]，得到 {shape:?}），请检查 det.onnx"
+                )));
+            }
             let dh = shape[2] as usize;
             let dw = shape[3] as usize;
             im::det_boxes(
@@ -182,10 +188,10 @@ impl OcrEngineImpl for OnnxEngine {
                 cfg.ocr_unclip_ratio,
             )
         };
-        // 换算回原图坐标，并按行合并相邻框
+        // 换算回原图坐标（x/w 与 y/h 分别按各自轴的缩放比），并按行合并相邻框
         let mut rects: Vec<(i32, i32, i32, i32)> = boxes
             .into_iter()
-            .filter_map(|b| im::scale_box(b, det_in.ratio, w as i32, h as i32))
+            .filter_map(|b| im::scale_box(b, det_in.ratio, det_in.ratio_y, w as i32, h as i32))
             .collect();
         merge_line_boxes(&mut rects);
 
@@ -198,23 +204,48 @@ impl OcrEngineImpl for OnnxEngine {
             let cy = (rb.1 - pad).max(0);
             let cw = (rb.2 + 2 * pad).min(w as i32 - cx).max(1);
             let ch = (rb.3 + 2 * pad).min(h as i32 - cy).max(1);
-            let crop = im::crop_resize(&rgb, cx, cy, cw, ch, 48);
-            let (data, rw, rh) = im::rec_input(&crop);
-            let xt = Tensor::from_array((vec![1i64, 3, rh as i64, rw as i64], data))
-                .map_err(|e| AppError::Ocr(format!("构造识别输入失败: {e}")))?;
-            let (text, conf) = {
-                let mut rec = m.rec.lock().map_err(|_| AppError::Ocr("识别会话已损坏".into()))?;
-                let outs = rec
-                    .run(ort::inputs!["x" => xt])
-                    .map_err(|e| AppError::Ocr(format!("识别推理失败: {e}")))?;
-                let (shape, logits) = outs[0]
-                    .try_extract_tensor::<f32>()
-                    .map_err(|e| AppError::Ocr(format!("读取识别输出失败: {e}")))?;
-                ctc_decode(logits, shape[1] as usize, shape[2] as usize, &m.dict)
-            };
-            let text = super::collapse_cjk_spaces(&text);
-            if !text.trim().is_empty() {
-                lines.push(TextLine { text: text.trim().to_string(), conf, rect: Some(rb) });
+            // 超长行（整屏横排）：宽 clamp 到 4096 会压扁宽高比 → 按高切成
+            // 若干段（段宽 ≤ 80×高 < 85×48 上限）分别识别再拼接
+            let chunk_w = (ch * 80).max(1);
+            let mut acc_text = String::new();
+            let mut acc_conf = 0f32;
+            let mut acc_n = 0usize;
+            let mut x0 = cx;
+            while x0 < cx + cw {
+                let seg_w = (cx + cw - x0).min(chunk_w);
+                let crop = im::crop_resize(&rgb, x0, cy, seg_w, ch, 48);
+                let (data, rw, rh) = im::rec_input(&crop);
+                let xt = Tensor::from_array((vec![1i64, 3, rh as i64, rw as i64], data))
+                    .map_err(|e| AppError::Ocr(format!("构造识别输入失败: {e}")))?;
+                let (text, conf) = {
+                    let mut rec = m.rec.lock().map_err(|_| AppError::Ocr("识别会话已损坏".into()))?;
+                    let outs = rec
+                        .run(ort::inputs!["x" => xt])
+                        .map_err(|e| AppError::Ocr(format!("识别推理失败: {e}")))?;
+                    let (shape, logits) = outs[0]
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| AppError::Ocr(format!("读取识别输出失败: {e}")))?;
+                    if shape.len() != 3 || shape[0] != 1 {
+                        return Err(AppError::Ocr(format!(
+                            "识别模型输出形状异常（期望 [1,T,C]，得到 {shape:?}），请检查 rec.onnx"
+                        )));
+                    }
+                    ctc_decode(logits, shape[1] as usize, shape[2] as usize, &m.dict)
+                };
+                let text = super::collapse_cjk_spaces(&text);
+                if !text.trim().is_empty() {
+                    acc_text.push_str(text.trim());
+                    acc_conf += conf;
+                    acc_n += 1;
+                }
+                x0 += seg_w;
+            }
+            if acc_n > 0 {
+                lines.push(TextLine {
+                    text: acc_text,
+                    conf: acc_conf / acc_n as f32,
+                    rect: Some(rb),
+                });
             }
         }
         Ok(lines)
@@ -225,6 +256,10 @@ impl OcrEngineImpl for OnnxEngine {
 ///
 /// 返回 `(文本, 置信度)`；置信度取各有效字符处 argmax 概率的均值。
 /// 类别排布：`0=blank`，`1..=len(dict)` 为字典字符，`len(dict)+1` 为空格（PaddleOCR 约定）。
+///
+/// 置信度假设输出已过 softmax（值域 [0,1]）；若某时刻值域越界（模型导出未含
+/// softmax），对该时刻临时做一次 softmax 再取 argmax 概率，避免 conf 语义漂移
+/// （>1 或为负会击穿 `ocr_confidence` 阈值过滤）。
 fn ctc_decode(logits: &[f32], t: usize, c: usize, dict: &[String]) -> (String, f32) {
     let mut out = String::new();
     let mut prev = 0usize;
@@ -238,16 +273,25 @@ fn ctc_decode(logits: &[f32], t: usize, c: usize, dict: &[String]) -> (String, f
         let row = &logits[base..base + c];
         let mut best = 0usize;
         let mut bv = f32::MIN;
+        let mut row_min = f32::MAX;
         for (i, &v) in row.iter().enumerate() {
             if v > bv {
                 bv = v;
                 best = i;
             }
+            row_min = row_min.min(v);
         }
+        // 值域检查：越出 [0,1] 视为 raw logits → argmax 处改取 softmax 概率
+        let prob = if row_min < -1e-4 || bv > 1.0 + 1e-4 {
+            let denom: f32 = row.iter().map(|&v| (v - bv).exp()).sum();
+            if denom > 0.0 { 1.0 / denom } else { 0.0 }
+        } else {
+            bv
+        };
         if best != 0 && best != prev {
             if let Some(ch) = class_char(best, dict) {
                 out.push(ch);
-                sum += bv;
+                sum += prob;
                 n += 1;
             }
         }

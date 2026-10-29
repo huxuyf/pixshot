@@ -78,24 +78,33 @@ pub fn encode_png(bgra: &[u8], w: i32, h: i32) -> Result<Vec<u8>> {
 
         // 读回编码结果：经 GetHGlobalFromStream 拿到内存块尺寸，先回到流起点
         // （编码后位置在末尾，直接 Read 会得到 0 字节）再整块读出
+        // GlobalSize 是 HGLOBAL 的分配尺寸（≥ 流有效长度），只作容量提示；
+        // 循环 Read 直到短读（0）——单次 Read 不保证返回全部字节
         let hg = GetHGlobalFromStream(&stream)?;
-        let size = GlobalSize(hg) as usize;
+        let cap = GlobalSize(hg) as usize;
         stream.Seek(0, STREAM_SEEK_SET, None)?;
-        if size == 0 {
+        if cap == 0 {
             return Err(AppError::Config("PNG 编码结果为空".into()));
         }
-        let mut out = vec![0u8; size];
-        let mut read: u32 = 0;
-        let hr = stream.Read(
-            out.as_mut_ptr() as *mut core::ffi::c_void,
-            size as u32,
-            Some(&mut read),
-        );
-        // ISequentialStream::Read 返回 HRESULT（非 Result），手动检查
-        if hr.is_err() {
-            return Err(AppError::Config("读取 PNG 编码结果失败".into()));
+        let mut out = vec![0u8; cap];
+        let mut filled = 0usize;
+        while filled < cap {
+            let mut read: u32 = 0;
+            let hr = stream.Read(
+                out[filled..].as_mut_ptr() as *mut core::ffi::c_void,
+                (cap - filled) as u32,
+                Some(&mut read),
+            );
+            // ISequentialStream::Read 返回 HRESULT（非 Result），手动检查
+            if hr.is_err() {
+                return Err(AppError::Config("读取 PNG 编码结果失败".into()));
+            }
+            if read == 0 {
+                break;
+            }
+            filled += read as usize;
         }
-        out.truncate(read as usize);
+        out.truncate(filled);
         if out.is_empty() {
             return Err(AppError::Config("PNG 编码结果为空".into()));
         }
@@ -112,8 +121,19 @@ pub fn decode_png(png: &[u8]) -> Result<(i32, i32, Vec<u8>)> {
     unsafe {
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        if png.len() > u32::MAX as usize {
+            return Err(AppError::Config("PNG 数据过大".into()));
+        }
         let stream = CreateStreamOnHGlobal(HGLOBAL::default(), true)?;
-        let _ = stream.Write(png.as_ptr() as *const c_void, png.len() as u32, None);
+        // Write 可能短写/失败：检查 HRESULT 与实际写入量（否则后续报误导性的"解码失败"）
+        let mut written = 0u32;
+        let hr = stream.Write(png.as_ptr() as *const c_void, png.len() as u32, Some(&mut written));
+        if hr.is_err() || written as usize != png.len() {
+            return Err(AppError::Config(format!(
+                "PNG 写入内存流失败（{written}/{} 字节）",
+                png.len()
+            )));
+        }
         stream.Seek(0, STREAM_SEEK_SET, None)?;
 
         let decoder: IWICBitmapDecoder =
@@ -123,6 +143,10 @@ pub fn decode_png(png: &[u8]) -> Result<(i32, i32, Vec<u8>)> {
         frame.GetSize(&mut w, &mut h)?;
         if w == 0 || h == 0 {
             return Err(AppError::Config("PNG 尺寸无效".into()));
+        }
+        // 尺寸上限：解压炸弹（数万乘数万的合法 PNG）不得直接分配数 GB
+        if w > 32767 || h > 32767 || (w as u64) * (h as u64) * 4 > (1 << 30) {
+            return Err(AppError::Config(format!("PNG 尺寸超出上限: {w}×{h}")));
         }
         let conv: IWICFormatConverter = factory.CreateFormatConverter()?;
         conv.Initialize(
@@ -225,8 +249,8 @@ pub fn save_with_dialog(
 ) -> Result<Option<String>> {
     let default_name = default_file_name(fmt, default_dir);
 
-    let mut file_buf = [0u16; 260];
-    for (i, c) in default_name.encode_utf16().take(259).enumerate() {
+    let mut file_buf = [0u16; 1024]; // 长路径（超过 MAX_PATH 的目录）也能容纳
+    for (i, c) in default_name.encode_utf16().take(1023).enumerate() {
         file_buf[i] = c;
     }
 
@@ -245,12 +269,19 @@ pub fn save_with_dialog(
         .map(to_wide)
         .unwrap_or_default();
 
+    // 初始选中配置格式对应的过滤器项（1 起）
+    let initial_index = [SaveFormat::Png, SaveFormat::Jpeg, SaveFormat::Bmp]
+        .iter()
+        .position(|f| *f == fmt)
+        .map(|i| i as u32 + 1)
+        .unwrap_or(1);
+
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
         lpstrFilter: PCWSTR::from_raw(filter.as_ptr()),
         lpstrFile: PWSTR(file_buf.as_mut_ptr()),
-        nMaxFile: 260,
+        nMaxFile: 1024,
         lpstrDefExt: PCWSTR::from_raw(def_ext.as_ptr()),
         lpstrTitle: PCWSTR::from_raw(title.as_ptr()),
         lpstrInitialDir: if init_dir.is_empty() {
@@ -261,9 +292,17 @@ pub fn save_with_dialog(
         Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR,
         ..Default::default()
     };
+    ofn.nFilterIndex = initial_index;
     let ok = unsafe { GetSaveFileNameW(&mut ofn) };
     if !ok.as_bool() {
-        return Ok(None); // 用户取消
+        // 区分「用户取消」与「对话框出错」（错误码 0 = 取消）
+        let err = unsafe {
+            windows::Win32::UI::Controls::Dialogs::CommDlgExtendedError()
+        };
+        if err.0 != 0 {
+            crate::diag::log(&format!("[imageio] 保存对话框错误，CommDlgExtendedError={}", err.0));
+        }
+        return Ok(None);
     }
     let end = file_buf
         .iter()
@@ -273,6 +312,13 @@ pub fn save_with_dialog(
     if path.is_empty() {
         return Ok(None);
     }
+    // 保存格式跟随用户在对话框里选的过滤器（否则选了 JPEG 仍存 PNG，扩展名与内容不符）
+    let fmt = match ofn.nFilterIndex {
+        2 => SaveFormat::Jpeg,
+        3 => SaveFormat::Bmp,
+        _ => SaveFormat::Png,
+    };
+    let path = match_extension(&path, fmt);
     save(&path, bgra, w, h, fmt)?;
 
     // 记住本次目录，供下次对话框使用
@@ -281,6 +327,23 @@ pub fn save_with_dialog(
         crate::config::update(|c| c.save_dir = Some(dir));
     }
     Ok(Some(path))
+}
+
+/// 让文件扩展名与保存格式一致：扩展名已是目标格式则不动；是其它已知图片
+/// 扩展名（如对话框按默认扩展名补的 `.png`）则替换；没有扩展名则补上。
+fn match_extension(path: &str, fmt: SaveFormat) -> String {
+    let want = fmt.ext();
+    let p = std::path::Path::new(path);
+    let cur = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
+    match cur.as_deref() {
+        Some(e) if e == want || (want == "jpg" && e == "jpeg") => path.to_string(),
+        Some(e) if ["png", "jpg", "jpeg", "bmp"].contains(&e) => {
+            let mut pb = p.to_path_buf();
+            pb.set_extension(want);
+            pb.to_string_lossy().into_owned()
+        }
+        Some(_) | None => format!("{path}.{want}"),
+    }
 }
 
 /// 静默保存目录：优先配置里的 `imageio_autosave_dir`，其次 `save_dir`，
@@ -308,9 +371,20 @@ pub fn autosave(bgra: &[u8], w: i32, h: i32, fmt: SaveFormat) -> Result<String> 
     let dir = autosave_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::Config(format!("创建目录失败 {}：{e}", dir.display())))?;
-    let dir_s = dir.to_string_lossy().into_owned();
-    let name = default_file_name(fmt, Some(&dir_s));
-    let path = dir.join(name);
+    // 序号已被占用（并发实例/同秒重复触发）时递增避让，到上限为止
+    let cfg = crate::config::get();
+    let max_seq = cfg.imageio_max_seq.max(1);
+    let st = unsafe { GetLocalTime() };
+    let ymd = format!("{:04}{:02}{:02}", st.wYear, st.wMonth, st.wDay);
+    let mut seq = next_seq(Some(&dir.to_string_lossy()), &ymd);
+    let path = loop {
+        let name = format!("{}_{ymd}_{seq:02}.{}", cfg.imageio_prefix, fmt.ext());
+        let p = dir.join(name);
+        if !p.exists() || seq >= max_seq {
+            break p;
+        }
+        seq += 1;
+    };
     let path_s = path.to_string_lossy().into_owned();
     save(&path_s, bgra, w, h, fmt)?;
     Ok(path_s)

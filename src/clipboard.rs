@@ -79,7 +79,10 @@ pub fn copy_image_with_png(
     }
 
     let header = std::mem::size_of::<BITMAPINFOHEADER>();
-    let total = header + stride * h as usize;
+    let total = stride
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_add(header))
+        .ok_or_else(|| AppError::Config("图像尺寸溢出".into()))?;
 
     // 守卫在函数结束时（含提前 return / ? 传播）自动 CloseClipboard
     let _guard = ClipboardGuard::open()?;
@@ -191,7 +194,7 @@ pub fn copy_text(s: &str) -> Result<()> {
 /// 把自上而下的行序翻转成自下而上（CF_DIB 要求）。
 /// 抽成独立函数以便单元测试行序正确性。
 fn copy_rows_flipped(src: &[u8], stride: usize, h: usize, dst: &mut [u8]) {
-    debug_assert_eq!(src.len() / stride.max(1), h);
+    debug_assert!(src.len() >= stride * h, "源缓冲必须至少容纳 stride×h");
     debug_assert!(dst.len() >= stride * h);
     for row in 0..h {
         let s = row * stride;
@@ -310,7 +313,9 @@ fn probe_formats() -> Formats {
 }
 
 /// 把 `HGLOBAL` 剪贴板数据整块拷进 `Vec`（不释放句柄）。
+/// 巨型剪贴板项直接报错（`vec!` 分配失败是 abort 而非可恢复错误）。
 fn read_hglobal(fmt: u32) -> Result<Vec<u8>> {
+    const MAX_CLIP_BYTES: usize = 512 * 1024 * 1024; // 512MB，足以容纳 8K 截图
     unsafe {
         let h = GetClipboardData(fmt)
             .map_err(|e| AppError::Config(format!("读取剪贴板格式 {fmt} 失败：{e}")))?;
@@ -323,6 +328,13 @@ fn read_hglobal(fmt: u32) -> Result<Vec<u8>> {
             return Err(AppError::Config("GlobalLock 失败".into()));
         }
         let size = GlobalSize(hg);
+        if size > MAX_CLIP_BYTES {
+            let _ = GlobalUnlock(hg);
+            return Err(AppError::Config(format!(
+                "剪贴板数据过大（{}MB），拒绝读取",
+                size / 1024 / 1024
+            )));
+        }
         let mut v = vec![0u8; size];
         if size > 0 {
             std::ptr::copy_nonoverlapping(p as *const u8, v.as_mut_ptr(), size);
@@ -358,50 +370,92 @@ fn i32_at(b: &[u8], o: usize) -> i32 {
 
 /// CF_DIB / CF_DIBV5 数据块 → BGRA 自上而下。
 ///
-/// 手动按字节解析 `BITMAPINFOHEADER` 字段（避免依赖不同 V4/V5 结构体布局）。
-/// 支持 24/32bpp、`BI_RGB`（及 32bpp `BI_BITFIELDS` 的常见掩码），正高度行翻转。
+/// 手动按字节解析位图头字段（避免依赖不同 V4/V5 结构体布局）。
+/// **这是不可信输入**（剪贴板任何进程可写）：尺寸先钳制再换算（checked 运算，
+/// 乘法溢出不得绕过长度校验）；只接受 BI_RGB 与 32bpp BI_BITFIELDS 的常见
+/// 掩码布局（00RRGGBB，内存字节序与 BI_RGB 相同）；BI_JPEG/BI_PNG 等压缩
+/// 格式明确报错，而不是把压缩字节当像素解析（花屏）。
+/// 支持 BITMAPINFOHEADER+（biSize 40..=124）与 BITMAPCOREHEADER（biSize=12）。
 pub fn dib_to_bgra(blob: &[u8]) -> Result<(i32, i32, Vec<u8>)> {
-    if blob.len() < 40 {
+    /// 单条边上限（8K 截图 7680 远低于此；防御畸形头）
+    const MAX_DIM: i32 = 32767;
+    /// 输出总字节上限（32767²×4 ≈ 4GB，分配失败会 abort——先拦住）
+    const MAX_OUT_BYTES: u64 = 1 << 30; // 1 GiB
+    if blob.len() < 12 {
         return Err(AppError::Config("DIB 数据过短".into()));
     }
     let bi_size = u32_at(blob, 0) as usize;
-    let w = i32_at(blob, 4);
-    let h_raw = i32_at(blob, 8);
-    let bpp = u16_at(blob, 14);
+    let (w, h_raw, bpp, compression, pixel_off);
+    if bi_size == 12 {
+        // BITMAPCOREHEADER：宽/高为 u16，bpp 在偏移 10；无压缩字段（恒 BI_RGB）
+        w = u16_at(blob, 4) as i32;
+        h_raw = u16_at(blob, 6) as i32;
+        bpp = u16_at(blob, 10);
+        compression = 0u32;
+        pixel_off = 12usize;
+    } else if (40..=124).contains(&bi_size) {
+        if blob.len() < bi_size {
+            return Err(AppError::Config("DIB 头不完整".into()));
+        }
+        w = i32_at(blob, 4);
+        h_raw = i32_at(blob, 8);
+        bpp = u16_at(blob, 14);
+        compression = u32_at(blob, 16);
+        // BI_BITFIELDS + 40 字节头：3 个掩码 DWORD 紧随头部（在 biSize 之外）
+        pixel_off = if compression == 3 && bi_size == 40 { bi_size + 12 } else { bi_size };
+    } else {
+        return Err(AppError::Config(format!("DIB 头长度异常: biSize={bi_size}")));
+    }
     if w <= 0 || h_raw == 0 {
         return Err(AppError::Config("DIB 尺寸无效".into()));
+    }
+    let h_abs = h_raw.unsigned_abs() as i64;
+    if w > MAX_DIM || h_abs > MAX_DIM as i64 {
+        return Err(AppError::Config(format!("DIB 尺寸超出上限: {w}×{h_abs}")));
+    }
+    if bpp != 24 && bpp != 32 {
+        return Err(AppError::Config(format!("不支持的 DIB 位深：{bpp}bpp")));
+    }
+    // 只接受未压缩；32bpp 兼容 BI_BITFIELDS 的常见掩码（字节序与 BI_RGB 相同）
+    if compression != 0 && !(compression == 3 && bpp == 32) {
+        return Err(AppError::Config(format!("不支持的 DIB 压缩格式: {compression}")));
     }
     let top_down = h_raw < 0;
     let h = h_raw.unsigned_abs() as usize;
     let wu = w as usize;
-
-    // 调色板（仅 ≤8bpp 有；本函数只支持 24/32bpp，其余报错）
-    if bpp != 24 && bpp != 32 {
-        return Err(AppError::Config(format!("不支持的 DIB 位深：{bpp}bpp")));
+    if (wu as u64) * (h as u64) * 4 > MAX_OUT_BYTES {
+        return Err(AppError::Config("DIB 图像过大".into()));
     }
-    let pixel_off = bi_size;
     let src_stride = ((wu * bpp as usize + 31) / 32) * 4;
-    if blob.len() < pixel_off + src_stride * h {
+    let need = src_stride
+        .checked_mul(h)
+        .and_then(|n| n.checked_add(pixel_off))
+        .ok_or_else(|| AppError::Config("DIB 尺寸溢出".into()))?;
+    if blob.len() < need {
         return Err(AppError::Config("DIB 像素数据不完整".into()));
     }
 
     let mut out = vec![0u8; wu * h * 4];
-    for row in 0..h {
-        let src_row = if top_down { row } else { h - 1 - row };
-        let s = pixel_off + src_row * src_stride;
-        let d = row * wu * 4;
-        if bpp == 32 {
-            for x in 0..wu {
-                let si = s + x * 4;
-                let di = d + x * 4;
-                out[di] = blob[si];
-                out[di + 1] = blob[si + 1];
-                out[di + 2] = blob[si + 2];
-                let a = blob[si + 3];
-                // BI_RGB 下 alpha 常为 0：当不透明处理（与 capture 一致）
-                out[di + 3] = if a == 0 { 255 } else { a };
+    if bpp == 32 {
+        for row in 0..h {
+            let src_row = if top_down { row } else { h - 1 - row };
+            let s = pixel_off + src_row * src_stride;
+            let d = row * wu * 4;
+            out[d..d + wu * 4].copy_from_slice(&blob[s..s + wu * 4]);
+        }
+        // alpha 整图决策：BI_RGB 下 alpha 常全为 0（应整体视为不透明）；
+        // 若存在真实透明像素（DIBV5），则保留原 alpha，不做逐像素改写
+        let all_zero = out.chunks_exact(4).all(|px| px[3] == 0);
+        if all_zero {
+            for px in out.chunks_exact_mut(4) {
+                px[3] = 255;
             }
-        } else {
+        }
+    } else {
+        for row in 0..h {
+            let src_row = if top_down { row } else { h - 1 - row };
+            let s = pixel_off + src_row * src_stride;
+            let d = row * wu * 4;
             for x in 0..wu {
                 let si = s + x * 3;
                 let di = d + x * 4;
@@ -428,6 +482,13 @@ pub fn hbitmap_to_bgra(hbmp: HBITMAP) -> Result<(i32, i32, Vec<u8>)> {
             return Err(AppError::Config("HBITMAP 尺寸无效".into()));
         }
         let (w, h) = (bm.bmWidth, bm.bmHeight);
+        // 防御：超大位图（不可信来源）。`w * h * 4` 必须先在 usize 域相乘——
+        // i32 乘法溢出回绕会让缓冲远小于 GetDIBits 的实际写入量（堆越界写）。
+        const MAX_DIM: i32 = 32767;
+        const MAX_BYTES: u64 = 1 << 30; // 1 GiB
+        if w > MAX_DIM || h > MAX_DIM || (w as u64) * (h as u64) * 4 > MAX_BYTES {
+            return Err(AppError::Config(format!("HBITMAP 尺寸超出上限: {w}×{h}")));
+        }
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -441,7 +502,7 @@ pub fn hbitmap_to_bgra(hbmp: HBITMAP) -> Result<(i32, i32, Vec<u8>)> {
             ..Default::default()
         };
         let mut bmi = bmi;
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let mut buf = vec![0u8; w as usize * h as usize * 4];
         let dc = CreateCompatibleDC(None);
         if dc.is_invalid() {
             return Err(AppError::Config("CreateCompatibleDC 失败".into()));
@@ -739,5 +800,60 @@ mod tests {
         let mut b = make_dib_2x2();
         b[14..16].copy_from_slice(&8u16.to_le_bytes());
         assert!(dib_to_bgra(&b).is_err());
+    }
+
+    #[test]
+    fn dib_rejects_huge_dims_and_compressed() {
+        // 畸形头：巨大尺寸必须被拒绝（乘法溢出不得绕过长度校验）
+        let mut b = make_dib_2x2();
+        b[4..8].copy_from_slice(&i32::MAX.to_le_bytes());
+        b[8..12].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert!(dib_to_bgra(&b).is_err(), "巨大尺寸必须拒绝");
+        // BI_PNG（compression=5）：压缩数据不得当像素解析
+        let mut b = make_dib_2x2();
+        b[16..20].copy_from_slice(&5u32.to_le_bytes());
+        assert!(dib_to_bgra(&b).is_err(), "压缩格式必须拒绝");
+        // 异常 biSize
+        let mut b = make_dib_2x2();
+        b[0..4].copy_from_slice(&7u32.to_le_bytes());
+        assert!(dib_to_bgra(&b).is_err(), "异常 biSize 必须拒绝");
+    }
+
+    #[test]
+    fn dib_bitfields_offset_and_coreheader() {
+        // 32bpp BI_BITFIELDS + 40 字节头：像素在 biSize+12（3 个掩码 DWORD）之后
+        let mut b = make_dib_2x2();
+        b[16..20].copy_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+        b.splice(40..40, [0u8; 12]); // 插入掩码（值不读，布局与 BI_RGB 相同）
+        let (w, h, out) = dib_to_bgra(&b).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(out[0], 0x20, "掩码后的像素偏移必须正确");
+        // 全零 alpha → 整体置不透明
+        assert_eq!(out[3], 255);
+
+        // BITMAPCOREHEADER（biSize=12）：宽高为 u16
+        let mut c = vec![0u8; 12 + 2 * 8]; // 头 + 2 行（24bpp stride = 8）
+        c[0..4].copy_from_slice(&12u32.to_le_bytes());
+        c[4..6].copy_from_slice(&2u16.to_le_bytes()); // w
+        c[6..8].copy_from_slice(&2u16.to_le_bytes()); // h
+        c[8..10].copy_from_slice(&1u16.to_le_bytes()); // planes
+        c[10..12].copy_from_slice(&24u16.to_le_bytes()); // bpp
+        c[12] = 0x10; // 底行 B
+        c[20] = 0x20; // 顶行 B
+        let (w, h, out) = dib_to_bgra(&c).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(out[0], 0x20);
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn dib_preserves_real_alpha() {
+        // 存在真实透明像素（非全零 alpha）时保留原 alpha
+        let mut b = make_dib_2x2();
+        b[43] = 0x80; // 某像素 alpha=0x80（非全零）
+        let (_, _, out) = dib_to_bgra(&b).unwrap();
+        // 该像素在 DIB 底行第一个 → 翻转后是输出最后一行第一个
+        assert_eq!(out[(1 * 2) * 4 + 3], 0x80, "真实 alpha 必须保留");
+        assert_eq!(out[3], 0, "其余像素的 alpha 不被改写");
     }
 }

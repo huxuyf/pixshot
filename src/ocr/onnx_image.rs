@@ -44,7 +44,8 @@ pub fn bgra_to_rgb(bgra: &[u8], w: usize, h: usize) -> Rgb {
     Rgb { w, h, data }
 }
 
-/// 可分离双三次缩放（先横后纵），与 [`super::resize_bicubic`] 同一套核。RGB 三通道。
+/// 可分离双三次缩放（先横后纵），与 [`super::resize_bicubic`] 同一套核
+/// （通道数泛型实现在 `super::resize_bicubic_ch`，此处为 RGB 三通道适配）。
 pub fn resize(src: &Rgb, nw: usize, nh: usize) -> Rgb {
     if src.w == 0 || src.h == 0 || nw == 0 || nh == 0 {
         return Rgb::new(nw.max(1), nh.max(1));
@@ -52,65 +53,11 @@ pub fn resize(src: &Rgb, nw: usize, nh: usize) -> Rgb {
     if nw == src.w && nh == src.h {
         return src.clone();
     }
-    let (w, h) = (src.w, src.h);
-    let read = |x: usize, y: usize, c: usize| -> f32 {
-        let i = (y * w + x) * 3 + c;
-        if i < src.data.len() {
-            src.data[i] as f32
-        } else {
-            255.0
-        }
-    };
-
-    // 横向
-    let mut tmp = vec![0f32; nw * h * 3];
-    let rx = w as f32 / nw as f32;
-    let fx = rx.max(1.0);
-    let support_x = 2.0 * fx;
-    for y in 0..h {
-        for x in 0..nw {
-            let s = (x as f32 + 0.5) * rx - 0.5;
-            let lo = (s - support_x).ceil() as i32;
-            let hi = (s + support_x).floor() as i32;
-            for c in 0..3 {
-                let mut acc = 0f32;
-                let mut wsum = 0f32;
-                for idx in lo..=hi {
-                    let wt = super::cubic_kernel((s - idx as f32) / fx);
-                    let cx = idx.clamp(0, w as i32 - 1) as usize;
-                    acc += wt * read(cx, y, c);
-                    wsum += wt;
-                }
-                tmp[(y * nw + x) * 3 + c] = if wsum != 0.0 { acc / wsum } else { 0.0 };
-            }
-        }
+    Rgb {
+        w: nw,
+        h: nh,
+        data: super::resize_bicubic_ch::<3>(&src.data, src.w, src.h, nw, nh, 255),
     }
-
-    // 纵向
-    let mut out = vec![0u8; nw * nh * 3];
-    let ry = h as f32 / nh as f32;
-    let fy = ry.max(1.0);
-    let support_y = 2.0 * fy;
-    for y in 0..nh {
-        let s = (y as f32 + 0.5) * ry - 0.5;
-        let lo = (s - support_y).ceil() as i32;
-        let hi = (s + support_y).floor() as i32;
-        for x in 0..nw {
-            for c in 0..3 {
-                let mut acc = 0f32;
-                let mut wsum = 0f32;
-                for idx in lo..=hi {
-                    let wt = super::cubic_kernel((s - idx as f32) / fy);
-                    let cy = idx.clamp(0, h as i32 - 1) as usize;
-                    acc += wt * tmp[(cy * nw + x) * 3 + c];
-                    wsum += wt;
-                }
-                let v = if wsum != 0.0 { acc / wsum } else { 0.0 };
-                out[(y * nw + x) * 3 + c] = v.round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-    Rgb { w: nw, h: nh, data: out }
 }
 
 /// 裁剪矩形区域并缩放到 `target_h` 高（保持宽高比，宽向上取整）。越界以白填充。
@@ -135,12 +82,17 @@ pub fn crop_resize(src: &Rgb, x: i32, y: i32, w: i32, h: i32, target_h: usize) -
 
 /// 检测模型输入：尺寸对齐到 32 的倍数（长边不超过 `limit`），并归一化到 CHW f32。
 ///
-/// 返回 `(数据, 宽, 高, ratio)`，`ratio = 网络宽 / 原图宽`，用于把检测框换算回原图坐标。
+/// 返回 `(数据, 宽, 高, ratio_x, ratio_y)`。宽、高**各自独立**对齐到 32，
+/// 两轴缩放比一般不等——换算检测框回原图时 x/w 用 `ratio_x`、y/h 用 `ratio_y`，
+/// 混用会让框在垂直方向系统性偏移（见 `scale_box`）。
 pub struct DetInput {
     pub data: Vec<f32>,
     pub w: usize,
     pub h: usize,
+    /// 网络宽 / 原图宽
     pub ratio: f32,
+    /// 网络高 / 原图高
+    pub ratio_y: f32,
 }
 
 pub fn det_input(img: &Rgb, limit: usize) -> DetInput {
@@ -157,6 +109,7 @@ pub fn det_input(img: &Rgb, limit: usize) -> DetInput {
     }
     let resized = resize(img, rw, rh);
     let ratio = rw as f32 / img.w.max(1) as f32;
+    let ratio_y = rh as f32 / img.h.max(1) as f32;
 
     // PaddleOCR det 归一化：x/255，mean=[0.485,0.456,0.406]，std=[0.229,0.224,0.225]
     const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -169,7 +122,7 @@ pub fn det_input(img: &Rgb, limit: usize) -> DetInput {
             data[c * n + i] = (v - MEAN[c]) / STD[c];
         }
     }
-    DetInput { data, w: rw, h: rh, ratio }
+    DetInput { data, w: rw, h: rh, ratio, ratio_y }
 }
 
 /// 识别模型输入：固定高 48、按比宽，归一化到 CHW f32（mean=0.5, std=0.5）。
@@ -276,14 +229,16 @@ fn connected_components(mask: &[bool], w: usize, h: usize) -> Vec<(usize, usize,
 }
 
 /// 把检测网络坐标系下的框换算回原图坐标并裁剪到边界。
-pub fn scale_box(b: (i32, i32, i32, i32), ratio: f32, ow: i32, oh: i32) -> Option<(i32, i32, i32, i32)> {
-    if ratio <= 0.0 {
+/// x/w 除以 `ratio_x`（网络宽/原图宽），y/h 除以 `ratio_y`（网络高/原图高）——
+/// 两轴独立对齐到 32，比例一般不等，混用会让框垂直偏移。
+pub fn scale_box(b: (i32, i32, i32, i32), ratio_x: f32, ratio_y: f32, ow: i32, oh: i32) -> Option<(i32, i32, i32, i32)> {
+    if ratio_x <= 0.0 || ratio_y <= 0.0 {
         return None;
     }
-    let x = (b.0 as f32 / ratio).floor() as i32;
-    let y = (b.1 as f32 / ratio).floor() as i32;
-    let w = ((b.2 as f32 / ratio).ceil() as i32).max(1);
-    let h = ((b.3 as f32 / ratio).ceil() as i32).max(1);
+    let x = (b.0 as f32 / ratio_x).floor() as i32;
+    let y = (b.1 as f32 / ratio_y).floor() as i32;
+    let w = ((b.2 as f32 / ratio_x).ceil() as i32).max(1);
+    let h = ((b.3 as f32 / ratio_y).ceil() as i32).max(1);
     let x = x.clamp(0, ow.max(1) - 1);
     let y = y.clamp(0, oh.max(1) - 1);
     let x1 = (x + w).min(ow);
@@ -371,11 +326,26 @@ mod tests {
     #[test]
     fn scale_box_maps_back_and_clamps() {
         // ratio=2（网络坐标翻倍），框 (20,10,40,20) → 原图 (10,5,20,10)
-        assert_eq!(scale_box((20, 10, 40, 20), 2.0, 100, 100), Some((10, 5, 20, 10)));
+        assert_eq!(scale_box((20, 10, 40, 20), 2.0, 2.0, 100, 100), Some((10, 5, 20, 10)));
+        // 两轴比例不同：x 按 ratio_x、y 按 ratio_y 换算
+        assert_eq!(scale_box((48, 32, 48, 32), 0.96, 1.28, 100, 50), Some((50, 25, 50, 25)));
         // 越界应被裁剪
-        let b = scale_box((90, 90, 40, 40), 1.0, 100, 100).unwrap();
+        let b = scale_box((90, 90, 40, 40), 1.0, 1.0, 100, 100).unwrap();
         assert!(b.0 + b.2 <= 100 && b.1 + b.3 <= 100);
         // ratio 非法 → None
-        assert_eq!(scale_box((1, 1, 5, 5), 0.0, 10, 10), None);
+        assert_eq!(scale_box((1, 1, 5, 5), 0.0, 1.0, 10, 10), None);
+    }
+
+    #[test]
+    fn det_input_exposes_per_axis_ratios() {
+        // 100×50 → rw=96, rh=64：两轴比例必须分别记录
+        let img = solid_rgb(100, 50, [255, 255, 255]);
+        let d = det_input(&img, 960);
+        assert_eq!((d.w, d.h), (96, 64));
+        assert!((d.ratio - 0.96).abs() < 1e-6);
+        assert!((d.ratio_y - 1.28).abs() < 1e-6);
+        // 网络坐标 y=32（高度一半）应映回原图 y=25（32/1.28），而不是 32/0.96≈33
+        let b = scale_box((0, 32, 96, 32), d.ratio, d.ratio_y, 100, 50).unwrap();
+        assert_eq!(b, (0, 25, 100, 25), "y/h 必须按 ratio_y 换算: {b:?}");
     }
 }

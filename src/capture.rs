@@ -37,8 +37,9 @@ impl CapturedImage {
     /// 从本图裁出一块区域（虚拟屏幕绝对坐标）。越界自动钳制到图像内。
     pub fn crop(&self, x: i32, y: i32, w: i32, h: i32) -> CapturedImage {
         let stride = self.width.max(1) as usize * 4;
-        let dx = (x - self.x).clamp(0, self.width.max(0)) as usize;
-        let dy = (y - self.y).clamp(0, self.height.max(0)) as usize;
+        // i64 中间值：x/self.x 极端取值下 i32 减法可溢出（debug 构建会 panic）
+        let dx = ((x as i64 - self.x as i64).clamp(0, self.width.max(0) as i64)) as usize;
+        let dy = ((y as i64 - self.y as i64).clamp(0, self.height.max(0) as i64)) as usize;
         let cw = w.min(self.width - dx as i32).max(1) as usize;
         let ch = h.min(self.height - dy as i32).max(1) as usize;
         let row = cw * 4;
@@ -115,6 +116,10 @@ pub fn capture_region_ex(
 ) -> Result<CapturedImage> {
     if w <= 0 || h <= 0 {
         return Err(AppError::Config("截屏区域为空".into()));
+    }
+    // 尺寸上限（纵深防御）：w*h*4 的分配在 usize 域先校验，CreateDIBSection 另有兜底
+    if (w as u64) * (h as u64) * 4 > (2 << 30) {
+        return Err(AppError::Config(format!("截屏区域过大：{w}×{h}")));
     }
     unsafe {
         let screen_dc: HDC = GetDC(HWND::default());

@@ -27,11 +27,23 @@ pub fn assemble(lines: &[TextLine], layout: OcrLayout) -> String {
         };
     }
 
-    // 归并成视觉行
+    // 归并成视觉行。混合输入（部分行无几何）：无几何行不丢弃，附在几何行之后，
+    // 否则这些行的文本会静默从输出消失。
     let mut items: Vec<(i32, i32, i32, i32, &TextLine)> = text_lines
         .iter()
         .filter_map(|l| l.rect.map(|(x, y, w, h)| (x, y, w, h, *l)))
         .collect();
+    let no_geom: Vec<&TextLine> = text_lines
+        .iter()
+        .filter(|l| l.rect.is_none())
+        .copied()
+        .collect();
+    if !no_geom.is_empty() {
+        crate::diag::log(&format!(
+            "[ocr] {} 行无几何信息，附在版面重建结果之后",
+            no_geom.len()
+        ));
+    }
     items.sort_by_key(|r| (r.1, r.0));
 
     let mut rows: Vec<Vec<(i32, i32, i32, i32, &TextLine)>> = Vec::new();
@@ -70,7 +82,9 @@ pub fn assemble(lines: &[TextLine], layout: OcrLayout) -> String {
     };
 
     if layout == OcrLayout::Single {
-        return rows.iter().map(row_text).collect::<Vec<_>>().join(" ");
+        let mut parts: Vec<String> = rows.iter().map(row_text).collect();
+        parts.extend(no_geom.iter().map(|l| l.text.trim().to_string()));
+        return parts.join(" ");
     }
 
     // 行高中位数 → 段落间距判据
@@ -92,6 +106,11 @@ pub fn assemble(lines: &[TextLine], layout: OcrLayout) -> String {
         }
         out.push_str(&row_text(row));
         prev_bottom = Some(bottom);
+    }
+    // 无几何信息的行附在最后（不丢弃文本）
+    for l in no_geom {
+        out.push('\n');
+        out.push_str(l.text.trim());
     }
     out
 }
@@ -205,6 +224,17 @@ mod tests {
         ];
         assert_eq!(assemble(&lines, OcrLayout::Auto), "a\nb");
         assert_eq!(assemble(&lines, OcrLayout::Single), "a b");
+    }
+
+    #[test]
+    fn assemble_mixed_geometry_keeps_ungeoreferenced_lines() {
+        // 混合输入：无几何行的文本不得静默丢失（附在几何行之后）
+        let lines = vec![
+            line("有几何", (10, 10, 60, 16)),
+            TextLine { text: "无几何".into(), conf: 0.5, rect: None },
+        ];
+        let out = assemble(&lines, OcrLayout::Multi);
+        assert!(out.contains("有几何") && out.contains("无几何"), "两行都应在输出中: {out:?}");
     }
 
     #[test]

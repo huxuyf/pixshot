@@ -221,11 +221,23 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_NCHITTEST => {
             let x = (lp.0 & 0xFFFF) as u16 as i16 as i32;
             let y = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-            let m = data_of(hwnd).map(|d| d.margin).unwrap_or(0);
-            let mut r = RECT::default();
-            if GetWindowRect(hwnd, &mut r).is_err() || m <= 0 {
+            let (m, cached) = data_of(hwnd)
+                .map(|d| (d.margin, d.rect_valid.then_some(d.rect)))
+                .unwrap_or((0, None));
+            if m <= 0 {
                 return LRESULT(HTCLIENT as isize);
             }
+            // 高频路径优先用 WM_WINDOWPOSCHANGED 缓存的矩形，避免每次 GetWindowRect
+            let r = match cached {
+                Some(r) => r,
+                None => {
+                    let mut rr = RECT::default();
+                    if GetWindowRect(hwnd, &mut rr).is_err() {
+                        return LRESULT(HTCLIENT as isize);
+                    }
+                    rr
+                }
+            };
             let in_image = x >= r.left + m && x < r.right - m && y >= r.top + m && y < r.bottom - m;
             if in_image {
                 LRESULT(HTCLIENT as isize)
@@ -315,8 +327,9 @@ unsafe fn zoom(hwnd: HWND, wp: WPARAM) {
     let (new_iw, new_ih) = scaled_size(data, new_scale);
     let cx = (pt.x - (r.left + m)).clamp(0, old_iw);
     let cy = (pt.y - (r.top + m)).clamp(0, old_ih);
-    let nx = pt.x - cx * new_iw / old_iw - m;
-    let ny = pt.y - cy * new_ih / old_ih - m;
+    // 锚点换算用 i64 中间值：大图（7680px）× 8 倍缩放时 cx*new_iw 可超 i32
+    let nx = pt.x - (cx as i64 * new_iw as i64 / old_iw as i64) as i32 - m;
+    let ny = pt.y - (cy as i64 * new_ih as i64 / old_ih as i64) as i32 - m;
 
     data.scale = new_scale;
     data.rect = RECT {
@@ -327,9 +340,10 @@ unsafe fn zoom(hwnd: HWND, wp: WPARAM) {
     };
     data.rect_valid = true;
     // 位置与尺寸由 nx/ny/尺寸 显式给出 → 不能用 SWP_NOMOVE
+    // SWP_NOZORDER 下 hwndInsertAfter 无效，传空句柄（原写 HWND_TOP 自相矛盾）
     let _ = SetWindowPos(
         hwnd,
-        HWND_TOP,
+        HWND::default(),
         nx,
         ny,
         new_iw + m * 2,
@@ -441,7 +455,15 @@ unsafe fn fill_shadow(bits: *mut u8, cw: i32, m: i32, iw: i32, ih: i32) {
     }
     let ch = ih + m * 2;
     let (ix0, iy0, ix1, iy1) = (m, m, m + iw, m + ih);
+    // alpha 只依赖 d²：查表代替每像素的 sqrt（更避免在像素内层循环里重复读配置）
+    let peak = crate::config::get().pin_shadow_peak;
     let inv_m = 1.0f32 / m as f32;
+    let lut: Vec<u8> = (0..=2 * m * m)
+        .map(|d2| {
+            let t = ((d2 as f32).sqrt() * inv_m).min(1.0);
+            (255.0 * peak * (1.0 - t) * (1.0 - t)).round() as u8
+        })
+        .collect();
     for y in 0..ch {
         // 该行到图像矩形的纵向距离；行在图像带内时为 0（此时只在左右留白写投影）
         let (dy, x_lo, x_hi, two_span) = if y < iy0 {
@@ -465,10 +487,7 @@ unsafe fn fill_shadow(bits: *mut u8, cw: i32, m: i32, iw: i32, ih: i32) {
                 } else {
                     0
                 };
-                let d = ((dx * dx + dy * dy) as f32).sqrt();
-                let t = (d * inv_m).min(1.0);
-                let alpha =
-                    (255.0 * crate::config::get().pin_shadow_peak * (1.0 - t) * (1.0 - t)).round() as u8;
+                let alpha = lut[(dx * dx + dy * dy) as usize];
                 if alpha == 0 {
                     continue;
                 }
@@ -561,7 +580,6 @@ unsafe fn draw_image(
 }
 
 unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
-    let Some(data) = data_of(hwnd) else { return };
     let cfg = config::get();
 
     // 快捷键与工具条保持一致（Ctrl+C 复制 / Ctrl+S 保存 / Ctrl+O OCR）
@@ -585,6 +603,9 @@ unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
         return;
     };
 
+    // menu::show 是模态消息循环，期间本窗口过程可被重入——&mut PinData 不得
+    // 跨模态存续（Rust 别名规则），菜单返回后重新获取。
+    let Some(data) = data_of(hwnd) else { return };
     let img: &[u8] = &data.image;
     match choice {
         0 => match clipboard::copy_image(img, data.img_w, data.img_h) {
@@ -615,7 +636,7 @@ unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
             if GetWindowRect(hwnd, &mut r).is_ok() {
                 let _ = SetWindowPos(
                     hwnd,
-                    HWND_TOP,
+                    HWND::default(),
                     r.left,
                     r.top,
                     iw + m * 2,

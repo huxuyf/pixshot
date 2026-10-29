@@ -71,7 +71,7 @@ pub fn start(owner: HWND, x: i32, y: i32, font_px: i32) -> bool {
             unsafe {
                 let _ = AllowSetForegroundWindow(child.id());
             }
-            *HELPER.lock().unwrap() = Some(child);
+            *HELPER.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
             true
         }
         Err(e) => {
@@ -83,7 +83,8 @@ pub fn start(owner: HWND, x: i32, y: i32, font_px: i32) -> bool {
 
 /// 结束文字输入子进程（幂等）。
 pub fn stop() {
-    if let Some(mut child) = HELPER.lock().unwrap().take() {
+    let mut g = HELPER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut child) = g.take() {
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -92,6 +93,9 @@ pub fn stop() {
 /// 主进程收到 `WM_COPYDATA` 时解析载荷：`(是否结束输入, 正文)`。
 /// 非本模块的 `WM_COPYDATA`（`dwData` 非 0/1）返回 `None`。
 pub unsafe fn parse_payload(lp: LPARAM) -> Option<(bool, String)> {
+    if lp.0 == 0 {
+        return None;
+    }
     let cds = &*(lp.0 as *const COPYDATASTRUCT);
     let kind = cds.dwData;
     if kind != PAYLOAD_UPDATE && kind != PAYLOAD_DONE {
@@ -103,6 +107,25 @@ pub unsafe fn parse_payload(lp: LPARAM) -> Option<(bool, String)> {
         std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize)
     };
     Some((kind == PAYLOAD_DONE, String::from_utf8_lossy(bytes).into_owned()))
+}
+
+/// 校验 `WM_COPYDATA` 的发送者窗口（wParam）是否属于当前输入子进程。
+/// 同会话的任意进程都能向冻结层发 WM_COPYDATA，不校验即可被注入标注文字。
+pub fn is_expected_sender(wp: WPARAM) -> bool {
+    if wp.0 == 0 {
+        return false;
+    }
+    let pid = HELPER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|c| c.id());
+    let Some(pid) = pid else { return false };
+    let mut sender_pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(HWND(wp.0 as *mut core::ffi::c_void), Some(&mut sender_pid));
+    }
+    sender_pid == pid
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -135,9 +158,12 @@ struct Helper {
     had_focus: bool,
     /// 是否已发出"结束"、正在收尾（抑制重复发送与 WM_KILLFOCUS 误触发）。
     done: bool,
+    /// 从未获焦的计时（TIMER_ALIVE 节拍数）：置前/焦点失败时兜底自毁，
+    /// 避免输入窗永远挂在屏幕上。
+    focus_wait_ticks: u32,
 }
 
-/// 子进程入口：解析 `--text-input <owner_hex> <x> <y> <font_px>` 并跑输入窗口。
+/// 子进程入口：解析 `--text-input <owner_hwnd(十进制)> <x> <y> <font_px>` 并跑输入窗口。
 /// 返回进程退出码。
 pub fn run_helper(args: &[String]) -> i32 {
     let Some(i) = args.iter().position(|a| a == "--text-input") else {
@@ -187,6 +213,7 @@ unsafe fn run_window(owner: HWND, x: i32, y: i32, font_px: i32) -> i32 {
         orig_edit_proc: 0,
         had_focus: false,
         done: false,
+        focus_wait_ticks: 0,
     }));
 
     let hwnd = CreateWindowExW(
@@ -241,7 +268,9 @@ unsafe fn edit_text(edit: HWND) -> String {
 }
 
 /// 把正文回传 owner：`commit=false` 为变化中，`true` 为结束输入。
-unsafe fn send_text(owner: HWND, commit: bool, text: &str) {
+/// `from` = 本进程输入窗口句柄，经 wParam 带给主进程做发送者校验
+/// （同会话的其他进程不得向冻结层注入标注文字，见 `is_expected_sender`）。
+unsafe fn send_text(owner: HWND, from: HWND, commit: bool, text: &str) {
     let bytes = text.as_bytes();
     let cds = COPYDATASTRUCT {
         dwData: if commit { PAYLOAD_DONE } else { PAYLOAD_UPDATE },
@@ -255,19 +284,23 @@ unsafe fn send_text(owner: HWND, commit: bool, text: &str) {
     let _ = SendMessageW(
         owner,
         WM_COPYDATA,
-        WPARAM(0),
+        WPARAM(from.0 as usize),
         LPARAM(&cds as *const _ as isize),
     );
 }
 
-/// 收尾：发出"结束"（若还没发过）并销毁窗口。幂等。
+/// 收尾：发出"结束"（若还没发过）并请求销毁窗口。幂等。
+///
+/// 销毁走**投递** WM_CLOSE（异步）：本函数可能在 Edit 子类过程的调用栈上被调
+/// （Esc / WM_KILLFOCUS），同步 `DestroyWindow` 会在控件自身窗口过程内销毁
+/// 该控件——销毁后还要沿子类过程返回，属重入风险点；改为下一轮消息循环处理。
 unsafe fn finish(hwnd: HWND, data: *mut Helper) {
     let d = &mut *data;
     if !d.done {
         d.done = true;
-        send_text(d.owner, true, &edit_text(d.edit));
+        send_text(d.owner, hwnd, true, &edit_text(d.edit));
     }
-    let _ = DestroyWindow(hwnd);
+    let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
 }
 
 unsafe extern "system" fn helper_proc(
@@ -373,7 +406,7 @@ unsafe extern "system" fn helper_proc(
                 if !p.is_null() {
                     let d = &mut *p;
                     if !d.done {
-                        send_text(d.owner, false, &edit_text(d.edit));
+                        send_text(d.owner, hwnd, false, &edit_text(d.edit));
                     }
                 }
             }
@@ -383,10 +416,20 @@ unsafe extern "system" fn helper_proc(
             if wp.0 == TIMER_ALIVE {
                 let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Helper;
                 if !p.is_null() {
-                    let d = &*p;
-                    // owner 窗口没了（主进程退出/会话结束）→ 自杀，避免残留
-                    if d.owner.is_invalid() || !IsWindow(d.owner).as_bool() {
+                    let (owner_gone, never_focused) = {
+                        let d = &mut *p;
+                        if !d.had_focus && !d.done {
+                            d.focus_wait_ticks += 1;
+                        }
+                        let gone = d.owner.is_invalid() || !IsWindow(d.owner).as_bool();
+                        // 约 5 秒（12×400ms）从未获焦：置前/焦点失败，不能永远挂着
+                        (gone, !d.had_focus && d.focus_wait_ticks >= 12)
+                    };
+                    if owner_gone {
+                        // owner 窗口没了（主进程退出/会话结束）→ 自杀，避免残留
                         let _ = DestroyWindow(hwnd);
+                    } else if never_focused {
+                        finish(hwnd, p);
                     }
                 }
             }

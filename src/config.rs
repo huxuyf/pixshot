@@ -597,6 +597,7 @@ fn load() -> Config {
     let p = path();
     match std::fs::read_to_string(&p) {
         Ok(text) => {
+            // BOM 剥离在 parse_detailed 内统一处理
             let (c, warnings) = parse_detailed(&text);
             for w in &warnings {
                 crate::diag::log(&format!("[config] {w}"));
@@ -611,15 +612,27 @@ fn load() -> Config {
             ));
             c
         }
-        Err(_) => {
-            // 首次运行：落一份带注释的模板，让用户知道有这个文件
-            let c = Config::default();
-            if let Err(e) = write(&c) {
-                crate::diag::log(&format!("[config] 创建默认配置失败: {e}"));
+        Err(e) => {
+            // 只有「文件不存在」才是首次运行——落一份带注释的模板。
+            // 读取失败（非 UTF-8/GBK 编辑、磁盘错误、权限拒绝）**不得覆盖原文件**：
+            // 备份留底后用默认值运行（用户改过的配置不应因编码问题被清盘）。
+            if e.kind() == std::io::ErrorKind::NotFound {
+                let c = Config::default();
+                if let Err(e) = write(&c) {
+                    crate::diag::log(&format!("[config] 创建默认配置失败: {e}"));
+                } else {
+                    crate::diag::log(&format!("[config] 已创建默认配置 {}", p.display()));
+                }
+                c
             } else {
-                crate::diag::log(&format!("[config] 已创建默认配置 {}", p.display()));
+                crate::diag::log(&format!(
+                    "[config] 读取失败({e})，已备份为 config.ini.bak 并改用默认配置（原文件未覆盖）"
+                ));
+                if let Err(be) = std::fs::copy(&p, p.with_extension("ini.bak")) {
+                    crate::diag::log(&format!("[config] 备份失败: {be}"));
+                }
+                Config::default()
             }
-            c
         }
     }
 }
@@ -636,13 +649,16 @@ fn write(c: &Config) -> std::io::Result<()> {
 pub fn render(c: &Config) -> String {
     let b = |v: bool| if v { "1" } else { "0" };
     let mut s = String::new();
-    s.push_str("# PixShot 配置文件（UTF-8）\n");
+    s.push_str("# PixShot 配置文件（必须以 UTF-8 保存；用记事本编辑请选 UTF-8 编码）\n");
     s.push_str("# 分节（[section]）仅用于组织；键名在全文件内唯一。\n");
     s.push_str("# 修改后重启 PixShot 生效；删除本文件即恢复默认。\n");
+    s.push_str("# 注意：程序内改动设置（如保存目录）会整体重写本文件，手写注释不保留；\n");
+    s.push_str("# 请将本程序放在有写权限的目录（勿放 Program Files），否则配置无法保存。\n");
 
     s.push_str("\n[hotkey]\n");
-    s.push_str("# 截图热键：F1..F24 / 字母 / 数字 / PrintScreen / Home / End 等，\n");
+    s.push_str("# 截图热键：F1..F24 / 字母 / 数字 / PrintScreen / Home / End / Enter / Esc / 方向键等，\n");
     s.push_str("# 可加修饰键 Ctrl、Alt、Shift、Win，用 + 连接。例：Ctrl+Shift+S\n");
+    s.push_str("#（热键固定为按住不重复触发，当前不可配置）\n");
     s.push_str(&format!("hotkey = {}\n", c.hotkey));
     s.push_str("# 剪贴板贴图热键：把剪贴板内容（图片/文本/Excel/富文本）以图片置顶显示。\n");
     s.push_str(&format!("pin_hotkey = {}\n", c.pin_hotkey));
@@ -836,6 +852,8 @@ pub fn parse(text: &str) -> Config {
 /// 支持 `[section]` 标题（仅组织用，键按叶子名匹配）、`#`/`;` 注释、
 /// 以及旧版扁平键名（别名）。
 pub fn parse_detailed(text: &str) -> (Config, Vec<String>) {
+    // 剥 UTF-8 BOM（部分编辑器保存时附加，否则首行键名被污染而静默忽略）
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut c = Config::default();
     let mut warnings: Vec<String> = Vec::new();
     for raw in text.lines() {
@@ -1100,7 +1118,13 @@ fn parse_u32(s: &str, lo: u32, hi: u32) -> Option<u32> {
 }
 
 fn parse_f32(s: &str, lo: f32, hi: f32) -> Option<f32> {
-    s.trim().parse::<f32>().ok().map(|n| n.clamp(lo, hi))
+    // 显式排除 NaN/inf：Rust 的 f32::from_str 接受它们，而 NaN.clamp() 仍返回
+    // NaN——会穿透钳制进入配置（下游 `< 阈值` 比较恒为假，静默改变行为）
+    s.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|n| n.is_finite())
+        .map(|n| n.clamp(lo, hi))
 }
 
 /// 整数项解析：非法时记告警并沿用 `cur`。
@@ -1225,6 +1249,12 @@ fn vk_from_name(k: &str) -> Option<u32> {
         "end" => 0x23,
         "pageup" | "pgup" => 0x21,
         "pagedown" | "pgdn" => 0x22,
+        "enter" | "return" => 0x0D,
+        "esc" | "escape" => 0x1B,
+        "up" => 0x26,
+        "down" => 0x28,
+        "left" => 0x25,
+        "right" => 0x27,
         "space" => 0x20,
         "tab" => 0x09,
         "backspace" | "back" => 0x08,
@@ -1268,6 +1298,33 @@ mod tests {
         assert_eq!(parse_hotkey("Ctrl+"), None);
         assert_eq!(parse_hotkey("Ctrl+A+B"), None); // 两个主键
         assert_eq!(parse_hotkey("NoSuchKey"), None);
+    }
+
+    #[test]
+    fn hotkey_supports_enter_esc_arrows() {
+        assert_eq!(parse_hotkey("Enter"), Some((MOD_NOREPEAT, 0x0D)));
+        assert_eq!(parse_hotkey("Esc"), Some((MOD_NOREPEAT, 0x1B)));
+        assert_eq!(parse_hotkey("Ctrl+Up"), Some((MOD_NOREPEAT | MOD_CONTROL, 0x26)));
+        assert_eq!(parse_hotkey("Right"), Some((MOD_NOREPEAT, 0x27)));
+    }
+
+    #[test]
+    fn parse_strips_utf8_bom() {
+        // 带 BOM 的文件：首行键名不得被污染
+        let c = parse("\u{FEFF}hotkey = F5\ntoast_ms = 3000\n");
+        assert_eq!(c.hotkey, "F5");
+        assert_eq!(c.toast_ms, 3000);
+    }
+
+    #[test]
+    fn parse_f32_rejects_nan_and_inf() {
+        // NaN.clamp 仍返回 NaN——必须显式拒绝，否则穿透钳制
+        let c = parse("confidence = NaN\n");
+        assert!(c.ocr_confidence.is_finite(), "NaN 不得进入配置");
+        let c = parse("confidence = inf\n");
+        assert!(c.ocr_confidence.is_finite(), "inf 不得进入配置");
+        let c = parse("confidence = 0.7\n");
+        assert!((c.ocr_confidence - 0.7).abs() < 1e-6);
     }
 
     /// 越界与非法项必须回退默认值，绝不能让程序起不来。

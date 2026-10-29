@@ -74,7 +74,12 @@ unsafe fn render_impl(text: &str, opts: &TextOptions) -> Result<(i32, i32, Vec<u
     }
 
     let lines = wrap_lines(gm, measure_font, text, max_width);
-    let line_h = (font_px as f32 * opts.line_spacing).round().max(1.0) as i32;
+    // 行高取「配置比例」与「量测行盒」的较大者：line_spacing 配小了字形不再上下重叠
+    let measured_h = measure(gm, measure_font, "Ag中").1;
+    let line_h = (font_px as f32 * opts.line_spacing)
+        .max(measured_h)
+        .round()
+        .max(1.0) as i32;
     let text_w = lines
         .iter()
         .map(|l| measure(gm, measure_font, l).0.ceil().max(1.0) as i32)
@@ -108,7 +113,8 @@ unsafe fn render_impl(text: &str, opts: &TextOptions) -> Result<(i32, i32, Vec<u
     free_graphics(g);
 
     let mut out = surf.read_rows();
-    // 文本贴图是不透明内容：alpha 统一置满
+    // 文本贴图是不透明内容：alpha 统一置满。配置里 `bg` 的 alpha 被有意忽略——
+    // 贴图窗口是预乘 alpha 的分层窗口，半透明底色需要整套预乘管线支撑，当前不支持
     for px in out.chunks_exact_mut(4) {
         px[3] = 0xFF;
     }
@@ -116,6 +122,10 @@ unsafe fn render_impl(text: &str, opts: &TextOptions) -> Result<(i32, i32, Vec<u
 }
 
 /// 贪心换行（按字符切分，对中文友好；英文单词可能被从中间断开）。
+///
+/// 性能：整段先一次量测（放得下即成行）；放不下时**逐字符量测一次并缓存宽度**
+/// 后贪心累积——总共 O(n) 次量测。原实现对每个字符都量测整个累积串（O(n²)，
+/// 且每次新建 StringFormat），粘贴长文本时会明显卡顿。
 unsafe fn wrap_lines(g: *mut GpGraphics, font: *mut GpFont, text: &str, max_width: i32) -> Vec<String> {
     let max_w = max_width as f32;
     let mut lines: Vec<String> = Vec::new();
@@ -124,15 +134,25 @@ unsafe fn wrap_lines(g: *mut GpGraphics, font: *mut GpFont, text: &str, max_widt
             lines.push(String::new());
             continue;
         }
+        // 快速路径：整段放得下
+        if measure(g, font, para).0 <= max_w {
+            lines.push(para.to_string());
+            continue;
+        }
+        let chars: Vec<char> = para.chars().collect();
+        let widths: Vec<f32> = chars
+            .iter()
+            .map(|c| measure(g, font, &c.to_string()).0)
+            .collect();
         let mut cur = String::new();
-        for ch in para.chars() {
-            cur.push(ch);
-            let (w, _) = measure(g, font, &cur);
-            if w > max_w && cur.chars().count() > 1 {
-                let last = cur.pop().unwrap();
+        let mut cur_w = 0f32;
+        for (c, cw) in chars.iter().zip(widths.iter()) {
+            if cur_w + cw > max_w && !cur.is_empty() {
                 lines.push(std::mem::take(&mut cur));
-                cur.push(last);
+                cur_w = 0.0;
             }
+            cur.push(*c);
+            cur_w += cw;
         }
         lines.push(cur);
     }

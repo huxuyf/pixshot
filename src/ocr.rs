@@ -21,10 +21,16 @@ mod onnx_image;
 mod winrt;
 
 use engine::OcrEngineImpl;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::error::{AppError, Result};
+use windows::Win32::Foundation::{S_FALSE, S_OK};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+/// 识别进行中标志（并发触发去抖：连点 N 次只会排队跑 N 次完整推理，
+/// 而只有最后一次的结果有意义）。
+static OCR_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// 后台识别 → 文字写入剪贴板 → 交主窗口弹 Toast（**不弹结果窗口**）。
 ///
@@ -33,6 +39,11 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 /// 识别必须离开 GUI 线程（WinRT 异步调用不可阻塞消息循环），故开后台线程，
 /// 完成后用 `WM_APP_OCR_DONE` 把结果码投递回主窗口展示提示。
 pub fn recognize_to_clipboard_async(image: Arc<[u8]>, w: i32, h: i32) {
+    // 识别中去抖：忽略重复触发
+    if OCR_BUSY.swap(true, Ordering::SeqCst) {
+        crate::diag::log("[ocr] 上一次识别尚未完成，忽略本次触发");
+        return;
+    }
     // HWND 非 Send：跨线程以地址（isize）传递，线程内还原
     let main_addr = crate::tray::main_hwnd().0 as isize;
     std::thread::spawn(move || {
@@ -50,6 +61,7 @@ pub fn recognize_to_clipboard_async(image: Arc<[u8]>, w: i32, h: i32) {
                 crate::tray::OCR_DONE_FAIL
             }
         };
+        OCR_BUSY.store(false, Ordering::SeqCst);
         if main_addr != 0 {
             use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
             use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -65,10 +77,14 @@ pub fn recognize_to_clipboard_async(image: Arc<[u8]>, w: i32, h: i32) {
 /// 须在非 GUI 线程调用（本函数自行初始化 COM）。
 pub fn recognize(bgra: &[u8], w: i32, h: i32) -> Result<String> {
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    if hr.is_ok() {
+    // S_OK（本线程首次初始化）才配对 CoUninitialize；S_FALSE 表示调用方已初始化，
+    // 此时 uninit 会抵消对方的计数，导致同线程后续 COM 调用意外失效
+    if hr == S_OK {
         let r = recognize_inner(bgra, w, h);
         unsafe { CoUninitialize() };
         r
+    } else if hr == S_FALSE {
+        recognize_inner(bgra, w, h)
     } else {
         Err(AppError::Ocr(format!("CoInitializeEx 失败: {hr}")))
     }
@@ -98,7 +114,25 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
 
     // 自包含引擎（ONNX）：自带检测+识别+版面，直接取行结构做聚类与后处理，不走多候选启发式。
     if engine.self_contained() {
-        let lines = engine.recognize_lines(bgra, w, h)?;
+        // 小图先整体上采样：DB 检测对 <10px 字高召回差（原 WinRT 路径同样上采样）。
+        // 仅长边 < 阈值时触发、上限 3×；正常截图不受影响（超限由 det_input 按 det_limit 收缩）。
+        const UPSAMPLE_FLOOR: i32 = 640;
+        const UPSAMPLE_MAX: f32 = 3.0;
+        let longest = w.max(h);
+        let upscaled: Option<(Vec<u8>, i32, i32)> = if longest < UPSAMPLE_FLOOR {
+            let scale = (UPSAMPLE_FLOOR as f32 / longest as f32).min(UPSAMPLE_MAX);
+            let sw = ((w as f32 * scale).round() as i32).max(1);
+            let sh = ((h as f32 * scale).round() as i32).max(1);
+            crate::diag::log(&format!("[ocr] 小图上采样 {w}×{h} -> {sw}×{sh}"));
+            Some((resize_bicubic(bgra, w as usize, h as usize, sw as usize, sh as usize), sw, sh))
+        } else {
+            None
+        };
+        let (data, w, h) = match &upscaled {
+            Some((v, sw, sh)) => (v.as_slice(), *sw, *sh),
+            None => (bgra, w, h),
+        };
+        let lines = engine.recognize_lines(data, w, h)?;
         let total = lines.len();
         let kept: Vec<engine::TextLine> = lines
             .into_iter()
@@ -231,37 +265,50 @@ fn cubic_kernel(x: f32) -> f32 {
 /// 把细笔画整根丢掉。两者都减少锯齿对字符笔画的破坏。输入/输出均为 BGRA、自上而下、
 /// 行距 = width×4；四个通道（含 alpha）一并插值，以像素中心对齐并钳制采样坐标。
 fn resize_bicubic(bgra: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
+    resize_bicubic_ch::<4>(bgra, w, h, nw, nh, 0)
+}
+
+/// 可分离双三次缩放内核（通道数泛型：BGRA 4 通道与 RGB 3 通道共用，
+/// 见 `onnx_image::resize`）。越界采样回填 `fill`（BGRA 用 0，RGB 用 255）。
+pub(crate) fn resize_bicubic_ch<const C: usize>(
+    data: &[u8],
+    w: usize,
+    h: usize,
+    nw: usize,
+    nh: usize,
+    fill: u8,
+) -> Vec<u8> {
     if w == 0 || h == 0 || nw == 0 || nh == 0 {
-        return vec![0u8; nw * nh * 4];
+        return vec![fill; nw * nh * C];
     }
     if nw == w && nh == h {
-        let mut out = vec![0u8; w * h * 4];
-        let n = out.len().min(bgra.len());
-        out[..n].copy_from_slice(&bgra[..n]);
+        let mut out = vec![fill; w * h * C];
+        let n = out.len().min(data.len());
+        out[..n].copy_from_slice(&data[..n]);
         return out;
     }
 
     let read = |x: usize, y: usize, c: usize| -> f32 {
-        let i = (y * w + x) * 4 + c;
-        if i < bgra.len() {
-            bgra[i] as f32
+        let i = (y * w + x) * C + c;
+        if i < data.len() {
+            data[i] as f32
         } else {
-            0.0
+            fill as f32
         }
     };
 
     // 横向：w → nw，中间结果用 f32 承接，避免纵向再做一次 8 位量化
-    let mut tmp = vec![0f32; nw * h * 4];
+    let mut tmp = vec![0f32; nw * h * C];
     let rx = w as f32 / nw as f32;
     let fx = rx.max(1.0); // 缩小 → 核支撑域按此加宽
     let support_x = 2.0 * fx;
     for y in 0..h {
         for x in 0..nw {
             let src = (x as f32 + 0.5) * rx - 0.5;
-            let d = (y * nw + x) * 4;
+            let d = (y * nw + x) * C;
             let lo = (src - support_x).ceil() as i32;
             let hi = (src + support_x).floor() as i32;
-            for c in 0..4 {
+            for c in 0..C {
                 let mut acc = 0f32;
                 let mut wsum = 0f32;
                 for idx in lo..=hi {
@@ -276,7 +323,7 @@ fn resize_bicubic(bgra: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<
     }
 
     // 纵向：h → nh，量化回 8 位
-    let mut out = vec![0u8; nw * nh * 4];
+    let mut out = vec![fill; nw * nh * C];
     let ry = h as f32 / nh as f32;
     let fy = ry.max(1.0);
     let support_y = 2.0 * fy;
@@ -285,14 +332,14 @@ fn resize_bicubic(bgra: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<
         let lo = (src - support_y).ceil() as i32;
         let hi = (src + support_y).floor() as i32;
         for x in 0..nw {
-            let d = (y * nw + x) * 4;
-            for c in 0..4 {
+            let d = (y * nw + x) * C;
+            for c in 0..C {
                 let mut acc = 0f32;
                 let mut wsum = 0f32;
                 for idx in lo..=hi {
                     let wt = cubic_kernel((src - idx as f32) / fy);
                     let cy = idx.clamp(0, h as i32 - 1) as usize;
-                    acc += wt * tmp[(cy * nw + x) * 4 + c];
+                    acc += wt * tmp[(cy * nw + x) * C + c];
                     wsum += wt;
                 }
                 let v = if wsum != 0.0 { acc / wsum } else { 0.0 };

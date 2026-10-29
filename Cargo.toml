@@ -44,6 +44,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     # 单实例互斥体（CreateMutexW 依赖 SECURITY_ATTRIBUTES）
     "Win32_Security",
+    # RTF 降级文本的代码页解码（MultiByteToWideChar，ANSICPG -> Unicode）
+    "Win32_Globalization",
 ] }
 
 [features]
