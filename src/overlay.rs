@@ -54,8 +54,9 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
-    GdiFlush, GetDC, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
-    BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
+    GdiFlush, GetDC, MonitorFromPoint, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER,
+    BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -226,6 +227,12 @@ struct State {
     last: Option<Rect4>,
     /// 上一帧尺寸标签矩形（客户区坐标）：擦标签时还原为暗化像素。
     last_label: Option<Rect4>,
+    /// 缓存的 GDI+ 上下文（建在 surface_dc 上）：拖动框选期间每个 mousemove
+    /// 都画尺寸标签，逐帧创建/销毁 GpGraphics 是不必要的固定开销。
+    /// 生命周期 ≤ surface_dc（cleanup 中先释放它）。
+    label_g: *mut windows::Win32::Graphics::GdiPlus::GpGraphics,
+    /// 尺寸标签文本的复用缓冲（避免每帧 `format!` 堆分配）。
+    label_text: String,
     /// 当前文字输入子进程所服务的**标注锚点**（选区局部坐标）。`Some` 表示子进程
     /// 正在运行；锚点变化（点别处重新落点）时重挂子进程。`None` 表示未在输入。
     text_helper_anchor: Option<Pt>,
@@ -325,6 +332,9 @@ unsafe fn run() -> Option<Selection> {
         surface_bits: bits as *mut u32,
         last: None,
         last_label: None,
+        label_g: crate::annot::render_gdiplus::graphics_from(surface_dc)
+            .unwrap_or(std::ptr::null_mut()),
+        label_text: String::new(),
         text_helper_anchor: None,
     }));
 
@@ -368,7 +378,7 @@ unsafe fn run() -> Option<Selection> {
         if let Some(shot) = &s.snapshot {
             copy_snapshot_into_surface(s.surface_bits, vw, vh, shot);
         }
-            dim_surface(s.surface_bits, vw, vh, crate::config::get().ui_overlay_dim);
+        dim_surface(s.surface_bits, vw, vh, crate::config::get().ui_overlay_dim);
         commit(hwnd, s, (0, 0, vw, vh));
     }
     let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -379,7 +389,15 @@ unsafe fn run() -> Option<Selection> {
     let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 
     let mut msg = MSG::default();
-    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+    loop {
+        let r = GetMessageW(&mut msg, None, 0, 0).0;
+        if r == 0 {
+            break; // WM_QUIT
+        }
+        if r == -1 {
+            crate::diag::log("[overlay] GetMessageW 返回 -1（消息错误），结束框选循环");
+            break;
+        }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -398,7 +416,12 @@ unsafe fn run() -> Option<Selection> {
             state,
         });
     }
-    // 无成品 = 用户取消（Esc / 关闭）
+    // 无成品 = 用户取消（Esc / 关闭 / 外部 WM_QUIT）。外部 WM_QUIT（如托盘「退出」）
+    // 打断模态循环时窗口仍在、`GWLP_USERDATA` 仍指向 State —— 必须先拆窗再释放，
+    // 否则窗口残留且消息处理会解引用悬垂指针（Esc/关闭路径窗口已销毁，重复调用无害）。
+    // 置 quiet_destroy 抑制 WM_DESTROY 里的 PostQuitMessage（退出发令由外层统一处理）。
+    s.quiet_destroy = true;
+    let _ = DestroyWindow(hwnd);
     cleanup(&s);
     None
 }
@@ -456,6 +479,8 @@ unsafe fn commit(hwnd: HWND, s: &State, dirty: Rect4) {
 
 /// 释放框选占用的全部 GDI 资源。
 unsafe fn cleanup(s: &State) {
+    // 先释放缓存的 GDI+ 上下文（建在 surface_dc 上，必须先于 DC 删除）
+    crate::annot::render_gdiplus::free_graphics(s.label_g);
     // 先恢复原对象再删除位图（位图被选入 DC 时 DeleteObject 会失败并泄漏）
     let _ = SelectObject(s.surface_dc, s.surface_old);
     let _ = DeleteObject(s.surface_bmp);
@@ -673,8 +698,13 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 
         // 文字输入子进程 → 冻结层：正文变化 / 结束输入（`dwData` 0=变化 1=结束）。
         // 变化只更新"输入中的正文"（不重绘，正文显示在子进程的输入窗里）；结束时提交落图。
+        // 发送者必须是当前输入子进程的窗口（防同会话其他进程注入标注文字）。
         WM_COPYDATA => {
             if let Some((commit, text)) = crate::textinput::parse_payload(lp) {
+                if !crate::textinput::is_expected_sender(wp) {
+                    crate::diag::log("[overlay] 忽略非输入子进程发来的 WM_COPYDATA");
+                    return LRESULT(0);
+                }
                 if let Some(s) = state_of(hwnd) {
                     if s.mode == OverlayMode::Annotating && s.annot.typing() {
                         let a = if commit {
@@ -771,6 +801,13 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
             crate::config::get().annot_prefs(),
         );
         s.annot_base = DibSurface::new(region.width, region.height);
+        if s.annot_base.is_none() {
+            // 内存不足等：标注层将完全不显示（repaint_annot 早退），必须留下线索
+            crate::diag::log(&format!(
+                "[overlay] 标注底图创建失败（{}×{}）：本次会话标注将不可见",
+                region.width, region.height
+            ));
+        }
         if let Some(base) = &s.annot_base {
             // 底图 = 冻结画面 + 选区红框（此后不可变）
             base.blit_from(s.surface_dc, sel_c.0, sel_c.1, sel_c.2, sel_c.3);
@@ -787,15 +824,17 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
     }
 
     // 单击 / 过小的拖动：不产生选区，擦掉已画的框线与标签（还原为暗化像素），
-    // 继续等待框选
+    // 继续等待框选。脏区必须覆盖框线与标签的**并集**——漏掉标签会让它残留在屏幕上。
     if let Some(last) = s.last.take() {
+        let label = s.last_label.take();
+        let dirty = label.map(|ll| union_rect(last, ll)).unwrap_or(last);
         if let Some(shot) = &s.snapshot {
             restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, last, dim);
-            if let Some(ll) = s.last_label.take() {
+            if let Some(ll) = label {
                 restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, ll, dim);
             }
         }
-        commit(hwnd, s, last);
+        commit(hwnd, s, dirty);
     }
 }
 
@@ -938,7 +977,8 @@ unsafe fn repaint_annot(hwnd: HWND, s: &State, dirty: Rect) {
 
     // 1. 恢复底图
     let _ = BitBlt(s.surface_dc, ox + d.x, oy + d.y, d.w, d.h, base.dc, d.x, d.y, SRCCOPY);
-    // 2. 全量重画标注 + 预览 + 选中态（render_into 内部按选区裁剪）。
+    // 2. 重画标注 + 预览 + 选中态（render_into 按 `d` 裁剪/剔除/限制 CPU 写入，
+    //    部分重绘与全量重绘逐像素一致——见 session::render_into）。
     //    base 供马赛克/高亮取样 pristine 底图（annot_base = 冻结选区 + 框线）。
     let base_src = s.annot_base.as_ref().map(annot::BaseSource::Surface);
     annot::render_into(
@@ -950,17 +990,31 @@ unsafe fn repaint_annot(hwnd: HWND, s: &State, dirty: Rect) {
         &s.annot,
         overlay_dpi(),
         base_src.as_ref(),
+        d,
     );
     // 3. alpha 防御（表面坐标）
     let sr = Rect::new(ox + d.x, oy + d.y, d.w, d.h);
-    crate::annot::session::alpha_fix(s.surface_bits, s.vw, sr);
+    crate::annot::session::alpha_fix(s.surface_bits, s.vw, s.vh, sr);
     // 4. 提交脏区
     commit(hwnd, s, (sr.x, sr.y, sr.w, sr.h));
 }
 
-/// 框选层横跨整个虚拟屏幕，用系统 DPI 作为框线粗细/拖动阈值的换算基准。
+/// 框选层横跨整个虚拟屏幕：以**光标所在显示器**的 DPI 作为框线粗细/拖动阈值/
+/// 标签字号的换算基准（多屏异缩放下比系统 DPI 更贴近用户正在看的屏幕），
+/// 失败时回退系统 DPI。
 fn overlay_dpi() -> i32 {
-    unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as i32 }
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    unsafe {
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_ok() {
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let (mut dx, mut dy) = (0u32, 0u32);
+            if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).is_ok() && dx > 0 {
+                return (dx as i32).max(96);
+            }
+        }
+        windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as i32
+    }
 }
 
 /// 重画选区遮罩帧：擦上一帧（还原为**暗化**像素）→ 提亮当前选区（快照原像素）
@@ -994,16 +1048,19 @@ unsafe fn repaint_frame(hwnd: HWND, s: &mut State) {
     }
     s.last = has.then_some(cur_c);
 
-    // 3) 尺寸标签（画后记录标签区，供下一帧擦除）
+    // 3) 尺寸标签（画后记录标签区，供下一帧擦除）；文本用复用缓冲，避免每帧堆分配
     let label = if has {
-        let text = format!("{} × {}", cur_c.2, cur_c.3);
+        use std::fmt::Write as _;
+        s.label_text.clear();
+        let _ = write!(s.label_text, "{} × {}", cur_c.2, cur_c.3);
         let r = label_rect(
             s.vw,
+            s.vh,
             cur_c,
-            &text,
+            &s.label_text,
             util::scaled(cfg.ui_overlay_label_px, overlay_dpi()),
         );
-        draw_size_label(s, &r, &text, cfg.ui_overlay_label_px);
+        draw_size_label(s, &r, cfg.ui_overlay_label_px);
         Some(r)
     } else {
         None
@@ -1026,28 +1083,30 @@ unsafe fn repaint_frame(hwnd: HWND, s: &mut State) {
     }
 }
 
-/// 选区尺寸标签："宽 × 高" GDI+ 白字，画在标签矩形处。
+/// 选区尺寸标签："宽 × 高" GDI+ 白字，画在标签矩形处（文本取 `s.label_text`）。
 /// GDI+ 文字不写 alpha：画后 `GdiFlush` + `alpha_fix` 强制不透明
 /// （分层窗口上 alpha<255 的像素会显示为半透明并穿透点击）。
-unsafe fn draw_size_label(s: &State, r: &Rect4, text: &str, label_px: i32) {
-    let Some(g) = crate::annot::render_gdiplus::graphics_from(s.surface_dc) else {
+unsafe fn draw_size_label(s: &State, r: &Rect4, label_px: i32) {
+    // 复用缓存的 GDI+ 上下文（拖动期间每个 mousemove 都画标签，
+    // 逐帧 GdipCreateFromHDC 是不必要的固定开销）
+    let g = s.label_g;
+    if g.is_null() {
         return;
-    };
+    }
     let cfg = crate::config::get();
     let px = util::scaled(label_px, overlay_dpi()) as f32;
     crate::annot::render_gdiplus::draw_label_string(
         g,
         r.0 as f32,
         r.1 as f32,
-        text,
+        &s.label_text,
         px,
         cfg.ui_overlay_label_color,
     );
-    crate::annot::render_gdiplus::free_graphics(g);
     let _ = GdiFlush();
     // alpha 防御：标签矩形（外扩 2px 覆盖抗锯齿边缘）强制不透明
     if let Some((x, y, w, h)) = clip_rect((r.0 - 2, r.1 - 2, r.2 + 4, r.3 + 4), s.vw, s.vh) {
-        crate::annot::session::alpha_fix(s.surface_bits, s.vw, Rect::new(x, y, w, h));
+        crate::annot::session::alpha_fix(s.surface_bits, s.vw, s.vh, Rect::new(x, y, w, h));
     }
 }
 
@@ -1057,14 +1116,17 @@ fn label_w(text: &str, px: i32) -> i32 {
 }
 
 /// 标签矩形：选区上方（贴顶则移到下方），左对齐选区左缘（钳回屏幕内）。
-/// `sel_c` 为表面（客户区）坐标，返回同坐标系。
-fn label_rect(vw: i32, sel_c: Rect4, text: &str, px: i32) -> Rect4 {
+/// `sel_c` 为表面（客户区）坐标，返回同坐标系。上下方向都钳回屏幕内。
+fn label_rect(vw: i32, vh: i32, sel_c: Rect4, text: &str, px: i32) -> Rect4 {
     let w = label_w(text, px);
     let h = (px as f32 * 1.4).ceil() as i32;
     let mut x = sel_c.0;
     let mut y = sel_c.1 - h - 4;
     if y < 0 {
         y = sel_c.1 + sel_c.3 + 4;
+    }
+    if y + h > vh {
+        y = (vh - h).max(0);
     }
     if x + w > vw {
         x = vw - w;
@@ -1100,18 +1162,23 @@ unsafe fn clear_rect(bits: *mut u32, vw: i32, vh: i32, r: Rect4) {
 
 /// 用整屏快照铺满绘制表面（框选期间的"冻结画面"底图）。
 ///
-/// 快照与表面同为 `vw×vh`、自上而下 BGRA、行距 `vw*4`，因此整块一次拷贝即可。
-/// 快照 alpha 恒为 255，与分层窗口要求的预乘 BGRA 在此取值下等价。
+/// 常规路径快照与表面同为 `vw×vh`、行距一致；防御路径（快照比虚拟屏幕小）下
+/// 源/目标行距不同，必须**逐行**拷贝。快照 alpha 恒为 255，与分层窗口要求的
+/// 预乘 BGRA 在此取值下等价。
 unsafe fn copy_snapshot_into_surface(bits: *mut u32, vw: i32, vh: i32, shot: &CapturedImage) {
     let rows = vh.min(shot.height.max(0));
     let cols = vw.min(shot.width.max(0));
     if rows <= 0 || cols <= 0 {
         return;
     }
-    let n = rows as usize * cols as usize;
+    let src_stride = shot.width.max(1) as usize;
     let src = shot.data.as_ptr() as *const u32;
-    if shot.data.len() >= n * 4 {
-        std::ptr::copy_nonoverlapping(src, bits, n);
+    for r in 0..rows as usize {
+        let off = r * src_stride;
+        if (off + cols as usize) * 4 > shot.data.len() {
+            break; // 越界保护（快照尺寸异常时宁可留原样也不越界读）
+        }
+        std::ptr::copy_nonoverlapping(src.add(off), bits.add(r * vw as usize), cols as usize);
     }
 }
 
@@ -1209,14 +1276,12 @@ fn point_from_lparam(lp: LPARAM, vx: i32, vy: i32) -> POINT {
 
 type Rect4 = (i32, i32, i32, i32); // (x, y, w, h)
 
-/// 由两个对角点得到规范化矩形（支持反向拖动）。
+/// 由两个对角点得到规范化矩形（支持反向拖动）。min/max 后相减，不走
+/// `(a-b).abs()` 的 i32 取负溢出路径。
 fn norm_rect(a: POINT, b: POINT) -> Rect4 {
-    (
-        a.x.min(b.x),
-        a.y.min(b.y),
-        (a.x - b.x).abs(),
-        (a.y - b.y).abs(),
-    )
+    let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+    let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+    (x0, y0, x1 - x0, y1 - y0)
 }
 
 /// 把矩形钳制到虚拟屏幕范围内（宽高至少 1）。
@@ -1367,7 +1432,8 @@ mod tests {
         assert_eq!(buf, want, "擦帧后必须完全还原为快照像素");
     }
 
-    /// 越界矩形在铺底/擦帧里都不得 panic，也不得越界写。
+    /// 越界矩形在铺底/擦帧里都不得 panic，也不得越界写；快照比表面小时
+    /// 必须按行距逐行铺到正确位置（不允许把二维拷贝拍平成一维）。
     #[test]
     fn snapshot_blit_clips_out_of_bounds() {
         let (vw, vh) = (6i32, 5i32);
@@ -1375,6 +1441,24 @@ mod tests {
         let mut buf = vec![0u32; (vw * vh) as usize];
         unsafe {
             copy_snapshot_into_surface(buf.as_mut_ptr(), vw, vh, &shot);
+        }
+        // 位置断言：快照 (x,y) 像素必须落在表面同一坐标，而不是连续铺开错位
+        for y in 0..3 {
+            for x in 0..4 {
+                let got = buf[(y * vw + x) as usize];
+                let want = u32::from_le_bytes([
+                    shot.data[((y * 4 + x) * 4) as usize],
+                    shot.data[((y * 4 + x) * 4 + 1) as usize],
+                    shot.data[((y * 4 + x) * 4 + 2) as usize],
+                    shot.data[((y * 4 + x) * 4 + 3) as usize],
+                ]);
+                assert_eq!(got, want, "({x},{y}) 位置错位");
+            }
+        }
+        // 快照之外的表面像素必须保持原样（未被写）
+        assert_eq!(buf[(0 * vw + 4) as usize], 0);
+        assert_eq!(buf[(3 * vw + 0) as usize], 0);
+        unsafe {
             restore_rect(buf.as_mut_ptr(), vw, vh, &shot, (4, 3, 100, 100));
             restore_rect(buf.as_mut_ptr(), vw, vh, &shot, (-50, -50, 8, 8));
         }
@@ -1502,20 +1586,23 @@ mod tests {
         );
     }
 
-    /// 标签定位：默认在选区上方；贴顶移到下方；水平钳回屏幕内。
+    /// 标签定位：默认在选区上方；贴顶移到下方；水平钳回屏幕内；下方越界钳回屏内。
     #[test]
     fn label_rect_positioning() {
         // 常规：上方
-        let r = label_rect(1000, (100, 200, 300, 100), "1920 × 1080", 13);
+        let r = label_rect(1000, 800, (100, 200, 300, 100), "1920 × 1080", 13);
         assert_eq!(r.0, 100, "左对齐选区左缘");
         assert!(r.1 + r.3 <= 200 - 4, "标签在选区上方");
         // 贴顶：移到下方
-        let r = label_rect(1000, (100, 2, 300, 100), "1920 × 1080", 13);
+        let r = label_rect(1000, 800, (100, 2, 300, 100), "1920 × 1080", 13);
         assert!(r.1 >= 2 + 100 + 4, "贴顶时标签在选区下方");
         // 左缘贴屏右：钳回屏幕内
-        let r = label_rect(1000, (990, 200, 8, 8), "1920 × 1080", 13);
+        let r = label_rect(1000, 800, (990, 200, 8, 8), "1920 × 1080", 13);
         assert!(r.0 + r.2 <= 1000, "标签不得超出屏幕");
         assert!(r.0 >= 0);
+        // 贴顶且选区延伸到底边：下方放不下时钳回屏内（不得画出下缘）
+        let r = label_rect(1000, 120, (100, 2, 300, 118), "1920 × 1080", 13);
+        assert!(r.1 >= 0 && r.1 + r.3 <= 120, "标签不得超出屏幕下缘: {r:?}");
     }
 
     #[test]

@@ -52,12 +52,13 @@ impl Rect {
     }
 
     /// 四周外扩 `d`（负值收缩；结果仍规范化为 w、h ≥ 0）。
+    /// 全程饱和运算：极端坐标（接近 ±2³⁰）下不溢出。
     pub fn inflate(self, d: i32) -> Self {
         Self {
-            x: self.x - d,
-            y: self.y - d,
-            w: (self.w + 2 * d).max(0),
-            h: (self.h + 2 * d).max(0),
+            x: self.x.saturating_sub(d),
+            y: self.y.saturating_sub(d),
+            w: self.w.saturating_add(d.saturating_mul(2)).max(0),
+            h: self.h.saturating_add(d.saturating_mul(2)).max(0),
         }
     }
 
@@ -65,15 +66,32 @@ impl Rect {
     pub const fn contains(self, p: Pt) -> bool {
         p.x >= self.x && p.x < self.right() && p.y >= self.y && p.y < self.bottom()
     }
+
+    /// 两矩形交集；不相交（含零面积接触）返回 `None`。
+    pub fn intersect(self, o: Rect) -> Option<Rect> {
+        let x0 = self.x.max(o.x);
+        let y0 = self.y.max(o.y);
+        let x1 = self.right().min(o.right());
+        let y1 = self.bottom().min(o.bottom());
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
+    }
+
+    /// 两矩形是否有正面积交集。
+    pub fn intersects(self, o: Rect) -> bool {
+        self.intersect(o).is_some()
+    }
 }
 
 /// 由两个对角点得到规范化矩形（支持反向拖动）。
+/// min/max 后相减，不经历 `(a-b).abs()` 的 i32 取负溢出路径。
 pub fn norm_rect(a: Pt, b: Pt) -> Rect {
+    let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+    let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
     Rect {
-        x: a.x.min(b.x),
-        y: a.y.min(b.y),
-        w: (a.x - b.x).abs(),
-        h: (a.y - b.y).abs(),
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
     }
 }
 
@@ -179,5 +197,17 @@ mod tests {
     fn inflate_clamps_negative_extent() {
         assert_eq!(Rect::new(10, 10, 4, 4).inflate(2), Rect::new(8, 8, 8, 8));
         assert_eq!(Rect::new(10, 10, 4, 4).inflate(-10), Rect::new(20, 20, 0, 0));
+    }
+
+    #[test]
+    fn intersect_basic_and_disjoint() {
+        assert_eq!(
+            Rect::new(0, 0, 10, 10).intersect(Rect::new(5, 5, 10, 10)),
+            Some(Rect::new(5, 5, 5, 5))
+        );
+        assert_eq!(Rect::new(0, 0, 4, 4).intersect(Rect::new(4, 0, 4, 4)), None, "边接触零面积");
+        assert_eq!(Rect::new(0, 0, 4, 4).intersect(Rect::new(9, 9, 2, 2)), None);
+        assert!(Rect::new(0, 0, 10, 10).intersects(Rect::new(9, 9, 5, 5)));
+        assert!(!Rect::new(0, 0, 10, 10).intersects(Rect::new(10, 0, 5, 5)));
     }
 }

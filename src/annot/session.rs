@@ -25,7 +25,7 @@ use super::doc::AnnotDoc;
 use super::geometry::{Pt, Rect};
 use super::render_gdiplus;
 use super::shape::Shape;
-use super::style::{HighlightMode, MosaicMode, Rgba};
+use super::style::{AnnotPrefs, HighlightMode, MosaicMode, Rgba};
 use windows::Win32::Graphics::GdiPlus::GpGraphics;
 
 /// 32bpp 自上而下 DIB 表面（DC + 位图 + 像素基址），`Drop` 时释放 GDI 资源。
@@ -131,11 +131,12 @@ fn top_down_32bpp(w: i32, h: i32) -> BITMAPINFO {
 ///
 /// 冻结表面是分层窗口的内容来源，alpha < 255 的像素会显示为半透明并穿透点击；
 /// 底图 alpha 本就恒 255，这里只修补 GDI+ 写入的区域（脏区小，成本可忽略）。
-pub unsafe fn alpha_fix(bits: *mut u32, stride_w: i32, r: Rect) {
+/// 矩形在函数内部钳到 `[0, stride_w]×[0, height]`，调用方无需保证。
+pub unsafe fn alpha_fix(bits: *mut u32, stride_w: i32, height: i32, r: Rect) {
     let x0 = r.x.max(0);
     let y0 = r.y.max(0);
-    let x1 = r.right();
-    let y1 = r.bottom();
+    let x1 = r.right().min(stride_w);
+    let y1 = r.bottom().min(height);
     if x1 <= x0 || y1 <= y0 {
         return;
     }
@@ -198,10 +199,15 @@ fn blur_radius(w: i32, h: i32) -> i32 {
 }
 
 /// 马赛克：bbox 内按 `block` 块做平均（取样自 pristine 底图，参照 SnowShot
-/// `drawPixelate`）。写入目标表面 `origin` 偏移处；越界自动裁剪。
+/// `drawPixelate`）。写入目标表面 `origin` 偏移处、`bbox ∩ write_clip` 范围内；
+/// 越界自动裁剪。
+///
+/// **块平均恒取整个块 ∩ bbox**（不含 write_clip 裁剪），保证部分重绘与全量重绘
+/// 的块色一致（否则脏区边缘会出现块级接缝）。
 ///
 /// # Safety
 /// `dst_bits` 须指向 `dst_w×dst_h` 的 32bpp 表面（u32 寻址）。
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn apply_mosaic(
     dst_bits: *mut u32,
     dst_w: i32,
@@ -210,11 +216,15 @@ pub unsafe fn apply_mosaic(
     base: &BaseSource,
     bbox: Rect,
     block: i32,
+    write_clip: Rect,
 ) {
     if block < 1 || bbox.w <= 0 || bbox.h <= 0 {
         return;
     }
-    let (rx0, ry0, rx1, ry1) = clip_surface(origin, bbox, dst_w, dst_h);
+    let Some(wrect) = bbox.intersect(write_clip) else {
+        return;
+    };
+    let (rx0, ry0, rx1, ry1) = clip_surface(origin, wrect, dst_w, dst_h);
     if rx1 <= rx0 || ry1 <= ry0 {
         return;
     }
@@ -223,17 +233,23 @@ pub unsafe fn apply_mosaic(
     while by < bbox.bottom() {
         let mut bx = bbox.x;
         while bx < bbox.right() {
-            let lx0 = bx.max(rx0 - origin.x).max(bbox.x);
-            let ly0 = by.max(ry0 - origin.y).max(bbox.y);
-            let lx1 = (bx + block).min(bbox.right()).min(rx1 - origin.x);
-            let ly1 = (by + block).min(bbox.bottom()).min(ry1 - origin.y);
+            // 采样范围 = 块 ∩ bbox（与 write_clip 无关：保证块色与全量渲染一致）
+            let sx0 = bx.max(bbox.x);
+            let sy0 = by.max(bbox.y);
+            let sx1 = (bx + block).min(bbox.right());
+            let sy1 = (by + block).min(bbox.bottom());
+            // 写入范围 = 采样范围 ∩ 本次脏区切片
+            let lx0 = sx0.max(rx0 - origin.x);
+            let ly0 = sy0.max(ry0 - origin.y);
+            let lx1 = sx1.min(rx1 - origin.x);
+            let ly1 = sy1.min(ry1 - origin.y);
             if lx1 > lx0 && ly1 > ly0 {
                 let mut sb = 0u32;
                 let mut sg = 0u32;
                 let mut sr = 0u32;
                 let mut n = 0u32;
-                for y in ly0..ly1 {
-                    for x in lx0..lx1 {
+                for y in sy0..sy1 {
+                    for x in sx0..sx1 {
                         let [b, g, r, _] = base.pixel(x, y);
                         sb += b as u32;
                         sg += g as u32;
@@ -256,11 +272,13 @@ pub unsafe fn apply_mosaic(
     }
 }
 
-/// 高亮：bbox 内逐像素乘法混合（取样自 pristine 底图，参照 SnowShot
+/// 高亮：bbox ∩ write_clip 内逐像素乘法混合（取样自 pristine 底图，参照 SnowShot
 /// `drawHighlight`：每通道 `× (255-(255-c)·keep)/255`，底层文字保持可读）。
+/// 逐像素算子无跨像素依赖，写入裁剪不影响结果一致性。
 ///
 /// # Safety
 /// `dst_bits` 须指向 `dst_w×dst_h` 的 32bpp 表面（u32 寻址）。
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn apply_highlight(
     dst_bits: *mut u32,
     dst_w: i32,
@@ -270,13 +288,17 @@ pub unsafe fn apply_highlight(
     bbox: Rect,
     color: Rgba,
     keep: f32,
+    write_clip: Rect,
 ) {
     let m = [
         (255.0 - (255.0 - color.b as f32) * keep) / 255.0, // 蓝
         (255.0 - (255.0 - color.g as f32) * keep) / 255.0, // 绿
         (255.0 - (255.0 - color.r as f32) * keep) / 255.0, // 红
     ];
-    let (rx0, ry0, rx1, ry1) = clip_surface(origin, bbox, dst_w, dst_h);
+    let Some(wrect) = bbox.intersect(write_clip) else {
+        return;
+    };
+    let (rx0, ry0, rx1, ry1) = clip_surface(origin, wrect, dst_w, dst_h);
     if rx1 <= rx0 || ry1 <= ry0 {
         return;
     }
@@ -294,8 +316,12 @@ pub unsafe fn apply_highlight(
 
 /// 模糊：bbox 内两趟可分盒模糊（取样自 pristine 底图，幂等——与部分重绘兼容）。
 ///
+/// **采样钳制到 bbox、写入限制在 `bbox ∩ write_clip`**：部分重绘（脏区切片）与
+/// 全量重绘结果逐像素一致，脏区边缘不会出现接缝。
+///
 /// # Safety
 /// `dst_bits` 须指向 `dst_w×dst_h` 的 32bpp 表面（u32 寻址）。
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn apply_blur(
     dst_bits: *mut u32,
     dst_w: i32,
@@ -304,32 +330,46 @@ pub unsafe fn apply_blur(
     base: &BaseSource,
     bbox: Rect,
     radius: i32,
+    write_clip: Rect,
 ) {
     if radius < 1 || bbox.w <= 0 || bbox.h <= 0 {
         return;
     }
-    let (rx0, ry0, rx1, ry1) = clip_surface(origin, bbox, dst_w, dst_h);
+    let Some(wrect) = bbox.intersect(write_clip) else {
+        return;
+    };
+    let (rx0, ry0, rx1, ry1) = clip_surface(origin, wrect, dst_w, dst_h);
     if rx1 <= rx0 || ry1 <= ry0 {
         return;
     }
     let r = radius;
     let w = (rx1 - rx0) as usize;
-    let h = (ry1 - ry0) as usize;
     // 局部坐标原点（surface 坐标 → 局部：减 origin）
     let lx0 = rx0 - origin.x;
     let ly0 = ry0 - origin.y;
+    let wh = (ry1 - ry0) as usize; // 写入行数
 
-    // 水平趟：tmp[j*w + i] = 行 ly 上 [lx-r, lx+r] 的平均（越界按 bbox 边界延伸）
-    let mut tmp = vec![[0u8; 3]; w * h];
-    let cw = w as i32;
-    for j in 0..h {
-        let ly = ly0 + j as i32;
+    // 采样域钳到 bbox（pristine 底图在整个 bbox 内可用），而非本次写入切片——
+    // 否则切片内缘 r px 的模糊结果与全量渲染不同（脏区边缘接缝）。
+    let (bx0, bx1) = (bbox.x, bbox.right() - 1); // 水平采样钳制范围（含端点）
+    // 水平趟需覆盖的行：写入行上下各扩 r（钳到 bbox），供垂直趟采样
+    let sy0 = (ly0 - r).max(bbox.y);
+    let sy1 = (ly0 + wh as i32 + r).min(bbox.bottom()); // 不含
+    let th = (sy1 - sy0).max(0) as usize;
+    if th == 0 || w == 0 {
+        return;
+    }
+
+    // 水平趟：tmp[j*w + i] = 行 sy0+j 上 [lx-r, lx+r] 的平均（越 bbox 界按边界延伸）
+    let mut tmp = vec![[0u8; 3]; w * th];
+    for j in 0..th {
+        let ly = sy0 + j as i32;
         let mut sb = 0i64;
         let mut sg = 0i64;
         let mut sr = 0i64;
         let n = (2 * r + 1) as i64;
         for k in -r..=r {
-            let [b, g, rr, _] = base.pixel(lx0 + k.clamp(0, cw - 1), ly);
+            let [b, g, rr, _] = base.pixel((lx0 + k).clamp(bx0, bx1), ly);
             sb += b as i64;
             sg += g as i64;
             sr += rr as i64;
@@ -339,28 +379,30 @@ pub unsafe fn apply_blur(
             row[0] = (sb / n) as u8;
             row[1] = (sg / n) as u8;
             row[2] = (sr / n) as u8;
-            // 滑窗：去掉左端、加上右端（下标按边界夹取）
-            let out = base.pixel(lx0 + (i as i32 - r).clamp(0, cw - 1), ly);
-            let inx = base.pixel(lx0 + (i as i32 + r + 1).clamp(0, cw - 1), ly);
-            sb += inx[0] as i64 - out[0] as i64;
-            sg += inx[1] as i64 - out[1] as i64;
-            sr += inx[2] as i64 - out[2] as i64;
+            if i + 1 < w {
+                // 滑窗：去掉左端、加上右端（下标钳到 bbox 边界）
+                let out = base.pixel((lx0 + i as i32 - r).clamp(bx0, bx1), ly);
+                let inx = base.pixel((lx0 + i as i32 + r + 1).clamp(bx0, bx1), ly);
+                sb += inx[0] as i64 - out[0] as i64;
+                sg += inx[1] as i64 - out[1] as i64;
+                sr += inx[2] as i64 - out[2] as i64;
+            }
         }
     }
-    // 垂直趟：对 tmp 逐列滑窗，写回目标表面
+    // 垂直趟：对 tmp 逐列滑窗（行下标钳到已覆盖范围 = bbox 行），写回目标表面
     let n = (2 * r + 1) as i64;
-    let ch = h as i32;
+    let tmax = th as i32 - 1;
     for i in 0..w {
         let mut sb = 0i64;
         let mut sg = 0i64;
         let mut sr = 0i64;
         for k in -r..=r {
-            let idx = k.clamp(0, ch - 1) as usize * w + i;
+            let idx = (ly0 + k - sy0).clamp(0, tmax) as usize * w + i;
             sb += tmp[idx][0] as i64;
             sg += tmp[idx][1] as i64;
             sr += tmp[idx][2] as i64;
         }
-        for j in 0..h {
+        for j in 0..wh {
             let px = 0xFF00_0000u32
                 | (((sr / n) as u32) << 16)
                 | (((sg / n) as u32) << 8)
@@ -368,11 +410,14 @@ pub unsafe fn apply_blur(
             let sy = (origin.y + ly0 + j as i32) as usize;
             let sx = (origin.x + lx0 + i as i32) as usize;
             *dst_bits.add(sy * dst_w as usize + sx) = px;
-            let outi = (j as i32 - r).clamp(0, ch - 1) as usize * w + i;
-            let ini = (j as i32 + r + 1).clamp(0, ch - 1) as usize * w + i;
-            sb += tmp[ini][0] as i64 - tmp[outi][0] as i64;
-            sg += tmp[ini][1] as i64 - tmp[outi][1] as i64;
-            sr += tmp[ini][2] as i64 - tmp[outi][2] as i64;
+            if j + 1 < wh {
+                let ly = ly0 + j as i32;
+                let outi = (ly - r - sy0).clamp(0, tmax) as usize * w + i;
+                let ini = (ly + r + 1 - sy0).clamp(0, tmax) as usize * w + i;
+                sb += tmp[ini][0] as i64 - tmp[outi][0] as i64;
+                sg += tmp[ini][1] as i64 - tmp[outi][1] as i64;
+                sr += tmp[ini][2] as i64 - tmp[outi][2] as i64;
+            }
         }
     }
 }
@@ -381,6 +426,7 @@ pub unsafe fn apply_blur(
 ///
 /// 与马赛克/高亮同一口径：取样自 pristine 底图（幂等，兼容部分重绘）。
 /// `bounds` 为选区局部尺寸（0,0,w,h）——只改写选区，不碰屏幕上选区以外的冻结画面。
+/// 写入进一步限制在 `bounds ∩ write_clip`（逐像素算子，部分重绘与全量一致）。
 ///
 /// 局限：作为整选区滤镜，它按 pristine 底图重写整选区，因此**画在它之前的标注
 /// 会被压暗/覆盖**（这与 SnowAir 合并下层的做法不同）；后画的标注正常叠在其上。
@@ -397,18 +443,17 @@ pub unsafe fn apply_spotlight(
     bounds: Rect,
     bbox: Rect,
     dim: f32,
+    write_clip: Rect,
 ) {
     let dim = dim.clamp(0.0, 1.0);
-    for ly in 0..bounds.h {
-        let sy = origin.y + ly;
-        if sy < 0 || sy >= dst_h {
-            continue;
-        }
-        for lx in 0..bounds.w {
-            let sx = origin.x + lx;
-            if sx < 0 || sx >= dst_w {
-                continue;
-            }
+    let Some(wrect) = bounds.intersect(write_clip) else {
+        return;
+    };
+    let (rx0, ry0, rx1, ry1) = clip_surface(origin, wrect, dst_w, dst_h);
+    for sy in ry0..ry1 {
+        let ly = sy - origin.y;
+        for sx in rx0..rx1 {
+            let lx = sx - origin.x;
             let [b, g, r, _] = base.pixel(lx, ly);
             let inside = bbox.contains(Pt::new(lx, ly));
             let f = if inside { 1.0 } else { dim };
@@ -456,6 +501,12 @@ unsafe fn write_px(
 /// 在该表面中的坐标（见 4.1）。`base` 供马赛克/高亮取样 pristine 底图：
 /// 预览路径传 `Some(BaseSource::Surface(&annot_base))`，导出传
 /// `Some(BaseSource::Image(&成品))`；无底图时这两类标注退化为不绘制。
+///
+/// `dirty`（局部坐标）限定本次重绘范围：GDI+ 裁剪、CPU 算子写入与形状剔除
+/// 都按 `bounds ∩ dirty` 收敛——部分重绘与全量重绘结果逐像素一致（CPU 算子的
+/// 采样域不受脏区影响，见 `apply_blur`/`apply_mosaic`）。渲染参数每帧取一次
+/// （prefs 会话快照 + `RenderEnv` 配置快照），热路径不再重复克隆全局配置。
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn render_into(
     dc: HDC,
     bits: *mut u32,
@@ -465,35 +516,57 @@ pub unsafe fn render_into(
     session: &AnnotSession,
     dpi: i32,
     base: Option<&BaseSource>,
+    dirty: Rect,
 ) {
+    let bounds = session.bounds();
+    let Some(clip_r) = bounds.intersect(dirty) else {
+        return;
+    };
     let Some(g) = render_gdiplus::graphics_from(dc) else {
         return;
     };
     render_gdiplus::set_origin(g, origin.x as f32, origin.y as f32);
-    render_gdiplus::clip(g, session.bounds());
+    render_gdiplus::clip(g, clip_r);
 
-    let hidden = session.hidden_id();
+    let prefs = session.prefs();
+    let env = render_gdiplus::RenderEnv::from_config(&crate::config::get());
+    // 拖动/缩放中的提交副本（预览分支另画），以及选中态形状（chrome 分支统一画）：
+    // 主循环都跳过——选中形状画两遍会让文字抗锯齿边缘与渐隐笔重复混合变深。
+    let skip = session.render_skip_id();
+    let attach = session.attach_preview_delta();
     for ann in session.doc.shapes() {
-        if Some(ann.id) == hidden {
+        if Some(ann.id) == skip {
             continue;
         }
-        draw_one(
-            g, bits, dst_w, dst_h, origin, &ann.shape, session.bounds(), base,
-        );
+        // 挂线文字预览跟随：所挂线段正被拖动时按同一位移画瞬态位置（不落文档）
+        let translated;
+        let shape: &Shape = match attach {
+            Some((hid, d))
+                if matches!(&ann.shape, Shape::Text { attach: Some(a), .. } if *a == hid) =>
+            {
+                translated = ann.shape.translate(d);
+                &translated
+            }
+            _ => &ann.shape,
+        };
+        if !effect_bbox(shape, bounds).intersects(clip_r) {
+            continue;
+        }
+        draw_one(g, bits, dst_w, dst_h, origin, shape, bounds, base, prefs, &env, clip_r);
     }
     if session.drawing() || session.typing() {
         if let Some(pv) = session.preview_shape() {
-            draw_one(
-                g, bits, dst_w, dst_h, origin, &pv, session.bounds(), base,
-            );
+            if effect_bbox(&pv, bounds).intersects(clip_r) {
+                draw_one(g, bits, dst_w, dst_h, origin, &pv, bounds, base, prefs, &env, clip_r);
+            }
         }
         // 输入中的文字：末尾光标（仅预览；已提交文字不带光标）
         if let Some((anchor, text, style)) = session.typing_state() {
-            render_gdiplus::draw_caret(g, anchor, &text, &style);
+            render_gdiplus::draw_caret(g, anchor, &text, &style, &env);
         }
     } else if let Some(ch) = session.chrome_shape() {
-        render_gdiplus::draw_shape(g, &ch);
-        render_gdiplus::draw_chrome(g, &ch, dpi);
+        render_gdiplus::draw_shape(g, &ch, prefs, &env);
+        render_gdiplus::draw_chrome(g, &ch, dpi, prefs, &env);
     }
 
     render_gdiplus::reset_origin(g);
@@ -501,8 +574,29 @@ pub unsafe fn render_into(
     let _ = GdiFlush();
 }
 
+/// 形状的实际影响区域（脏区剔除用）：含描边半宽、抗锯齿与外框余量；
+/// 聚光灯是整选区滤镜，影响整个 bounds。
+fn effect_bbox(shape: &Shape, bounds: Rect) -> Rect {
+    match shape {
+        Shape::Highlight {
+            mode: HighlightMode::Spotlight,
+            ..
+        } => bounds,
+        // 文字按真实字形渲染，可能超出估算 bbox：用保守脏区口径（与 Shape::dirty_bbox 一致）
+        Shape::Text { .. } => shape.dirty_bbox(),
+        Shape::Rect { bbox, style, .. } | Shape::Ellipse { bbox, style } => {
+            bbox.inflate(style.width / 2 + 2)
+        }
+        Shape::Mosaic { bbox, .. } | Shape::Highlight { bbox, .. } => *bbox,
+        // Line/Pen/Arrow/StepNo 的 bbox 已含线宽/箭头头部/徽章半径
+        _ => shape.bbox().inflate(2),
+    }
+}
+
 /// 绘制单个形状：马赛克/高亮走 CPU 像素合成（需底图取样），其余走 GDI+。
 /// z 序 = 调用序；CPU 写入与 GDI+ 绘制交错时以 `GdiFlush` 分隔，保证顺序正确。
+/// `write_clip`（局部坐标）限制 CPU 算子写入范围（= bounds ∩ dirty）。
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_one(
     g: *mut GpGraphics,
     bits: *mut u32,
@@ -512,9 +606,11 @@ unsafe fn draw_one(
     shape: &Shape,
     bounds: Rect,
     base: Option<&BaseSource>,
+    prefs: &AnnotPrefs,
+    env: &render_gdiplus::RenderEnv,
+    write_clip: Rect,
 ) {
-    // 高亮/聚光灯系数来自配置（渲染路径非逐像素，读一次即可）。
-    let cfg = crate::config::get();
+    // 高亮/聚光灯系数取会话偏好快照（渲染帧级参数，非逐像素读取）
     match shape {
         Shape::Mosaic { bbox, mode } => {
             if let Some(base) = base {
@@ -528,6 +624,7 @@ unsafe fn draw_one(
                         base,
                         *bbox,
                         mosaic_block(bounds.w, bounds.h),
+                        write_clip,
                     ),
                     MosaicMode::Blur => apply_blur(
                         bits,
@@ -537,6 +634,7 @@ unsafe fn draw_one(
                         base,
                         *bbox,
                         blur_radius(bounds.w, bounds.h),
+                        write_clip,
                     ),
                 }
             }
@@ -545,9 +643,17 @@ unsafe fn draw_one(
             if let Some(base) = base {
                 let _ = GdiFlush();
                 match mode {
-                    HighlightMode::Marker => {
-                        apply_highlight(bits, dst_w, dst_h, origin, base, *bbox, *color, cfg.highlight_keep)
-                    }
+                    HighlightMode::Marker => apply_highlight(
+                        bits,
+                        dst_w,
+                        dst_h,
+                        origin,
+                        base,
+                        *bbox,
+                        *color,
+                        prefs.highlight_keep,
+                        write_clip,
+                    ),
                     HighlightMode::Spotlight => apply_spotlight(
                         bits,
                         dst_w,
@@ -556,90 +662,56 @@ unsafe fn draw_one(
                         base,
                         bounds,
                         *bbox,
-                        cfg.spotlight_dim,
+                        prefs.spotlight_dim,
+                        write_clip,
                     ),
                 }
             }
         }
-        _ => render_gdiplus::draw_shape(g, shape),
+        _ => render_gdiplus::draw_shape(g, shape, prefs, env),
     }
 }
 
 /// 把标注合成进成品图（见 6）。无标注时零拷贝返回 `base` 的共享引用。
+/// 与屏幕预览共用同一条渲染路径（`draw_one`），二者不会分叉。
 pub fn composite(base: &CapturedImage, doc: &AnnotDoc) -> CapturedImage {
     if doc.is_empty() {
         return base.clone();
     }
     unsafe {
         let Some(surf) = DibSurface::new(base.width, base.height) else {
+            crate::diag::log(&format!(
+                "[annot] composite: 目标表面创建失败（{}×{}），导出图将不含标注",
+                base.width, base.height
+            ));
             return base.clone();
         };
         surf.copy_rows(&base.data);
         let src = BaseSource::Image(base);
         let cfg = crate::config::get();
+        let prefs = cfg.annot_prefs();
+        let env = render_gdiplus::RenderEnv::from_config(&cfg);
+        let full = Rect::new(0, 0, base.width, base.height);
         if let Some(g) = render_gdiplus::graphics_from(surf.dc) {
             for ann in doc.shapes() {
-                let bounds = Rect::new(0, 0, base.width, base.height);
-                match &ann.shape {
-                    Shape::Mosaic { bbox, mode } => {
-                        let _ = GdiFlush();
-                        match mode {
-                            MosaicMode::Pixelate => apply_mosaic(
-                                surf.bits(),
-                                base.width,
-                                base.height,
-                                Pt::new(0, 0),
-                                &src,
-                                *bbox,
-                                mosaic_block(base.width, base.height),
-                            ),
-                            MosaicMode::Blur => apply_blur(
-                                surf.bits(),
-                                base.width,
-                                base.height,
-                                Pt::new(0, 0),
-                                &src,
-                                *bbox,
-                                blur_radius(base.width, base.height),
-                            ),
-                        }
-                    }
-                    Shape::Highlight { bbox, color, mode } => {
-                        let _ = GdiFlush();
-                        match mode {
-                            HighlightMode::Marker => apply_highlight(
-                                surf.bits(),
-                                base.width,
-                                base.height,
-                                Pt::new(0, 0),
-                                &src,
-                                *bbox,
-                                *color,
-                                cfg.highlight_keep,
-                            ),
-                            HighlightMode::Spotlight => apply_spotlight(
-                                surf.bits(),
-                                base.width,
-                                base.height,
-                                Pt::new(0, 0),
-                                &src,
-                                bounds,
-                                *bbox,
-                                cfg.spotlight_dim,
-                            ),
-                        }
-                    }
-                    _ => render_gdiplus::draw_shape(g, &ann.shape),
-                }
+                draw_one(
+                    g,
+                    surf.bits(),
+                    base.width,
+                    base.height,
+                    Pt::new(0, 0),
+                    &ann.shape,
+                    full,
+                    Some(&src),
+                    &prefs,
+                    &env,
+                    full,
+                );
             }
             render_gdiplus::free_graphics(g);
         }
         let _ = GdiFlush();
-        alpha_fix(
-            surf.bits(),
-            base.width,
-            Rect::new(0, 0, base.width, base.height),
-        );
+        alpha_fix(surf.bits(), base.width, base.height, full);
         let data = surf.read_rows();
         CapturedImage {
             x: base.x,
@@ -660,7 +732,7 @@ mod tests {
         let (w, h) = (4i32, 3i32);
         let mut buf = vec![0u32; (w * h) as usize];
         unsafe {
-            alpha_fix(buf.as_mut_ptr(), w, Rect::new(1, 1, 2, 2));
+            alpha_fix(buf.as_mut_ptr(), w, h, Rect::new(1, 1, 2, 2));
         }
         // 只有 (1,1)-(2,2) 被置满 alpha
         assert_eq!(buf[(1 * w + 1) as usize] >> 24, 0xFF);
@@ -808,6 +880,7 @@ mod tests {
                 &base,
                 Rect::new(0, 0, 8, 8),
                 8,
+                Rect::new(0, 0, 8, 8),
             );
         }
         // 8×8 平均：B = mean(0..8)=3.5→3, G = mean(0..8)=3, R = 0x40
@@ -830,6 +903,7 @@ mod tests {
                 &base,
                 Rect::new(0, 0, 4, 4),
                 2,
+                Rect::new(0, 0, 4, 4),
             );
         }
         // 左上块 (0..2)×(0..2)：B = (0+1)/2=0, G = 0
@@ -857,6 +931,7 @@ mod tests {
                 &base,
                 Rect::new(8, 8, 4, 4),
                 2,
+                Rect::new(0, 0, 4, 4),
             );
         }
         assert!(dst.iter().all(|&px| px == 0x11), "bbox 外不应改动");
@@ -870,6 +945,7 @@ mod tests {
                 &base,
                 Rect::new(-4, -4, 6, 6),
                 2,
+                Rect::new(0, 0, 4, 4),
             );
         }
         // bbox (-4..2)×(-4..2) 裁剪到 (0..2)×(0..2)；(3,3) 不在范围内
@@ -903,6 +979,7 @@ mod tests {
                 Rect::new(0, 0, 2, 1),
                 super::super::style::HIGHLIGHT,
                 super::super::style::HIGHLIGHT_KEEP,
+                Rect::new(0, 0, 2, 1),
             );
         }
         // 白像素：每通道 × m —— 蓝 ← color.b(0)、绿 ← color.g(0xCC)、红 ← color.r(0xFF)
@@ -935,7 +1012,7 @@ mod tests {
         };
         let base = BaseSource::Image(&img);
         let mut dst = vec![0u32; 16];
-        unsafe { apply_blur(dst.as_mut_ptr(), 4, 4, Pt::new(0, 0), &base, Rect::new(0, 0, 4, 4), 1) };
+        unsafe { apply_blur(dst.as_mut_ptr(), 4, 4, Pt::new(0, 0), &base, Rect::new(0, 0, 4, 4), 1, Rect::new(0, 0, 4, 4)) };
         for &px in &dst {
             assert_eq!(px, 0xFF00_0000 | (30 << 16) | (20 << 8) | 10, "均匀块应保持原色");
         }
@@ -967,6 +1044,7 @@ mod tests {
                 Rect::new(0, 0, 4, 4),
                 Rect::new(1, 1, 2, 2),
                 super::super::style::SPOTLIGHT_DIM,
+                Rect::new(0, 0, 4, 4),
             );
         }
         // (1,1) 在 bbox 内 → 原亮度
@@ -974,5 +1052,69 @@ mod tests {
         // (0,0) 在外 → 200 × 0.55 = 110
         assert_eq!(dst[0] & 0xFF, 110, "bbox 外压暗");
         assert_eq!(dst[0] >> 24, 0xFF, "alpha 恒 255");
+    }
+
+    /// 接缝回归：部分重绘（write_clip 切片）必须与全量重绘逐像素一致。
+    /// 模糊/马赛克从切片外的 bbox 区域采样，不能因写入裁剪而改变结果。
+    #[test]
+    fn partial_redraw_matches_full_for_blur_and_mosaic() {
+        // 16×8 渐变底图（行内变化 + 行间变化，让模糊/块平均对采样域敏感）
+        let mut data = vec![0u8; 16 * 8 * 4];
+        for y in 0..8 {
+            for x in 0..16 {
+                let i = (y * 16 + x) * 4;
+                data[i] = (x * 16) as u8;
+                data[i + 1] = (y * 32) as u8;
+                data[i + 2] = ((x + y) * 8) as u8;
+                data[i + 3] = 0xFF;
+            }
+        }
+        let img = CapturedImage {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 8,
+            data: Arc::from(data),
+        };
+        let base = BaseSource::Image(&img);
+        let bbox = Rect::new(2, 1, 12, 6);
+        let full_clip = Rect::new(0, 0, 16, 8);
+        let half_clip = Rect::new(0, 0, 9, 8); // 只重绘左半边切片
+
+        // 模糊
+        let mut full = vec![0u32; 16 * 8];
+        let mut part = vec![0u32; 16 * 8];
+        unsafe {
+            apply_blur(full.as_mut_ptr(), 16, 8, Pt::new(0, 0), &base, bbox, 3, full_clip);
+            apply_blur(part.as_mut_ptr(), 16, 8, Pt::new(0, 0), &base, bbox, 3, half_clip);
+        }
+        for y in 1..7 {
+            for x in 2..9 {
+                assert_eq!(
+                    full[y * 16 + x],
+                    part[y * 16 + x],
+                    "模糊切片内像素必须等于全量渲染 ({x},{y})"
+                );
+            }
+        }
+        assert_eq!(part[2 * 16 + 10], 0, "切片外不得写入");
+
+        // 马赛克（块大小 4：块跨切片边界时平均色仍按整块 ∩ bbox 计算）
+        let mut full = vec![0u32; 16 * 8];
+        let mut part = vec![0u32; 16 * 8];
+        unsafe {
+            apply_mosaic(full.as_mut_ptr(), 16, 8, Pt::new(0, 0), &base, bbox, 4, full_clip);
+            apply_mosaic(part.as_mut_ptr(), 16, 8, Pt::new(0, 0), &base, bbox, 4, half_clip);
+        }
+        for y in 1..7 {
+            for x in 2..9 {
+                assert_eq!(
+                    full[y * 16 + x],
+                    part[y * 16 + x],
+                    "马赛克切片内像素必须等于全量渲染 ({x},{y})"
+                );
+            }
+        }
+        assert_eq!(part[2 * 16 + 10], 0, "切片外不得写入");
     }
 }

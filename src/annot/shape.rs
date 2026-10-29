@@ -80,6 +80,7 @@ pub fn text_est_size(text: &str, font_px: i32) -> (i32, i32) {
     let px = font_px.max(1) as f32;
     let mut max_w = 0f32;
     let mut lines = 0usize;
+    // split('\n') 对空串也产出一行，lines 恒 ≥ 1
     for line in text.split('\n') {
         lines += 1;
         let w: f32 = line
@@ -93,9 +94,6 @@ pub fn text_est_size(text: &str, font_px: i32) -> (i32, i32) {
             })
             .sum();
         max_w = max_w.max(w);
-    }
-    if lines == 0 {
-        lines = 1;
     }
     (max_w.round() as i32 + 2, (px * lines as f32 * 1.45).round() as i32)
 }
@@ -142,6 +140,31 @@ impl Shape {
                 radius * 2,
                 radius * 2,
             ),
+        }
+    }
+
+    /// 保守脏区：供重绘/提交的脏区计算。文字按真实字形渲染，可超出估算
+    /// `bbox`（右侧字形溢出 + 外框 pad + 半笔宽），其余形状即 `bbox`。
+    pub fn dirty_bbox(&self) -> Rect {
+        match self {
+            Shape::Text {
+                bbox,
+                style,
+                frame,
+                ..
+            } => {
+                let mut r = bbox.inflate(2);
+                // 估算宽度按 0.55em/拉丁字符，真实字形（粗体/斜体）可能更宽：右侧多预留 25%
+                r.w += (bbox.w / 4).max(4);
+                match frame {
+                    TextFrame::None => r,
+                    _ => {
+                        // 外框在 bbox 外扩 pad 处描边，笔宽 font_px/8
+                        r.inflate((style.font_px / 2).max(6) + (style.font_px / 8).max(2))
+                    }
+                }
+            }
+            _ => self.bbox(),
         }
     }
 
@@ -466,7 +489,7 @@ mod tests {
             text: "ab".into(),
             bbox: Rect::new(10, 10, 24, 29),
             style: super::super::style::TextStyle {
-                color: DEF_STROKE,
+                color: super::super::style::DEF_STROKE,
                 font_px: 20,
                 bold: true,
                 italic: false,
@@ -484,5 +507,34 @@ mod tests {
             }
             _ => panic!("应为文字"),
         }
+    }
+
+    #[test]
+    fn text_dirty_bbox_inflates_estimate() {
+        let t = Shape::Text {
+            origin: Pt::new(10, 10),
+            text: "WWWW".into(),
+            bbox: Rect::new(10, 10, 46, 29),
+            style: super::super::style::TextStyle {
+                color: super::super::style::DEF_STROKE,
+                font_px: 20,
+                bold: false,
+                italic: false,
+            },
+            frame: super::super::style::TextFrame::None,
+            attach: None,
+        };
+        let d = t.dirty_bbox();
+        assert!(d.w > 46 + 4, "文字脏区必须比估算 bbox 宽（字形溢出余量）: {d:?}");
+        // 非文字形状：脏区 = bbox
+        let r = Shape::Rect {
+            bbox: Rect::new(0, 0, 10, 10),
+            style: super::super::style::StrokeStyle {
+                color: super::super::style::DEF_STROKE,
+                width: 3,
+            },
+            fill: None,
+        };
+        assert_eq!(r.dirty_bbox(), Rect::new(0, 0, 10, 10));
     }
 }

@@ -26,16 +26,17 @@ pub enum Handle {
 }
 
 impl Handle {
-    /// 全部控制柄（绘制与命中遍历用）。
+    /// 全部控制柄（绘制与命中遍历用）。**角柄在前**：微小图形上边柄中心与角柄
+    /// 间距可小于命中半径，`find` 取首个命中者——角柄优先保证角缩放总是可用。
     pub const ALL: [Handle; 8] = [
-        Handle::N,
         Handle::NE,
-        Handle::E,
         Handle::SE,
-        Handle::S,
         Handle::SW,
-        Handle::W,
         Handle::NW,
+        Handle::N,
+        Handle::E,
+        Handle::S,
+        Handle::W,
     ];
 
     /// 控制柄中心：bbox 的四角与四边中点。

@@ -7,9 +7,9 @@
 //! （`dpi` 用于容差/尺寸换算、`shift` 记忆最近一次修饰键、`Moving/Resizing` 的 `cur`）。
 
 use super::doc::AnnotDoc;
-use super::geometry::{norm_rect, union_opt, Pt, Rect};
+use super::geometry::{norm_rect, rect_union, union_opt, Pt, Rect};
 use super::hit_test::{self, Handle};
-use super::shape::{arrow_head_len, text_est_size, Shape};
+use super::shape::{arrow_head_len, pen_bounds, text_est_size, Shape};
 use super::style::{AnnotPrefs, PenStyle, StrokeStyle, TextStyle};
 
 /// 工具种类。
@@ -191,12 +191,33 @@ impl AnnotSession {
         )
     }
 
-    /// 拖动中的标注 id（渲染时需跳过其"旧位置"的提交副本）。
-    pub fn hidden_id(&self) -> Option<u64> {
+    /// 渲染主循环需跳过的形状 id：拖动/缩放中的「旧位置」提交副本（其瞬态由
+    /// chrome/预览分支绘制），以及**选中态**形状（由 chrome 分支连同控制柄统一
+    /// 绘制）——主循环若不跳过，选中形状会画两遍，文字抗锯齿边缘与渐隐笔的
+    /// alpha 会被重复混合而变深。
+    pub fn render_skip_id(&self) -> Option<u64> {
         match &self.mode {
-            Mode::Moving { id, .. } | Mode::Resizing { id, .. } => Some(*id),
+            Mode::Moving { id, .. } | Mode::Resizing { id, .. } | Mode::Selected { id } => {
+                Some(*id)
+            }
             _ => None,
         }
+    }
+
+    /// 移动中：被拖形状 id 与预览位移（渲染层据此让挂线文字的**预览**跟随，
+    /// 落文档仍发生在 mouseup 的 `doc.transform`）。缩放的中点联动不预览跟随。
+    pub fn attach_preview_delta(&self) -> Option<(u64, Pt)> {
+        match &self.mode {
+            Mode::Moving { id, grab, cur, .. } => {
+                Some((*id, Pt::new(cur.x - grab.x, cur.y - grab.y)))
+            }
+            _ => None,
+        }
+    }
+
+    /// 会话偏好快照（渲染链下传，避免逐形状/逐线段读全局配置）。
+    pub fn prefs(&self) -> &AnnotPrefs {
+        &self.prefs
     }
 
     /// 当前预览几何（绘制中的橡皮筋 / 自由轨迹 / 移动缩放中的临时位置 / 输入中的文字）。
@@ -403,10 +424,28 @@ impl AnnotSession {
                 let d = Pt::new(p.x - grab.x, p.y - grab.y);
                 if d.x != 0 || d.y != 0 {
                     let new = orig.translate(d);
-                    extra = self.doc.transform(id, orig, new);
+                    // 文字按真实字形渲染、可超出估算 bbox：移动文字时脏区用保守外扩
+                    let text_dirty = if matches!(orig, Shape::Text { .. }) {
+                        Some(rect_union(orig.dirty_bbox(), new.dirty_bbox()))
+                    } else {
+                        None
+                    };
+                    match self.doc.transform(id, orig, new) {
+                        Some(dirty) => {
+                            extra = Some(match text_dirty {
+                                Some(e) => rect_union(dirty, e),
+                                None => dirty,
+                            });
+                            self.mode = Mode::Selected { id };
+                        }
+                        // 目标已不存在：保持 Idle，不留悬空选中 id
+                        None => {}
+                    }
+                } else {
+                    self.mode = Mode::Selected { id };
                 }
-                self.mode = Mode::Selected { id };
-            }            Mode::Resizing {
+            }
+            Mode::Resizing {
                 id,
                 handle,
                 anchor,
@@ -417,10 +456,22 @@ impl AnnotSession {
                     orig.bbox(),
                     self.resize_bbox(orig.bbox(), anchor, handle, p),
                 );
-                if new != orig {
-                    extra = self.doc.transform(id, orig, new);
+                // 0×0 的「幽灵」图形：不可见却仍可被命中/选中 —— 丢弃本次变换
+                let ghost = {
+                    let b = new.bbox();
+                    b.w == 0 && b.h == 0
+                };
+                if !ghost && new != orig {
+                    match self.doc.transform(id, orig, new) {
+                        Some(dirty) => {
+                            extra = Some(dirty);
+                            self.mode = Mode::Selected { id };
+                        }
+                        None => {}
+                    }
+                } else {
+                    self.mode = Mode::Selected { id };
                 }
-                self.mode = Mode::Selected { id };
             }
             _ => {}
         }
@@ -449,7 +500,12 @@ impl AnnotSession {
             return Action::default();
         }
 
-        // Ctrl+Z / Ctrl+Y：撤销重做（模式不变，见 5.1）
+        // Ctrl+Z / Ctrl+Y：撤销重做（模式不变，见 5.1）。
+        // 捕获中（绘制/拖动/缩放）忽略：瞬态与命令栈交织会污染历史
+        // （如撤销掉被拖形状后 mouseup 留下悬空选中 id）。
+        if ctrl && (vk == VK_Z || vk == VK_Y) && self.capturing() {
+            return Action::default();
+        }
         if ctrl && vk == VK_Z {
             let d = self.doc.undo();
             return Action {
@@ -558,12 +614,17 @@ impl AnnotSession {
             return Action::default();
         };
         if text.trim().is_empty() {
-            return Action::default();
+            // 退出输入也要恢复光标（否则 IBeam 残留到下一次 WM_SETCURSOR）
+            return Action {
+                redraw: None,
+                cursor: Some(self.cursor_at_fallback()),
+                esc_passthrough: false,
+            };
         }
         // 挂线：落点靠近线段/箭头时吸附，并把文字居中到该线段的**中点**
         //（与 `AnnotDoc::transform` 的重居中口径一致，线一移动文字就跟着走）。
         let attach = if self.prefs.text_attach {
-            self.find_attach(anchor).map(|(id, _)| id)
+            self.find_attach(anchor)
         } else {
             None
         };
@@ -575,7 +636,8 @@ impl AnnotSession {
                 shape = center_shape_text(shape, Pt::new(ox, oy));
             }
         }
-        let dirty = shape.bbox();
+        // 文字按真实字形渲染，可超出估算 bbox：脏区取保守外扩（宁大勿小）
+        let dirty = shape.dirty_bbox();
         self.doc.add(shape);
         Action {
             redraw: Some(dirty),
@@ -613,12 +675,7 @@ impl AnnotSession {
 
     /// 挂线目标的中点（线段/箭头）；找不到返回 `None`。
     fn attach_mid(&self, id: u64) -> Option<Pt> {
-        match self.doc.find(id)? {
-            Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
-                Some(Pt::new((from.x + to.x) / 2, (from.y + to.y) / 2))
-            }
-            _ => None,
-        }
+        super::doc::seg_mid(self.doc.find(id)?)
     }
 
     /// 光标查询（供 `WM_SETCURSOR`）。
@@ -812,21 +869,21 @@ impl AnnotSession {
         }
     }
 
-    /// 在落点附近寻找可挂线的线段/箭头，返回 `(id, 投影点)`（取最近的一条）。
-    fn find_attach(&self, p: Pt) -> Option<(u64, Pt)> {
+    /// 在落点附近寻找可挂线的线段/箭头，返回其 id（取最近的一条）。
+    fn find_attach(&self, p: Pt) -> Option<u64> {
         let tol = self.s(self.prefs.attach_tol).max(1) as f32;
-        let mut best: Option<(u64, Pt, f32)> = None;
+        let mut best: Option<(u64, f32)> = None;
         for a in self.doc.shapes() {
             let (from, to) = match &a.shape {
                 Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => (*from, *to),
                 _ => continue,
             };
             let d = super::geometry::dist_point_segment(p, from, to);
-            if d <= tol && best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
-                best = Some((a.id, project_on_segment(p, from, to), d));
+            if d <= tol && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((a.id, d));
             }
         }
-        best.map(|(id, proj, _)| (id, proj))
+        best.map(|(id, _)| id)
     }
 
     /// 缩放：锚点固定。角柄用对角固定点 `anchor` + 当前点规范化；边柄只移动该边、
@@ -883,11 +940,32 @@ impl AnnotSession {
 
     /// 当前瞬时可视（预览 + 选中态）区域。
     fn transient_bbox(&self) -> Option<Rect> {
-        let preview = self.preview_shape().map(|s| s.bbox());
+        // 画笔轨迹直接算包围盒，不为预览克隆整条 Vec<Pt>（mousemove 高频路径）
+        let preview = match &self.mode {
+            Mode::Freehand { pts } => {
+                Some(pen_bounds(pts).inflate((self.s(self.prefs.stroke_width) / 2).max(1)))
+            }
+            // 文字预览用保守脏区（真实字形可超出估算 bbox）
+            _ => self.preview_shape().map(|s| s.dirty_bbox()),
+        };
         let chrome = self
             .chrome_shape()
             .map(|s| s.bbox().inflate(self.chrome_ext()));
-        union_opt(preview, chrome)
+        // 挂线文字的预览跟随（渲染层按 attach_preview_delta 平移绘制）：
+        // 其旧位置与新位置都必须进脏区，否则旧位置残留、新位置被裁剪
+        let mut tethered: Option<Rect> = None;
+        if let Some((hid, d)) = self.attach_preview_delta() {
+            for a in self.doc.shapes() {
+                if let Shape::Text { attach: Some(x), bbox, .. } = &a.shape {
+                    if *x == hid {
+                        let moved = Rect::new(bbox.x + d.x, bbox.y + d.y, bbox.w, bbox.h);
+                        let r = rect_union(*bbox, moved);
+                        tethered = union_opt(tethered, Some(r));
+                    }
+                }
+            }
+        }
+        union_opt(union_opt(preview, chrome), tethered)
     }
 
     fn action(&self, before: Option<Rect>, cursor: CursorKind) -> Action {
@@ -924,19 +1002,6 @@ fn sign(v: i32) -> i32 {
     }
 }
 
-/// `p` 在线段 AB 上的投影点（用于挂线吸附）。
-fn project_on_segment(p: Pt, a: Pt, b: Pt) -> Pt {
-    let (ax, ay, bx, by) = (a.x as f32, a.y as f32, b.x as f32, b.y as f32);
-    let (abx, aby) = (bx - ax, by - ay);
-    let len2 = abx * abx + aby * aby;
-    let t = if len2 <= f32::EPSILON {
-        0.0
-    } else {
-        (((p.x as f32 - ax) * abx + (p.y as f32 - ay) * aby) / len2).clamp(0.0, 1.0)
-    };
-    Pt::new((ax + t * abx).round() as i32, (ay + t * aby).round() as i32)
-}
-
 /// 把文字形状的 origin/bbox 移到 `origin`（左上角）；非文字原样返回。
 fn center_shape_text(shape: Shape, origin: Pt) -> Shape {
     match shape {
@@ -968,7 +1033,8 @@ fn square_rect(a: Pt, b: Pt) -> Rect {
 }
 
 /// Shift 约束箭头 45° 步进（见 7）。
-fn snap_45(from: Pt, to: Pt) -> Pt {    let dx = (to.x - from.x) as f32;
+fn snap_45(from: Pt, to: Pt) -> Pt {
+    let dx = (to.x - from.x) as f32;
     let dy = (to.y - from.y) as f32;
     let hyp = (dx * dx + dy * dy).sqrt();
     if hyp < 0.5 {

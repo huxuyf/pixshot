@@ -2,10 +2,15 @@
 //!
 //! `AnnotDoc` 持有全部标注（下标即 z 序）+ 撤销/重做命令栈 + 只增不减的步骤计数器
 //! （见设计文档 3.2 / 3.3 / 5.4）。移动/缩放统一为几何级 `Transform`：拖拽期间只在
-//! mouseup 时生成一条命令，天然合并整段拖拽。
+//! mouseup 时生成一条命令，天然合并整段拖拽。撤销栈深度上限 [`UNDO_LIMIT`]。
+
+use std::collections::VecDeque;
 
 use super::geometry::{rect_union, Pt, Rect};
 use super::shape::{Annotation, Shape};
+
+/// 撤销栈深度上限（超出丢弃最旧记录）：长会话内存有界。
+const UNDO_LIMIT: usize = 200;
 
 /// 单个形状的几何变更（一次变换可能含多个形状——挂线文字随线段一起动）。
 #[derive(Debug, Clone)]
@@ -19,8 +24,9 @@ pub struct ShapeChange {
 #[derive(Debug, Clone)]
 pub enum Command {
     Add(Annotation),
-    /// `index` = 删除时的 z 序，撤销时按此插回。
-    Delete { index: usize, ann: Annotation },
+    /// 整组删除（挂线：线段/箭头连同挂线文字一次删除、一步撤销）。
+    /// `items` 按删除前的原始下标**升序**记录；撤销时按序插回即恢复原 z 序。
+    DeleteGroup { items: Vec<(usize, Annotation)> },
     /// 几何变换：记旧/新形状（不做增量 delta）。可含多个形状以合并成一步。
     Transform { changes: Vec<ShapeChange> },
 }
@@ -32,7 +38,7 @@ pub struct AnnotDoc {
     next_id: u64,
     /// 步骤序号计数器：只增不减（见 5.4）。
     step_counter: u32,
-    undo: Vec<Command>,
+    undo: VecDeque<Command>,
     redo: Vec<Command>,
 }
 
@@ -48,7 +54,7 @@ impl AnnotDoc {
             shapes: Vec::new(),
             next_id: 1,
             step_counter: 1,
-            undo: Vec::new(),
+            undo: VecDeque::new(),
             redo: Vec::new(),
         }
     }
@@ -98,24 +104,34 @@ impl AnnotDoc {
         n
     }
 
+    /// 入栈一步操作（清空 redo；超上限丢弃最旧记录）。
+    fn push_undo(&mut self, cmd: Command) {
+        if self.undo.len() >= UNDO_LIMIT {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(cmd);
+        self.redo.clear();
+    }
+
     /// 新增标注：分配 id、入 `Add` 命令、清空 redo。返回新 id。
     pub fn add(&mut self, shape: Shape) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let ann = Annotation { id, shape };
         self.shapes.push(ann.clone());
-        self.undo.push(Command::Add(ann));
-        self.redo.clear();
+        self.push_undo(Command::Add(ann));
         id
     }
 
     /// 删除标注；返回被删形状的包围盒（脏区）。
     ///
-    /// **整组删除**（挂线）：删除线段/箭头时，挂在其上的文字一并删除——它们的 Delete
-    /// 命令各自入栈，撤销时逐个恢复（见 [`Shape::Text`] 的 `attach`）。
+    /// **整组删除**（挂线）：删除线段/箭头时，挂在其上的文字一并删除——
+    /// 整组记为**一条** `DeleteGroup` 命令，一次撤销全部恢复（见 [`Shape::Text`]
+    /// 的 `attach`）。
     pub fn delete(&mut self, id: u64) -> Option<Rect> {
-        let mut dirty: Option<Rect> = None;
-        // 先删挂在目标上的文字，再删目标（多次删除按 id 收集，倒序移除避免下标失效）
+        // 目标本身必须存在（防御）
+        self.index_of(id)?;
+        // 目标 + 挂在目标上的文字；记录**移除前**的原始下标（升序）
         let mut targets = vec![id];
         targets.extend(
             self.shapes
@@ -123,23 +139,27 @@ impl AnnotDoc {
                 .filter(|a| matches!(&a.shape, Shape::Text { attach: Some(x), .. } if *x == id))
                 .map(|a| a.id),
         );
-        // 目标本身可能不存在（防御）
-        if self.index_of(id).is_none() {
-            return None;
+        let mut items: Vec<(usize, Annotation)> = targets
+            .iter()
+            .filter_map(|t| {
+                let i = self.index_of(*t)?;
+                Some((i, self.shapes[i].clone()))
+            })
+            .collect();
+        items.sort_by_key(|(i, _)| *i);
+        // 按下标倒序移除，避免下标失效
+        let mut dirty: Option<Rect> = None;
+        for (_, ann) in items.iter().rev() {
+            if let Some(i) = self.index_of(ann.id) {
+                let ann = self.shapes.remove(i);
+                let d = ann.shape.bbox();
+                dirty = Some(match dirty {
+                    Some(prev) => rect_union(prev, d),
+                    None => d,
+                });
+            }
         }
-        for t in targets {
-            let Some(index) = self.index_of(t) else {
-                continue;
-            };
-            let ann = self.shapes.remove(index);
-            let d = ann.shape.bbox();
-            dirty = Some(match dirty {
-                Some(prev) => rect_union(prev, d),
-                None => d,
-            });
-            self.undo.push(Command::Delete { index, ann });
-            self.redo.clear();
-        }
+        self.push_undo(Command::DeleteGroup { items });
         dirty
     }
 
@@ -151,6 +171,11 @@ impl AnnotDoc {
         if self.index_of(id).is_none() {
             return None;
         }
+        debug_assert_eq!(
+            self.find(id),
+            Some(&old),
+            "transform 的 old 必须与文档当前值一致（否则撤销栈被污染）"
+        );
         let mut changes = vec![ShapeChange {
             id,
             old: old.clone(),
@@ -193,14 +218,13 @@ impl AnnotDoc {
                 self.shapes[i].shape = c.new.clone();
             }
         }
-        self.undo.push(Command::Transform { changes });
-        self.redo.clear();
+        self.push_undo(Command::Transform { changes });
         dirty
     }
 
     /// 撤销一步；返回受影响区域的包围盒。
     pub fn undo(&mut self) -> Option<Rect> {
-        let cmd = self.undo.pop()?;
+        let cmd = self.undo.pop_back()?;
         let dirty = self.apply_undo(&cmd);
         self.redo.push(cmd);
         Some(dirty)
@@ -210,7 +234,7 @@ impl AnnotDoc {
     pub fn redo(&mut self) -> Option<Rect> {
         let cmd = self.redo.pop()?;
         let dirty = self.apply_redo(&cmd);
-        self.undo.push(cmd);
+        self.undo.push_back(cmd);
         Some(dirty)
     }
 
@@ -222,10 +246,19 @@ impl AnnotDoc {
                 }
                 ann.shape.bbox()
             }
-            Command::Delete { index, ann } => {
-                let i = (*index).min(self.shapes.len());
-                self.shapes.insert(i, ann.clone());
-                ann.shape.bbox()
+            Command::DeleteGroup { items } => {
+                // 按原始下标升序插回，恢复原 z 序
+                let mut dirty: Option<Rect> = None;
+                for (index, ann) in items {
+                    let i = (*index).min(self.shapes.len());
+                    self.shapes.insert(i, ann.clone());
+                    let d = ann.shape.bbox();
+                    dirty = Some(match dirty {
+                        Some(prev) => rect_union(prev, d),
+                        None => d,
+                    });
+                }
+                dirty.unwrap_or(Rect::new(0, 0, 0, 0))
             }
             Command::Transform { changes } => {
                 let mut dirty: Option<Rect> = None;
@@ -250,12 +283,20 @@ impl AnnotDoc {
                 self.shapes.push(ann.clone());
                 ann.shape.bbox()
             }
-            Command::Delete { index, ann } => {
-                let i = (*index).min(self.shapes.len().saturating_sub(1));
-                if !self.shapes.is_empty() {
-                    self.shapes.remove(i);
+            Command::DeleteGroup { items } => {
+                // 按 id 移除（不依赖下标与历史严格吻合，更稳健）
+                let mut dirty: Option<Rect> = None;
+                for (_, ann) in items {
+                    if let Some(i) = self.index_of(ann.id) {
+                        self.shapes.remove(i);
+                    }
+                    let d = ann.shape.bbox();
+                    dirty = Some(match dirty {
+                        Some(prev) => rect_union(prev, d),
+                        None => d,
+                    });
                 }
-                ann.shape.bbox()
+                dirty.unwrap_or(Rect::new(0, 0, 0, 0))
             }
             Command::Transform { changes } => {
                 let mut dirty: Option<Rect> = None;
@@ -276,11 +317,13 @@ impl AnnotDoc {
 }
 
 /// 线段/箭头的中点（挂线文字的落点）；非线段类返回 `None`。
-fn seg_mid(shape: &Shape) -> Option<Pt> {
+/// 中点按 `from + (to-from)/2` 计算，避免 `from+to` 在极端坐标下溢出。
+pub(crate) fn seg_mid(shape: &Shape) -> Option<Pt> {
     match shape {
-        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
-            Some(Pt::new((from.x + to.x) / 2, (from.y + to.y) / 2))
-        }
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => Some(Pt::new(
+            from.x + (to.x - from.x) / 2,
+            from.y + (to.y - from.y) / 2,
+        )),
         _ => None,
     }
 }
@@ -490,10 +533,34 @@ mod tests {
         assert!(d.find(lid).is_none());
         assert!(d.find(tid).is_none());
         assert!(d.find(other).is_some());
-        // 撤销逐个恢复
-        d.undo();
+        // 整组删除 = 一条命令：一次撤销全部恢复（且恢复原 z 序：线在文字之下）
         d.undo();
         assert!(d.find(lid).is_some());
         assert!(d.find(tid).is_some());
+        assert_eq!(
+            d.shapes().iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![lid, tid, other],
+            "撤销后 z 序必须恢复"
+        );
+        // 一次重做整组再删
+        d.redo();
+        assert!(d.find(lid).is_none());
+        assert!(d.find(tid).is_none());
+        assert!(d.find(other).is_some());
+    }
+
+    #[test]
+    fn undo_stack_is_bounded() {
+        let mut d = AnnotDoc::new();
+        for i in 0..(UNDO_LIMIT + 50) {
+            d.add(rect(i as i32, 0, 2, 2));
+        }
+        let mut n = 0;
+        while d.undo().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, UNDO_LIMIT, "撤销步数不超过上限（最旧记录被丢弃）");
+        // 最早的 50 条已被挤出：文档还剩 50 个形状
+        assert_eq!(d.len(), 50);
     }
 }
