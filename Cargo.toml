@@ -1,6 +1,6 @@
 [package]
 name = "pixshot"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "PixPin 风格的 Windows 桌面工具：框选截图 / 贴图置顶 / OCR 文字识别（Rust + Win32 + 本地 ONNX 推理）"
 
