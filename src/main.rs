@@ -180,7 +180,7 @@ fn run_gui() -> error::Result<()> {
         hwnd.0 as usize
     ));
 
-    let (tray_ok, tray_err, hotkey_ok) = tray::init(hwnd);
+    let (tray_ok, tray_err, hotkey_ok, pin_hotkey_ok) = tray::init(hwnd);
 
     // 托盘失败会让程序"没有可见入口"，必须让用户知道原因（测试可用环境变量屏蔽弹窗）
     if !tray_ok && alerts_enabled() {
@@ -217,6 +217,9 @@ fn run_gui() -> error::Result<()> {
     }
 
     // 热键完全不可用（注册与钩子都失败）时同样必须可见，否则用户只会觉得"按键没反应"
+    if !pin_hotkey_ok {
+        diag::log("[boot] 贴图热键不可用（RegisterHotKey 与钩子兜底均失败）");
+    }
     if !hotkey_ok && alerts_enabled() {
         util::error_msgbox(&format!(
             "全局热键 {} 注册失败，且低级键盘钩子也未能安装。\n\n\
@@ -234,7 +237,19 @@ fn run_gui() -> error::Result<()> {
     diag::log("[boot] 进入主消息循环");
     let mut msg = MSG::default();
     unsafe {
-        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+        loop {
+            let r = GetMessageW(&mut msg, None, 0, 0).0;
+            if r == 0 {
+                break; // WM_QUIT：正常退出
+            }
+            if r == -1 {
+                // 消息错误（如窗口句柄失效）：不能与正常退出同路径静默
+                diag::log(&format!(
+                    "[main] GetMessageW 返回 -1，错误码 {}",
+                    windows::Win32::Foundation::GetLastError().0
+                ));
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -248,8 +263,11 @@ fn run_gui() -> error::Result<()> {
 ///
 /// 两层保护：
 /// - `BusyGuard`：流程进行中拒绝重入，且 panic 时也会自动复位；
-/// - `catch_unwind`：panic 不会穿过 `extern "system"` 窗口过程边界（那会直接 abort），
-///   而是转成一次可见的错误提示。
+/// - `catch_unwind`：只覆盖 `flow_impl` 的直接调用栈（框选/工具条的模态循环）。
+///   **注意**：模态循环内 `DispatchMessageW` 回调到的窗口过程（overlay_proc /
+///   toolbar_proc 等 `extern "system"`）中的 panic 不受其保护——nounwind ABI 会在
+///   函数边界直接 abort，此时由 panic hook 落诊断日志（见 `install_panic_hook`），
+///   进程随即退出。这里的 catch_unwind 兜的是流程编排代码本身。
 pub(crate) fn screenshot_flow() {
     let Some(_guard) = util::BusyGuard::acquire() else {
         return; // 已有流程进行中
@@ -275,8 +293,8 @@ pub(crate) fn screenshot_flow() {
 /// F3：把剪贴板内容以图片形式置顶。图片/文本/Excel/富文本四类都出图，
 /// 统一复用既有贴图窗口（[`pin::create`]），不另写置顶实现。
 ///
-/// 与截图流程同款双层保护：`BusyGuard` 拒绝重入，`catch_unwind` 防止 panic
-/// 穿过 `extern "system"` 窗口过程边界。
+/// 与截图流程同款双层保护（`BusyGuard` + `catch_unwind`）；`catch_unwind` 只覆盖
+/// 本函数的直接调用栈，窗口过程内的 panic 仍走 panic hook → abort（见 screenshot_flow）。
 pub(crate) fn pin_from_clipboard() {
     let Some(_guard) = util::BusyGuard::acquire() else {
         return;
@@ -408,7 +426,8 @@ pub(crate) fn capture_fullscreen_silent() {
     }
 }
 
-unsafe fn flow_impl() -> error::Result<()> {    // 1. 框选屏幕区域（模态，遮罩暗化 + 选区提亮 + 实时尺寸）。
+unsafe fn flow_impl() -> error::Result<()> {
+    // 1. 框选屏幕区域（模态，遮罩暗化 + 选区提亮 + 实时尺寸）。
     //    返回「已裁好的成品 + 仍在显示的冻结层」。
     let Some(sel) = overlay::select_region() else {
         return Ok(()); // 用户取消

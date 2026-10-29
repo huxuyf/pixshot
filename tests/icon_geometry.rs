@@ -32,6 +32,16 @@ fn lerp3_midpoint_is_average() {
     assert!(approx(m[0], 0.5) && approx(m[1], 0.25) && approx(m[2], 0.1));
 }
 
+/// lerp3 不做外推保护（与 theme::lerp 的 clamp 语义不同）：锁定该约定，
+/// 防止误把它当钳制插值用。
+#[test]
+fn lerp3_extrapolates_beyond_unit_interval() {
+    let v = lerp3([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 2.0);
+    assert_eq!(v, [2.0, 2.0, 2.0], "t>1 应外插而非钳制");
+    let v = lerp3([1.0, 1.0, 1.0], [2.0, 2.0, 2.0], -1.0);
+    assert_eq!(v, [0.0, 0.0, 0.0], "t<0 应外插而非钳制");
+}
+
 // ------------------------------------------------------------- dist_seg
 
 #[test]
@@ -83,6 +93,18 @@ fn in_rounded_out_of_bounds_is_false() {
     let r = CORNER * S;
     assert!(!in_rounded(-0.5, S / 2.0, S, r));
     assert!(!in_rounded(S / 2.0, S + 0.5, S, r));
+}
+
+/// 边界包含语义：x == s / y == s 仍在内（右/下边缘闭合），超出一律在外。
+#[test]
+fn in_rounded_boundary_is_inclusive() {
+    let r = CORNER * S;
+    assert!(in_rounded(S, S / 2.0, S, r), "右边缘中点在内");
+    assert!(in_rounded(S / 2.0, S, S, r), "下边缘中点在内");
+    assert!(in_rounded(0.0, S / 2.0, S, r), "左边缘中点在内");
+    // 角弧上的点：圆心 (r,r) 半径 r 处恰在边界上
+    assert!(in_rounded(r * 2.0, r, S, r), "圆弧过渡点在内");
+    assert!(!in_rounded(S + f32::EPSILON * S, S / 2.0, S, r));
 }
 
 // -------------------------------------------------------------- on_glyph

@@ -105,9 +105,18 @@ impl Tip {
         let s = |v: i32| util::scaled(v, dpi);
         let (pad_x, pad_y, gap, max_w) = metrics();
         d.label = util::to_wide(label);
-        d.suffix = util::to_wide(&format!("（{shortcut}）"));
+        // 空快捷键不渲染空括号「（）」
+        d.suffix = if shortcut.is_empty() {
+            Vec::new()
+        } else {
+            util::to_wide(&format!("（{shortcut}）"))
+        };
         // 窗口标题 = 完整文案：可访问性/自动化可直接读到气泡内容（E2E 依赖）
-        let title = util::to_wide(&format!("{label}（{shortcut}）"));
+        let title = if shortcut.is_empty() {
+            util::to_wide(label)
+        } else {
+            util::to_wide(&format!("{label}（{shortcut}）"))
+        };
         let _ = SetWindowTextW(self.hwnd, PCWSTR::from_raw(title.as_ptr()));
 
         // 量测两段文本（DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX）
@@ -260,7 +269,8 @@ unsafe fn paint_card(hwnd: HWND, hdc: HDC, cw: i32, ch: i32, d: &TipData) {
     let ob = SelectObject(hdc, brush);
     let op = SelectObject(hdc, pen);
     let r = util::scaled(8, dpi);
-    let _ = RoundRect(hdc, 0, 0, cw, ch, r, r);
+    // RoundRect 后两个参数是圆角椭圆的轴长（= 半径 × 2，与 toast 同一口径）
+    let _ = RoundRect(hdc, 0, 0, cw, ch, r * 2, r * 2);
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
     let _ = DeleteObject(brush);

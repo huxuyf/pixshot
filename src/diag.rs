@@ -26,14 +26,32 @@ pub fn log_path() -> PathBuf {
 }
 
 /// 追加一行诊断（失败静默：诊断本身不得影响功能）。
+/// 单次打开：先试 exe 同目录，不可写再回退临时目录（不为「探测」多开一次文件）。
 pub fn log(msg: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let primary = log_path_primary();
+    let f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path())
-    {
+        .open(&primary)
+        .or_else(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::env::temp_dir().join("pixshot_diag.log"))
+        });
+    if let Ok(mut f) = f {
         let _ = writeln!(f, "{msg}");
     }
+}
+
+/// 日志的首选路径（exe 同目录；无 exe 路径时临时目录）。不做可写性探测。
+fn log_path_primary() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("pixshot_diag.log");
+        }
+    }
+    std::env::temp_dir().join("pixshot_diag.log")
 }
 
 /// 启动时清空旧日志并写入会话头。
@@ -72,7 +90,10 @@ pub fn integrity_rid() -> Option<u32> {
             let _ = CloseHandle(token);
             return None;
         }
-        let mut buf = vec![0u8; len as usize];
+        // TOKEN_MANDATORY_LABEL 含指针（x64 需 8 字节对齐），Vec<u8> 只保证 1 字节
+        // 对齐——用 usize 缓冲承载，避免未对齐指针解引用（UB）
+        let words = (len as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buf = vec![0usize; words];
         let ok = GetTokenInformation(
             token,
             TokenIntegrityLevel,

@@ -20,10 +20,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const CLASS: &str = "PixShotToast";
 const TIMER_DISMISS: usize = 1;
-/// DT_CALCRECT | DT_SINGLELINE
-const DT_MEASURE: u32 = 0x0400 | 0x20;
-/// DT_CENTER | DT_VCENTER | DT_SINGLELINE
-const DT_CENTER_MID: u32 = 0x25;
+/// DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX（`&` 不当助记符前缀——提示会展示
+/// 保存路径，含 `&` 的路径（如 `D:\R&D\`）不能被吞字符/加下划线）
+const DT_MEASURE: u32 = 0x0400 | 0x20 | 0x0800;
+/// DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
+const DT_CENTER_MID: u32 = 0x25 | 0x0800;
 
 /// 显示一条提示（文本由窗口标题承载，避免额外生命周期管理）。
 pub fn show(text: &str) {
@@ -35,6 +36,7 @@ unsafe fn show_impl(text: &str) {
     let ms = crate::config::get().toast_ms;
 
     // 复用已有窗口：更新文本 + 重新测量定位 + 重置定时器
+    // （按类名全局查找：类名是本程序专有，理论上可命中其他进程同名类，实际概率极低）
     if let Ok(old) = FindWindowW(PCWSTR::from_raw(cls.as_ptr()), PCWSTR::null()) {
         if !old.is_invalid() {
             let w = util::to_wide(text);
@@ -65,6 +67,8 @@ unsafe fn show_impl(text: &str) {
     if hwnd.is_invalid() {
         return;
     }
+    // 提示条永不出现在截图里（否则「已保存」提示会被拍进紧接着的下一张）
+    let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
     // 圆角 + 直角贴图不同：提示条用圆角更符合系统观感
     theme_frame(hwnd);
     place(hwnd);
@@ -72,14 +76,25 @@ unsafe fn show_impl(text: &str) {
     let _ = SetTimer(hwnd, TIMER_DISMISS, ms, None);
 }
 
+/// 读取窗口标题承载的提示文本（动态长度，不截断）。
+unsafe fn window_text(hwnd: HWND) -> Vec<u16> {
+    let n = GetWindowTextLengthW(hwnd);
+    if n <= 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u16; n as usize + 1];
+    let got = GetWindowTextW(hwnd, &mut buf);
+    buf.truncate(got.max(0) as usize);
+    buf
+}
+
 /// 依据文本测量尺寸并定位到光标右下方（越界则向内翻转）。
 unsafe fn place(hwnd: HWND) {
-    let mut buf = [0u16; 256];
-    let n = GetWindowTextW(hwnd, &mut buf);
-    if n <= 0 {
+    let text = window_text(hwnd);
+    if text.is_empty() {
         return;
     }
-    let text = &buf[..(n as usize).min(255)];
+    let text = text.as_slice();
 
     let dpi = util::dpi_of(hwnd).max(GetDpiForSystem() as i32);
     let cfg = crate::config::get();
@@ -131,8 +146,8 @@ unsafe fn place(hwnd: HWND) {
 }
 
 unsafe fn theme_frame(hwnd: HWND) {
-    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE};
-    let pref = 2i32; // DWMWCP_ROUND
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
+    let pref = DWMWCP_ROUND.0;
     let _ = DwmSetWindowAttribute(
         hwnd,
         DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -186,9 +201,8 @@ unsafe fn paint(hwnd: HWND) {
     let _ = DeleteObject(brush);
     let _ = DeleteObject(pen);
 
-    let mut buf = [0u16; 256];
-    let n = GetWindowTextW(hwnd, &mut buf);
-    if n > 0 {
+    let text = window_text(hwnd);
+    if !text.is_empty() {
         let font = util::gui_font(hwnd, cfg.ui_toast_font_pt, 400);
         let old = SelectObject(hdc, font);
         raw::SetBkMode(hdc.0 as isize, 1);
@@ -201,8 +215,8 @@ unsafe fn paint(hwnd: HWND) {
         };
         let _ = raw::DrawTextW(
             hdc.0 as isize,
-            PCWSTR::from_raw(buf.as_ptr()),
-            n,
+            PCWSTR::from_raw(text.as_ptr()),
+            text.len() as i32,
             &mut r,
             DT_CENTER_MID,
         );

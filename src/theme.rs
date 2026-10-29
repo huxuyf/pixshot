@@ -17,9 +17,9 @@ use crate::util::to_wide;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMSBT_TRANSIENTWINDOW,
-    DWMWA_NCRENDERING_POLICY, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject, GetDC, GetTextFaceW, ReleaseDC,
@@ -97,11 +97,8 @@ thread_local! {
     static FAMILY: RefCell<Option<Vec<u16>>> = const { RefCell::new(None) };
 }
 
-/// 重新读取系统主题（WM_SETTINGCHANGE 时调用实现实时跟随）。
-///
-/// 当前无调用方（跟随系统的 OCR 结果窗口已移除；工具条为固定配色无需跟随），
-/// 保留以便后续窗口接入实时主题。
-#[allow(dead_code)]
+/// 重新读取系统主题（工具条 WM_SETTINGCHANGE 时调用，实现菜单等窗口的实时跟随）。
+/// 注意：CACHE 是 thread_local——必须在 GUI 线程调用（WM_SETTINGCHANGE 满足）。
 pub fn reload() {
     let t = load_theme();
     CACHE.with(|c| *c.borrow_mut() = Some(t));
@@ -293,7 +290,7 @@ fn probe_font(name: &str) -> bool {
 pub fn ui_font(hwnd: HWND, pt: i32, weight: i32) -> HFONT {
     unsafe {
         let dpi = GetDpiForWindow(hwnd).max(96) as i32;
-        let h = -(pt * dpi / 72);
+        let h = -(pt * dpi + 36) / 72; // 四舍五入
         let fam = family();
         CreateFontW(
             h,
@@ -364,19 +361,13 @@ pub fn apply_frame(hwnd: HWND, t: Theme, mica: bool) -> bool {
     }
 }
 
-/// 贴图窗口专用：保持直角（贴图是图像内容，圆角会裁掉像素），并禁用
-/// DWM 非客户区渲染——否则当贴图失去前台（用户点击其他窗口）后，DWM 会在
-/// WM_NCHITTEST 返回 HT* 的外缘 8px 调整大小带上绘制标准框架视觉带，
-/// 将贴图内容视觉内缩 8px（实测 Win11 26300）。
+/// 贴图窗口专用：保持直角（贴图是图像内容，圆角会裁掉像素）——
+/// 否则当贴图失去前台（用户点击其他窗口）后，DWM 会在 WM_NCHITTEST 返回 HT*
+/// 的外缘 8px 调整大小带上绘制标准框架视觉带，将贴图内容视觉内缩 8px
+/// （实测 Win11 26300）。生效的是 DWMWCP_DONOTROUND；
+/// （Vista 遗留的 DWMWA_NCRENDERING_POLICY 在 Win8+ 被忽略，不再调用。）
 pub fn frame_pin(hwnd: HWND) {
     unsafe {
-        let nrp = DWMNCRP_DISABLED.0;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_NCRENDERING_POLICY,
-            &nrp as *const i32 as *const core::ffi::c_void,
-            4,
-        );
         let pref = DWMWCP_DONOTROUND.0;
         let _ = DwmSetWindowAttribute(
             hwnd,

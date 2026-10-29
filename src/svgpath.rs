@@ -277,7 +277,13 @@ pub fn flatten(d: &str) -> Vec<Vec<(f32, f32)>> {
                     sub.push(start_pt);
                 }
             }
-            _ => break,
+            // 未支持的命令（S/T/Q 平滑/二次贝塞尔等）：整条路径剩余部分被截断。
+            // 记日志便于发现「图标少一半」（当前 Lucide 数据集不含这些命令；
+            // 一旦图标库升级引入它们，没有这行日志会静默缺笔画）。
+            _ => {
+                crate::diag::log(&format!("[svgpath] 未支持的命令 '{cmd}'，路径剩余部分被截断"));
+                break;
+            }
         }
     }
     flush!();

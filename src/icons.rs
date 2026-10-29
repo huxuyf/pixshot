@@ -175,6 +175,23 @@ const LUCIDE_STROKE: f32 = 2.0;
 /// 图标占按钮短边的比例：Lucide 内容约占 viewBox 的 20/24，乘 0.72 后视觉边长 ≈ 0.60。
 const ICON_RATIO: f32 = 0.72;
 
+// 扁平化缓存（线程局部）：图标路径解析结果只算一次。
+thread_local! {
+    static FLATTEN_CACHE: std::cell::RefCell<
+        std::collections::HashMap<&'static str, std::rc::Rc<Vec<Vec<(f32, f32)>>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// 取路径的扁平化折线（带缓存；Rc 克隆 O(1)）。
+fn flattened(d: &'static str) -> std::rc::Rc<Vec<Vec<(f32, f32)>>> {
+    FLATTEN_CACHE.with(|c| {
+        c.borrow_mut()
+            .entry(d)
+            .or_insert_with(|| std::rc::Rc::new(svgpath::flatten(d)))
+            .clone()
+    })
+}
+
 /// 在按钮矩形内居中绘制指定图标（Lucide 路径，GDI+ 抗锯齿描边）。
 /// `ink` 描边色。
 pub unsafe fn draw(hdc: HDC, rc: RECT, icon: Icon, ink: COLORREF) {
@@ -210,7 +227,10 @@ pub unsafe fn draw(hdc: HDC, rc: RECT, icon: Icon, ink: COLORREF) {
     }
 
     for d in lucide_paths(icon) {
-        for sub in svgpath::flatten(d) {
+        // 扁平化结果按路径串缓存（viewBox 坐标与 DPI/尺寸无关，天然可复用）——
+        // HoverFx 动画 16ms 节拍期间每个图标每帧都画，逐帧重新解析 SVG 不值
+        let subs = flattened(d);
+        for sub in subs.iter() {
             if sub.len() < 2 {
                 continue;
             }

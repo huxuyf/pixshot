@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::annot;
 use crate::capture::{self, CapturedImage};
 use crate::config;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::overlay::{
     Selection, WM_APP_CHAR, WM_APP_ESC_CLOSE, WM_APP_KEY, WM_APP_QUERY_TYPING, WM_APP_SET_TOOL,
     WM_APP_TOOL_CHANGED,
@@ -201,14 +201,24 @@ pub fn run(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()> {
 unsafe fn run_impl(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()> {
     register_class_w("PixShotToolbar", toolbar_proc, false, false, false);
 
-    let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as i32;
+    // 初始 DPI 按选区所在显示器（多屏异缩放下比系统 DPI 更贴近实际显示位置；
+    // 创建后 WM_DPICHANGED 仍会纠正一次）
+    let dpi = util::dpi_for_rect(image.x, image.y, image.width, image.height);
     let (lw, lh) = logical_size();
     let (tw, th) = (util::scaled(lw, dpi), util::scaled(lh, dpi));
 
-    // 定位在选区下方 8px，水平对齐选区中线，越界则钳制回虚拟屏幕内
+    // 定位在选区下方 8px，水平对齐选区中线；下方放不下则翻到选区上方，
+    // 仍不足再钳制回虚拟屏幕内（贴底时直接压在选区上会遮挡标注操作区）
     let (vx, vy, vw, vh) = capture::virtual_screen_rect();
     let x = (image.x + (image.width - tw) / 2).clamp(vx, (vx + vw - tw).max(vx));
-    let y = (image.y + image.height + util::scaled(8, dpi)).clamp(vy, (vy + vh - th).max(vy));
+    let gap = util::scaled(8, dpi);
+    let y_below = image.y + image.height + gap;
+    let y = if y_below + th > vy + vh {
+        (image.y - th - gap).max(vy) // 下方空间不足 → 选区上方
+    } else {
+        y_below
+    }
+    .clamp(vy, (vy + vh - th).max(vy));
 
     let data = Box::into_raw(Box::new(ToolbarData {
         image,
@@ -236,10 +246,10 @@ unsafe fn run_impl(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()>
         th,
         data as *mut core::ffi::c_void,
     )?;
-    if hwnd.is_invalid() {
-        drop(Box::from_raw(data));
-        return Err(AppError::Config("创建工具栏窗口失败".into()));
-    }
+    // 注意：不要在失败路径回收 `data` —— WM_CREATE 已把指针交给窗口
+    // （WM_DESTROY 里 Box::from_raw 释放），创建中途失败时 WM_DESTROY 会照常派发；
+    // 而 create_window 以 Err 提前返回时不会再执行到这里。两处只留一处释放点。
+    debug_assert!(!hwnd.is_invalid());
     // 排除出截屏捕获：防止工具栏出现在后续截图/录屏画面中（截图工具惯例）
     let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
     let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
@@ -259,7 +269,15 @@ unsafe fn run_impl(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()>
 
     // 模态消息循环
     let mut msg = MSG::default();
-    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+    loop {
+        let r = GetMessageW(&mut msg, None, 0, 0).0;
+        if r == 0 {
+            break; // WM_QUIT
+        }
+        if r == -1 {
+            crate::diag::log("[toolbar] GetMessageW 返回 -1（消息错误），结束工具条循环");
+            break;
+        }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -449,7 +467,9 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         }
 
         WM_SETTINGCHANGE => {
-            // 工具栏皮肤固定深色，此处只需重绘（系统主题变化不影响配色）
+            // 系统主题变化：刷新主题缓存（菜单等用 theme::current() 的窗口依赖它；
+            // 工具栏皮肤固定深色，自身只需重绘）
+            theme::reload();
             let _ = raw::InvalidateRect(hwnd, std::ptr::null(), 1);
             LRESULT(0)
         }

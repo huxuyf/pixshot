@@ -17,7 +17,6 @@ use windows::Win32::Graphics::Gdi::{
     GetStockObject, ReleaseDC, RoundRect, SelectObject, HDC, NULL_BRUSH, PS_SOLID,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -74,6 +73,8 @@ impl Item {
     }
 
     /// 带快捷键的条目（快捷键右对齐显示，并在菜单展开时生效）。
+    /// 带快捷键文案的菜单项。`shortcut` 文案必须与 `pressed_combo` 的拼法一致：
+    /// 修饰键固定 `Ctrl+Shift+Alt+` 顺序、主键为单个大写字母/数字（如 `Ctrl+S`）。
     pub fn accel(label: impl Into<String>, shortcut: impl Into<String>) -> Self {
         Self {
             label: label.into(),
@@ -167,16 +168,20 @@ unsafe fn show_impl(x: i32, y: i32, items: &[Item]) -> Option<usize> {
     }
     // WM_CREATE 已把 data 指针写入 USERDATA；此处 SAFETY：窗口存活期间指针有效
     let d = &mut *data;
-    measure(hwnd, d);
+    // 按目标点所在显示器的 DPI 量测（窗口尚未移到目标屏，dpi_of 此时是主屏 DPI，
+    // 多屏异缩放量测会错）
+    let dpi = util::dpi_for_rect(x, y, 1, 1);
+    measure(hwnd, d, dpi);
 
-    let dpi = util::dpi_of(hwnd).max(GetDpiForSystem() as i32);
+    // 钳制到目标点所在显示器的**工作区**（不含任务栏），贴底时向上翻转
     let (vx, vy, vw, vh) = crate::capture::virtual_screen_rect();
+    let wa = util::work_area_at(x, y)
+        .unwrap_or(RECT { left: vx, top: vy, right: vx + vw, bottom: vy + vh });
     let mh = menu_height(d, dpi);
-    // 贴边时向内收 / 向上翻转，避免菜单跑出屏幕
     let mut px = x;
-    let mut py = if y + mh > vy + vh { y - mh } else { y };
-    px = px.clamp(vx, (vx + vw - d.width).max(vx));
-    py = py.clamp(vy, (vy + vh - mh).max(vy));
+    let mut py = if y + mh > wa.bottom { y - mh } else { y };
+    px = px.clamp(wa.left, (wa.right - d.width).max(wa.left));
+    py = py.clamp(wa.top, (wa.bottom - mh).max(wa.top));
 
     let _ = theme::apply_frame(hwnd, theme::current(), false);
     let _ = SetWindowPos(
@@ -194,7 +199,9 @@ unsafe fn show_impl(x: i32, y: i32, items: &[Item]) -> Option<usize> {
     SetCapture(hwnd);
     let _ = raw::UpdateWindow(hwnd);
 
-    // 模态消息循环（WM_DESTROY 时 PostQuitMessage 会被本循环消费，不影响主循环）
+    // 模态消息循环（WM_DESTROY 时 PostQuitMessage 会被本循环消费，不影响主循环）。
+    // 注意：本循环按全线程收消息，期间主窗口的 WM_HOTKEY / 托盘回调仍会被分发——
+    // 重入安全由 TRAY_MENU_BUSY / BusyGuard 双保险兜底（见 tray.rs）。
     let mut msg = MSG::default();
     while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
         let _ = TranslateMessage(&msg);
@@ -218,8 +225,8 @@ fn menu_height(d: &Data, _dpi: i32) -> i32 {
 }
 
 /// 用真实字体测量最宽项，得出菜单宽度与各项高度。
-unsafe fn measure(hwnd: HWND, d: &mut Data) {
-    let dpi = util::dpi_of(hwnd).max(GetDpiForSystem() as i32);
+/// `dpi` 取目标显示器的 DPI（窗口可能尚未移到目标屏，不能 dpi_of(hwnd)）。
+unsafe fn measure(hwnd: HWND, d: &mut Data, dpi: i32) {
     let cfg = crate::config::get();
     d.item_h = util::scaled(cfg.ui_menu_item_h, dpi);
     d.sep_h = util::scaled(cfg.ui_menu_sep_h, dpi);
@@ -417,7 +424,8 @@ unsafe fn paint_into(hwnd: HWND, hdc: HDC, w: i32, h: i32, d: &Data, t: theme::T
     let op = SelectObject(hdc, pen);
     let _ = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     let radius = util::scaled(cfg.ui_menu_radius, dpi);
-    let _ = RoundRect(hdc, 0, 0, w, h, radius, radius);
+    // RoundRect 后两个参数是圆角椭圆的轴长（= 半径 × 2）
+    let _ = RoundRect(hdc, 0, 0, w, h, radius * 2, radius * 2);
     SelectObject(hdc, op);
     let _ = DeleteObject(pen);
 

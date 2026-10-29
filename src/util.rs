@@ -77,6 +77,37 @@ pub fn dpi_of(hwnd: HWND) -> i32 {
     unsafe { GetDpiForWindow(hwnd).max(96) as i32 }
 }
 
+/// 点所在显示器的工作区（不含任务栏）；失败返回 None（调用方自行回退）。
+pub fn work_area_at(x: i32, y: i32) -> Option<RECT> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(mon, &mut mi).as_bool().then_some(mi.rcWork)
+    }
+}
+
+/// 虚拟屏坐标矩形所在显示器的 DPI（下限 96）；失败回退系统 DPI。
+/// 多显示器异缩放下，新建窗口的初始尺寸应按目标显示器换算。
+pub fn dpi_for_rect(x: i32, y: i32, w: i32, h: i32) -> i32 {
+    use windows::Win32::Graphics::Gdi::{MonitorFromRect, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForSystem, MDT_EFFECTIVE_DPI};
+    unsafe {
+        let r = RECT { left: x, top: y, right: x + w, bottom: y + h };
+        let mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        let (mut dx, mut dy) = (0u32, 0u32);
+        if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).is_ok() && dx > 0 {
+            return (dx as i32).max(96);
+        }
+        GetDpiForSystem().max(96) as i32
+    }
+}
+
 /// 逻辑像素 → 物理像素（四舍五入）。
 pub fn scaled(v: i32, dpi: i32) -> i32 {
     let d = dpi.max(96);
@@ -260,11 +291,17 @@ pub unsafe fn ctlcolor_static(wp: WPARAM, text: COLORREF) -> LRESULT {
     LRESULT(GetStockObject(NULL_BRUSH).0 as isize)
 }
 
+/// MessageBox 属主：前台窗口（本程序大量 TOPMOST 窗口，无属主的模态框
+/// 可能被压在冻结层/贴图之后而看不见）。
+fn msgbox_owner() -> HWND {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }
+}
+
 /// 弹出错误提示框（错误必须可见，保留系统模态框是刻意选择）。
 pub fn error_msgbox(text: &str) {
     unsafe {
         let _ = MessageBoxW(
-            HWND::default(),
+            msgbox_owner(),
             PCWSTR::from_raw(to_wide(text).as_ptr()),
             PCWSTR::from_raw(to_wide("PixShot").as_ptr()),
             MB_OK | MB_ICONERROR,
@@ -276,7 +313,7 @@ pub fn error_msgbox(text: &str) {
 pub fn info_msgbox(text: &str) {
     unsafe {
         let _ = MessageBoxW(
-            HWND::default(),
+            msgbox_owner(),
             PCWSTR::from_raw(to_wide(text).as_ptr()),
             PCWSTR::from_raw(to_wide("PixShot").as_ptr()),
             MB_OK | MB_ICONINFORMATION,
@@ -605,6 +642,11 @@ pub fn unsubclass(hwnd: HWND) {
 
 /// 把消息转发到 [`subclass`] 替换前的原窗口过程（取不到时退回 `DefWindowProcW`）。
 pub unsafe fn call_orig(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // HWND 复用检测：控件销毁前必须 unsubclass，否则会把消息转发给错误的旧过程
+    debug_assert!(
+        windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd).as_bool(),
+        "call_orig 命中已销毁的控件（漏调 unsubclass?）"
+    );
     let old = OLD_PROCS.with(|m| {
         m.borrow()
             .iter()

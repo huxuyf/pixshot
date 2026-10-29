@@ -39,6 +39,8 @@ const NIN_SELECT: u32 = 0x0400;
 const NIN_KEYSELECT: u32 = 0x0401;
 /// LLKHF_INJECTED：注入按键标记（钩子中忽略，避免与自动化工具相互触发）
 const LLKHF_INJECTED: u32 = 0x10;
+/// LLKHF_LOWER_IL_INJECTED：低完整性进程注入的按键（同样忽略）
+const LLKHF_LOWER_IL_INJECTED: u32 = 0x02;
 /// ERROR_ALREADY_EXISTS
 const ERROR_ALREADY_EXISTS: u32 = 183;
 /// VK_SHIFT / VK_CONTROL / VK_MENU / VK_LWIN / VK_RWIN
@@ -50,6 +52,10 @@ const VK_RWIN_V: i32 = 0x5C;
 
 /// 托盘是否已成功升级到 `NOTIFYICON_VERSION_4` 回调协议。
 static TRAY_V4: AtomicBool = AtomicBool::new(false);
+/// 当前托盘图标（自有 HICON；0 = 无）。`LoadImageW` 每次返回新句柄，
+/// NIM_ADD 不接管所有权、NIM_DELETE 不销毁——重复添加（Explorer 重启恢复）
+/// 前必须销毁旧图标，否则每次重启泄漏一个。
+static TRAY_ICON: AtomicIsize = AtomicIsize::new(0);
 /// TaskbarCreated 消息 id（0 = 尚未注册）
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// 钩子宿主窗口
@@ -109,6 +115,8 @@ pub fn acquire_single_instance() -> bool {
             Ok(h) => {
                 let err = windows::Win32::Foundation::GetLastError().0;
                 if err == ERROR_ALREADY_EXISTS {
+                    // 句柄指向已有互斥体：进程即将退出，仍显式关闭保持收尾干净
+                    let _ = windows::Win32::Foundation::CloseHandle(h);
                     return false;
                 }
                 INSTANCE_MUTEX.store(h.0 as isize, Ordering::SeqCst);
@@ -174,9 +182,16 @@ fn load_app_icon() -> HICON {
                 HICON(h.0)
             }
             Err(e) => {
-                let fb = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+                // IDI_APPLICATION 是共享系统图标（绝不能 DestroyIcon）：
+                // CopyIcon 成自有副本，统一「调用方拥有」的所有权语义
+                let shared = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+                let fb = if shared.is_invalid() {
+                    shared
+                } else {
+                    CopyIcon(shared).unwrap_or_default()
+                };
                 diag::log(&format!(
-                    "[icon] LoadImageW 失败({e}) -> 回退 LoadIconW(IDI_APPLICATION) hIcon=0x{:X}",
+                    "[icon] LoadImageW 失败({e}) -> 回退 IDI_APPLICATION 副本 hIcon=0x{:X}",
                     fb.0 as usize
                 ));
                 fb
@@ -227,11 +242,19 @@ fn add_tray_icon(hwnd: HWND) -> (bool, u32) {
                     windows::Win32::Foundation::GetLastError().0,
                     if sok.as_bool() { "V4" } else { "V0/V3" }
                 ));
+                // 换入新图标并销毁旧的（Explorer 重启恢复路径会再次走到这里）
+                let old_icon = TRAY_ICON.swap(icon.0 as isize, Ordering::SeqCst);
+                if old_icon != 0 && old_icon != icon.0 as isize {
+                    let _ = DestroyIcon(HICON(old_icon as *mut core::ffi::c_void));
+                }
                 return (true, last_err);
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
         TRAY_V4.store(false, Ordering::SeqCst);
+        if !icon.is_invalid() {
+            let _ = DestroyIcon(icon); // 未入托盘，自行销毁
+        }
         (false, last_err)
     }
 }
@@ -249,6 +272,10 @@ fn remove_tray_icon(hwnd: HWND) {
             "[tray] Shell_NotifyIconW(NIM_DELETE) -> {}",
             ok.as_bool()
         ));
+        let icon = TRAY_ICON.swap(0, Ordering::SeqCst);
+        if icon != 0 {
+            let _ = DestroyIcon(HICON(icon as *mut core::ffi::c_void));
+        }
     }
 }
 
@@ -343,18 +370,22 @@ fn precapture() {
     }
     let t0 = Instant::now();
     // 用配置开关：热键那一刻若开着"含指针"，快照里就带上按下热键时的光标位置
-    if let Ok(img) =
-        capture::capture_region_ex(vx, vy, vw, vh, config::get().capture_cursor)
-    {
-        diag::log(&format!(
-            "[hotkey] 预捕获整屏 {}×{} @ {vx},{vy} 用时 {:?}",
-            img.width,
-            img.height,
-            t0.elapsed()
-        ));
-        if let Ok(mut g) = PRECAPTURE.lock() {
-            *g = Some((t0, Arc::new(img)));
+    match capture::capture_region_ex(vx, vy, vw, vh, config::get().capture_cursor) {
+        Ok(img) => {
+            let elapsed = t0.elapsed();
+            // 钩子回调受 LowLevelHooksTimeout 限制：明显偏慢要留痕（超时会被系统静默摘钩）
+            if elapsed > Duration::from_millis(500) {
+                diag::log(&format!("[hotkey] 预捕获耗时 {elapsed:?}，接近钩子超时风险"));
+            }
+            diag::log(&format!(
+                "[hotkey] 预捕获整屏 {}×{} @ {vx},{vy} 用时 {:?}",
+                img.width, img.height, elapsed
+            ));
+            if let Ok(mut g) = PRECAPTURE.lock() {
+                *g = Some((t0, Arc::new(img)));
+            }
         }
+        Err(e) => diag::log(&format!("[hotkey] 预捕获失败: {e}")),
     }
 }
 
@@ -393,7 +424,7 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
     if code == 0 && lp.0 != 0 {
         let kb = &*(lp.0 as *const KBDLLHOOKSTRUCT);
         let is_down = wp.0 == WM_KEYDOWN as usize || wp.0 == WM_SYSKEYDOWN as usize;
-        let injected = (kb.flags.0 & LLKHF_INJECTED) != 0;
+        let injected = (kb.flags.0 & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) != 0;
         let allow_injected = ALLOW_INJECTED.load(Ordering::Relaxed);
         if is_down && (allow_injected || !injected) {
             // 截图热键：命中后先抓整屏（此刻按键还没经 CallNextHookEx 投递给前台窗口）
@@ -483,8 +514,8 @@ fn install_keyboard_hook(hwnd: HWND, bindings: &[(i32, u32, u32)]) -> bool {
     }
 }
 
-/// 初始化托盘与热键。返回 (托盘成功, 托盘错误码, 热键可用)。
-pub fn init(hwnd: HWND) -> (bool, u32, bool) {
+/// 初始化托盘与热键。返回 (托盘成功, 托盘错误码, 截图热键可用, 贴图热键可用)。
+pub fn init(hwnd: HWND) -> (bool, u32, bool, bool) {
     MAIN_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
     let _ = taskbar_created_msg(); // 预注册 TaskbarCreated，供 Explorer 重启后恢复
     let (tray_ok, tray_err) = add_tray_icon(hwnd);
@@ -531,7 +562,7 @@ pub fn init(hwnd: HWND) -> (bool, u32, bool) {
     diag::log(&format!(
         "[boot] 集成状态: 托盘={tray_ok}(err={tray_err}), 截图热键={shot_ok}, 贴图热键={pin_ok}"
     ));
-    (tray_ok, tray_err, shot_ok)
+    (tray_ok, tray_err, shot_ok, pin_ok)
 }
 
 // ─── 主窗口消息过程 ──────────────────────────────────────────────
@@ -576,19 +607,27 @@ pub unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let lo_lp = (lp.0 & 0xFFFF) as u32;
             let hi_lp = ((lp.0 >> 16) & 0xFFFF) as u32;
             let v4 = TRAY_V4.load(Ordering::SeqCst);
-            diag::log(&format!(
-                "[tray] 回调({}): wp=0x{:X} lp=0x{:X} (x={lo_wp} y={hi_wp} 事件=0x{lo_lp:X} uID={hi_lp})",
-                if v4 { "V4" } else { "V0" },
-                wp.0,
-                lp.0
-            ));
+            // 高频事件（V4 下鼠标移动也会进回调）不记磁盘日志——每次写文件的
+            // 开销 × 鼠标扫过的频率 = 数百次磁盘 I/O，且日志会无上限膨胀
+            const WM_MOUSEMOVE_V: u32 = 0x0200;
+            const NIN_POPUPOPEN_V: u32 = 0x0406;
+            const NIN_POPUPCLOSE_V: u32 = 0x0407;
+            if !matches!(lo_lp, WM_MOUSEMOVE_V | NIN_POPUPOPEN_V | NIN_POPUPCLOSE_V) {
+                diag::log(&format!(
+                    "[tray] 回调({}): wp=0x{:X} lp=0x{:X} (x={lo_wp} y={hi_wp} 事件=0x{lo_lp:X} uID={hi_lp})",
+                    if v4 { "V4" } else { "V0" },
+                    wp.0,
+                    lp.0
+                ));
+            }
 
             if v4 {
                 // 坐标可能为负（副屏），按 i16 解释
                 let x = lo_wp as u16 as i16 as i32;
                 let y = hi_wp as u16 as i16 as i32;
                 match lo_lp {
-                    WM_LBUTTONUP | WM_LBUTTONDBLCLK | NIN_SELECT | NIN_KEYSELECT => {
+                    // 不含 DBLCLK：双击会连发 UP+DBLCLK 两条回调，不该连开两次截图
+                    WM_LBUTTONUP | NIN_SELECT | NIN_KEYSELECT => {
                         crate::screenshot_flow()
                     }
                     WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(hwnd, x, y),
@@ -596,7 +635,7 @@ pub unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 }
             } else {
                 match lo_lp {
-                    WM_LBUTTONUP | WM_LBUTTONDBLCLK => crate::screenshot_flow(),
+                    WM_LBUTTONUP => crate::screenshot_flow(),
                     WM_RBUTTONUP | WM_CONTEXTMENU => {
                         // V0 不携带坐标：取当前光标位置
                         let mut pt = windows::Win32::Foundation::POINT::default();

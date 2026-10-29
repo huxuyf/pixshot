@@ -48,7 +48,8 @@ fn main() {
     write_ico(&ico_path, &sizes);
 
     match embed_icon(&out, &ico_path) {
-        Ok(res) => println!("cargo:rustc-link-arg-bins={}", res.display()),
+        // 路径加引号：OUT_DIR 含空格时未加引号的路径会被 link.exe 按空格截断
+        Ok(res) => println!("cargo:rustc-link-arg-bins=\"{}\"", res.display()),
         Err(e) => {
             // 图标是产品的一部分：静默降级会导致"exe 没有图标"这种极难排查的问题，
             // 这里直接让构建失败，并在信息里给出两种解决方式。
@@ -83,6 +84,15 @@ fn stage_ocr_assets() {
     let Some(exe_dir) = out.ancestors().nth(3).map(Path::to_path_buf) else {
         return;
     };
+    // 目录布局假设失效时不要静默跳过资产布置（OCR 会在运行时找不到模型）。
+    // 宽松判定：exe 目录名应是 cargo 的 profile 目录（debug/release/自定义 profile）。
+    let dir_name = exe_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !(dir_name == "debug" || dir_name.starts_with("release") || exe_dir.join("build").is_dir()) {
+        println!(
+            "cargo:warning=OUT_DIR 布局异常（{}），OCR 资产可能布置到错误位置",
+            exe_dir.display()
+        );
+    }
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
 
     let pairs: [(&str, PathBuf); 3] = [
@@ -115,10 +125,16 @@ fn stage_ocr_assets() {
     }
 }
 
-/// 大小不同才复制（内容变化必然改变大小，够用且省事）。
+/// 内容不同才复制。同尺寸不必然同内容（模型同结构重新训练可同尺寸），
+/// 大小相同再逐字节比对一次。
 fn copy_if_changed(src: &Path, dst: &Path) {
     let same = match (fs::metadata(src), fs::metadata(dst)) {
-        (Ok(a), Ok(b)) => a.len() == b.len(),
+        (Ok(a), Ok(b)) if a.len() == b.len() => {
+            match (fs::read(src), fs::read(dst)) {
+                (Ok(sa), Ok(sb)) => sa == sb,
+                _ => false,
+            }
+        }
         _ => false,
     };
     if same {
