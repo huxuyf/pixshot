@@ -48,8 +48,9 @@ fn main() {
     write_ico(&ico_path, &sizes);
 
     match embed_icon(&out, &ico_path) {
-        // 路径加引号：OUT_DIR 含空格时未加引号的路径会被 link.exe 按空格截断
-        Ok(res) => println!("cargo:rustc-link-arg-bins=\"{}\"", res.display()),
+        // 注意：不要给路径加引号——cargo 把该值原样透传给 link.exe（不经 shell
+        // 分词），引号会成为文件名的一部分（CI 实测 LNK1104 打不开带引号的文件）
+        Ok(res) => println!("cargo:rustc-link-arg-bins={}", res.display()),
         Err(e) => {
             // 图标是产品的一部分：静默降级会导致"exe 没有图标"这种极难排查的问题，
             // 这里直接让构建失败，并在信息里给出两种解决方式。
