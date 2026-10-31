@@ -42,10 +42,10 @@ function Find-W([int]$TargetPid, [string]$Class) {
     foreach ($w in $script:hits) { if ($w.Class -eq $Class) { return $w.Hwnd } }
     [IntPtr]::Zero }
 
-$exe = "C:\Users\user\Desktop\pixpin\pixshot\target\release\pixshot.exe"
+$exe = "C:\Users\user\Desktop\pixpin\pixshot\target\release\PixShot.exe"
 $logPath = "C:\Users\user\Desktop\pixpin\pixshot\target\release\pixshot_diag.log"
 
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 700
 Remove-Item $logPath -ErrorAction SilentlyContinue
 $env:PIXSHOT_NO_UI_ALERTS = '1'
@@ -105,5 +105,5 @@ if ([A]::IsWindow($ov)) {
     [void][S]::SendMessageW($ov, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 400
 }
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 W "=== 验收结束（测试进程已结束）==="

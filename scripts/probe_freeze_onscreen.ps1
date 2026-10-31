@@ -8,7 +8,7 @@
 # 这样普通屏幕截图能拍到遮罩，从而直接比对它显示的内容。
 #
 # 判据：框选期间屏幕 ≈ RED 且与"遮罩已消失后"的 GREEN 明显不同。
-param([string]$Exe = (Join-Path $PSScriptRoot '..\target\release\pixshot.exe'))
+param([string]$Exe = (Join-Path $PSScriptRoot '..\target\release\PixShot.exe'))
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $env:PIXSHOT_NO_UI_ALERTS = '1'
@@ -46,7 +46,7 @@ function WaitWin([string]$Class, [int]$TimeoutMs) {
     return [IntPtr]::Zero
 }
 
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 $proc = Start-Process -FilePath $Exe -PassThru
 Start-Sleep -Milliseconds 1200

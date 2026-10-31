@@ -5,7 +5,7 @@
 //! 数十 MB），且**装入后无法卸载**（Win32 没有 `ImmEnableIME`）。因此主进程干脆
 //! 在启动时 `ImmDisableIME(-1)` 彻底拒绝注入，把"要输入法的文字输入"外包给子进程：
 //!
-//! - 用户点选文字工具、在画面上落点时，主进程用 `start()` 拉起 `pixshot.exe --text-input`；
+//! - 用户点选文字工具、在画面上落点时，主进程用 `start()` 拉起 `PixShot.exe --text-input`；
 //! - 子进程是个 **WS_POPUP + 标准 EDIT 控件**的小窗，它不禁用 IME，因此中文组字/候选窗
 //!   由系统原生处理（不需要手工 `ImmSetCompositionWindow`），窗口贴在标注锚点上；
 //! - 正文每次变化经 `WM_COPYDATA` 回传主进程（主进程据此保存"输入中的正文"，

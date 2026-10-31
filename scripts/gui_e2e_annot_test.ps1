@@ -12,7 +12,7 @@ PixShot 标注功能 GUI 端到端测试
      （**合成图回归**：导出图与屏幕所见一致）；
   7. 再次截图，点击「步骤序号」按钮并在画面上单击 → 出现蓝色徽章（RGB≈1E6FFF）。
 
-前置条件：已执行 cargo build（默认使用 target\debug\pixshot.exe）。
+前置条件：已执行 cargo build（默认使用 target\debug\PixShot.exe）。
 
 说明：本脚本设置 PIXSHOT_OVERLAY_CAPTURABLE=1，让冻结层可被普通屏幕截图捕获
 （正常使用下冻结层是 WDA_EXCLUDEFROMCAPTURE 的），从而能用像素采样回归标注观感。
@@ -20,7 +20,7 @@ PixShot 标注功能 GUI 端到端测试
 注意：脚本运行期间（约 25 秒）会接管鼠标和键盘，请勿操作桌面。
 
 用法：
-  pwsh -File scripts\gui_e2e_annot_test.ps1 [-Exe <pixshot.exe>] [-SelX 300 -SelY 300 -SelW 600 -SelH 400]
+  pwsh -File scripts\gui_e2e_annot_test.ps1 [-Exe <PixShot.exe>] [-SelX 300 -SelY 300 -SelW 600 -SelH 400]
 
 输出：
   - PASS/FAIL 检查清单；退出码 0 = 全部通过
@@ -28,7 +28,7 @@ PixShot 标注功能 GUI 端到端测试
   - e2e_artifacts\annot_final.png        全流程结束状态存档
 #>
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\debug\pixshot.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\debug\PixShot.exe'),
     [int]$SelX = 300,
     [int]$SelY = 300,
     [int]$SelW = 600,
@@ -44,7 +44,7 @@ if (-not (Test-Path $Exe)) { throw "找不到 $Exe，请先执行 cargo build" }
 $art = Join-Path $PSScriptRoot '..\e2e_artifacts'
 New-Item -ItemType Directory -Force -Path $art | Out-Null
 try { Start-Transcript -Path (Join-Path $art 'e2e_annot_transcript.txt') -Force | Out-Null } catch { }
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 
 Add-Type -AssemblyName System.Drawing

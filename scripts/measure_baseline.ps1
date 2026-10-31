@@ -8,7 +8,7 @@ PixShot 性能基线测量 v2
 窗口驱动全部走 SendMessage；日志实时写入 perf_baseline.txt。
 #>
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\pixshot.exe')
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\PixShot.exe')
 )
 $env:PIXSHOT_NO_UI_ALERTS = '1'   # 沙箱下托盘注册必失败，屏蔽启动提示框以保证测试确定性
 $ErrorActionPreference = 'Stop'
@@ -67,7 +67,7 @@ function Wait-Enum([int]$TargetPid, [string]$Class, [int]$TimeoutMs = 15000) {
 $exeItem = Get-Item $Exe
 Log ("系统: {0}" -f [Environment]::OSVersion.VersionString)
 Log ("EXE: {0:N2} MB ({1} 字节)" -f ($exeItem.Length / 1MB), $exeItem.Length)
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 
 # ── 1. 启动时间 ×3（EnumWindows 轮询：沙箱中 FindWindowW 对部分类名/标题不可见；

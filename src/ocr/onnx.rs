@@ -58,7 +58,7 @@ fn init_runtime() -> Result<()> {
     static ONCE: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     let r = ONCE.get_or_init(|| {
         let dll = find_file("onnxruntime.dll", "vendor/onnxruntime/onnxruntime.dll").ok_or_else(|| {
-            "未找到 onnxruntime.dll（应与 pixshot.exe 同目录，或位于仓库 vendor/onnxruntime/）".to_string()
+            "未找到 onnxruntime.dll（应与 PixShot.exe 同目录，或位于仓库 vendor/onnxruntime/）".to_string()
         })?;
         ort::init_from(&dll)
             .map_err(|e| format!("加载 {} 失败: {e}", dll.display()))?

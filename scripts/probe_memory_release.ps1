@@ -4,7 +4,7 @@
 # 1080p 整屏 BGRA ≈ 8 MB；4K 多屏更大。确认后该缓冲应被释放（Rust 大分配走
 # VirtualAlloc，drop 时立即归还系统，故驻留集应出现可见下降）。
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\pixshot.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\PixShot.exe'),
     [int]$DropMinMb = 5
 )
 $ErrorActionPreference = 'Stop'
@@ -28,7 +28,7 @@ $sw = [W]::GetSystemMetrics(0); $sh = [W]::GetSystemMetrics(1)
 function WS([int]$procId) { [int]((Get-Process -Id $procId).WorkingSet64 / 1MB) }
 function Priv([int]$procId) { [int]((Get-Process -Id $procId).PrivateMemorySize64 / 1MB) }
 
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 $proc = Start-Process -FilePath $Exe -PassThru
 Start-Sleep -Milliseconds 1500

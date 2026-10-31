@@ -6,7 +6,7 @@
 #
 # 判据：整屏粗采样均值 —— 冻结画面≈RED、解冻后≈GREEN（背后铺了一块"失焦即变绿"的整屏窗口）。
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\pixshot.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\PixShot.exe'),
     [int]$BtnCloseId = 5
 )
 $ErrorActionPreference = 'Stop'
@@ -68,7 +68,7 @@ function TopIndex([string]$prefix) {
     return 9999
 }
 
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 $proc = Start-Process -FilePath $Exe -PassThru
 Start-Sleep -Milliseconds 1200

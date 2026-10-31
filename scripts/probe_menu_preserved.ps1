@@ -8,7 +8,7 @@
 # 两种热键链路上都跑：
 #   - FORCE_HOOK=1：热键按键会投递给前台窗口（用户机器上 F1 被占用时的兜底路径）
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\pixshot.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\PixShot.exe'),
     [int]$Mx = 520, [int]$My = 260,
     [int]$Rw = 320, [int]$Rh = 470
 )
@@ -63,7 +63,7 @@ function Drag([int]$x0, [int]$y0, [int]$x1, [int]$y1) {
     [N]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 150
 }
 
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 $proc = Start-Process -FilePath $Exe -PassThru
 Start-Sleep -Milliseconds 1200

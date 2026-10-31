@@ -48,16 +48,16 @@ function Click([int]$x, [int]$y, [bool]$right) {
     else        { [R2]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 80; [R2]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero) }
     return "$($p.X),$($p.Y)" }
 
-$exe = "C:\Users\user\Desktop\pixpin\pixshot\target\release\pixshot.exe"
+$exe = "C:\Users\user\Desktop\pixpin\pixshot\target\release\PixShot.exe"
 $logPath = "C:\Users\user\Desktop\pixpin\pixshot\target\release\pixshot_diag.log"
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 700
 Remove-Item $logPath -ErrorAction SilentlyContinue
 $env:PIXSHOT_NO_UI_ALERTS='1'
 $p = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Seconds 2
 $main = Find-W $p.Id 'PixShotMain'
-W "pixshot PID=$($p.Id)"
+W "PixShot PID=$($p.Id)"
 
 function IconRect($main) {
     $id = New-Object R2+NII
@@ -166,5 +166,5 @@ if ($menu -ne [IntPtr]::Zero) {
 W ""
 W "④ 程序日志（托盘）"
 if (Test-Path $logPath) { foreach ($l in (Get-Content $logPath)) { if ($l -match '\[tray\]') { W "  $l" } } }
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 W "=== 结束 ==="

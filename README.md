@@ -45,7 +45,7 @@ pwsh -File scripts\ci.ps1      # 本地 CI（check → test → build → E2E）
 
 | 文件 | 约 | 说明 |
 |---|---|---|
-| `pixshot.exe` | 3.1 MB | 主程序 |
+| `PixShot.exe` | 3.1 MB | 主程序 |
 | `onnxruntime.dll` | 15 MB | OCR 推理运行时 |
 | `model\det.onnx`、`model\rec.onnx` | 16 MB | OCR 检测 / 识别模型 |
 
@@ -54,7 +54,7 @@ pwsh -File scripts\ci.ps1      # 本地 CI（check → test → build → E2E）
 
 ## 配置文件
 
-首次启动会在 `pixshot.exe` 同目录生成带注释的 `config.ini`（UTF-8）。
+首次启动会在 `PixShot.exe` 同目录生成带注释的 `config.ini`（UTF-8）。
 **修改后重启生效**，删除该文件即恢复默认。
 
 配置文件按用途分节（`[section]`），节名仅用于组织，键名在全文件内唯一。
@@ -155,7 +155,7 @@ mica = 1                     ; 是否启用 Mica 背景
 | 按 F1 无反应 | F1 可能被其他程序占用，本版本会自动回退到键盘钩子兜底；也可在 `config.ini` 里换一个热键，或设 `PIXSHOT_FORCE_HOOK=1` 强制走钩子 |
 | 双击运行也失败、托盘图标空白 | 运行目录被打了低完整性标签（常见于沙箱类工具写入的目录）。运行 `pwsh -File scripts\fix_integrity.ps1` 修复，或把 exe 复制到普通目录再运行 |
 | OCR 识别不出文字 / 直接失败 | 确认 `onnxruntime.dll` 与 `model\` 与 exe 同目录；缺失时会回退系统 OCR，中文需系统语言包带「文字识别」 |
-| 提示「PixShot 已启动，无需再次执行」 | 单实例保护：先在任务管理器结束所有 `pixshot.exe` 再启动 |
+| 提示「PixShot 已启动，无需再次执行」 | 单实例保护：先在任务管理器结束所有 `PixShot.exe` 再启动 |
 | 打开 exe 弹出 SmartScreen 警告 | 发布版未签名，点「更多信息 → 仍要运行」放行即可 |
 
 ## 已知限制

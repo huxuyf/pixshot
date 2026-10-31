@@ -536,7 +536,7 @@ mod preview {
         BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC,
     };
 
-    /// 渲染菜单（含悬停项）供人工核对：`cargo test --bin pixshot render_menu_preview -- --ignored`
+    /// 渲染菜单（含悬停项）供人工核对：`cargo test --bin PixShot render_menu_preview -- --ignored`
     #[test]
     #[ignore = "仅在需要人工核对菜单观感时运行"]
     fn render_menu_preview() {

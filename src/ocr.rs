@@ -99,7 +99,7 @@ fn recognize_inner(bgra: &[u8], w: i32, h: i32) -> Result<String> {
     }
     let engine = engine::create().ok_or_else(|| {
         AppError::Ocr(
-            "未找到可用的 OCR 引擎。内置引擎需要与 pixshot.exe 同目录的 onnxruntime.dll 与 \
+            "未找到可用的 OCR 引擎。内置引擎需要与 PixShot.exe 同目录的 onnxruntime.dll 与 \
              model/{det,rec}.onnx；回退引擎需要系统安装中文（简体）或英文语言包并包含\
              “文字识别”可选功能。"
                 .into(),

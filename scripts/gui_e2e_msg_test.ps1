@@ -13,12 +13,12 @@ EnumWindows（按 PID + 类名），不依赖 FindWindowW。
 未覆盖（需物理输入，请用 gui_e2e_test.ps1）：贴图拖动、右键菜单、保存对话框。
 
 用法：
-  pwsh -File scripts\gui_e2e_msg_test.ps1 [-Exe target\release\pixshot.exe]
+  pwsh -File scripts\gui_e2e_msg_test.ps1 [-Exe target\release\PixShot.exe]
 输出：
   PASS/FAIL 清单；e2e_artifacts\e2e_msg_transcript.txt 与 pin_visible.png 存档
 #>
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\pixshot.exe')
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\PixShot.exe')
 )
 
 $env:PIXSHOT_NO_UI_ALERTS = '1'   # 沙箱下托盘注册必失败，屏蔽启动提示框以保证测试确定性
@@ -27,7 +27,7 @@ if (-not (Test-Path $Exe)) { throw "找不到 $Exe，请先执行 cargo build --
 $art = Join-Path $PSScriptRoot '..\e2e_artifacts'
 New-Item -ItemType Directory -Force -Path $art | Out-Null
 try { Start-Transcript -Path (Join-Path $art 'e2e_msg_transcript.txt') -Force | Out-Null } catch { }
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 
 Add-Type -TypeDefinition @"

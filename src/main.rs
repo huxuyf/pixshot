@@ -198,7 +198,7 @@ fn run_gui() -> error::Result<()> {
                  通常是因为 exe 文件带有「Low Mandatory Level」强制完整性标签\n\
                  （沙箱类工具写入目录时会打标，并被其中的 exe 继承）。\n\n\
                  任选一种修复后重启本程序：\n\
-                 A) 在文件资源管理器中把 pixshot.exe 复制到别处（如桌面新建文件夹）再运行；\n\
+                 A) 在文件资源管理器中把 PixShot.exe 复制到别处（如桌面新建文件夹）再运行；\n\
                  B) 以【管理员】PowerShell 对其所在目录执行：\n\
                     icacls \"{exe_dir}\" /setintegritylevel (OI)(CI)Medium /T\n\
                  （本进程当前完整性：{}）",

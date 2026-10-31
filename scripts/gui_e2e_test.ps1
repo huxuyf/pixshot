@@ -6,14 +6,14 @@ PixShot GUI 端到端自动化测试
   （位置/置顶/拖动/滚轮缩放验证）→ 右键菜单 OCR（文字进剪贴板，与工具条一致）。
 
 前置条件：
-  - 已执行 cargo build（默认使用 target\debug\pixshot.exe）
+  - 已执行 cargo build（默认使用 target\debug\PixShot.exe）
   - 系统已安装 OCR 语言包（Windows.Media.Ocr，见 README）
 
 注意：脚本运行期间（约 20 秒）会接管鼠标和键盘，请勿操作桌面。
       脚本自身以 Per-Monitor-V2 DPI 感知运行，125% 缩放下坐标仍为物理像素。
 
 用法：
-  pwsh -File scripts\gui_e2e_test.ps1 [-Exe <pixshot.exe>] [-SelX 300 -SelY 300 -SelW 600 -SelH 400]
+  pwsh -File scripts\gui_e2e_test.ps1 [-Exe <PixShot.exe>] [-SelX 300 -SelY 300 -SelW 600 -SelH 400]
 
 输出：
   - PASS/FAIL 检查清单；退出码 0 = 全部通过
@@ -21,7 +21,7 @@ PixShot GUI 端到端自动化测试
   - e2e_artifacts\final_state.png    全流程结束状态存档
 #>
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\debug\pixshot.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\debug\PixShot.exe'),
     [int]$SelX = 300,
     [int]$SelY = 300,
     [int]$SelW = 600,
@@ -38,7 +38,7 @@ if (-not (Test-Path $Exe)) { throw "找不到 $Exe，请先执行 cargo build" }
 $art = Join-Path $PSScriptRoot '..\e2e_artifacts'
 New-Item -ItemType Directory -Force -Path $art | Out-Null
 try { Start-Transcript -Path (Join-Path $art 'e2e_transcript.txt') -Force | Out-Null } catch { }
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 
 Add-Type -AssemblyName System.Drawing

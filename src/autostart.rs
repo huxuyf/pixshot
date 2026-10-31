@@ -1,7 +1,7 @@
 //! 开机自启：维护当前用户的 Run 注册表项。
 //!
 //! 位置：`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
-//! 值名：`PixShot`，值数据：带引号的 `pixshot.exe` 绝对路径（`REG_SZ`，UTF-16）。
+//! 值名：`PixShot`，值数据：带引号的 `PixShot.exe` 绝对路径（`REG_SZ`，UTF-16）。
 //!
 //! 以注册表为唯一事实来源：托盘菜单的勾选状态直接查询注册表，
 //! 避免「配置说已启用、系统实际未生效」的状态漂移。

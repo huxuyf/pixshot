@@ -1,13 +1,13 @@
 # PixShot 托盘/热键根因诊断脚本
 # 启动 exe → 等待 → 收集进程状态与程序自报日志 → 交叉验证 F1 占用 → 结束
 $ErrorActionPreference = 'Continue'
-$exe = "C:\Users\user\Desktop\pixpin\pixshot\target\release\pixshot.exe"
+$exe = "C:\Users\user\Desktop\pixpin\pixshot\target\release\PixShot.exe"
 $log = "C:\Users\user\Desktop\pixpin\pixshot\target\release\pixshot_diag.log"
 $out = "C:\Users\user\Desktop\pixpin\pixshot\diag_probe.txt"
 function W($s) { Add-Content -Path $out -Value $s -Encoding UTF8 }
 Set-Content -Path $out -Value "=== 托盘/热键诊断 $(Get-Date -Format 'HH:mm:ss') ===" -Encoding UTF8
 
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
 Remove-Item $log -ErrorAction SilentlyContinue
 
@@ -65,11 +65,11 @@ W "--- 交叉验证 F1 当前是否被占用 ---"
 $r = [P]::RegisterHotKey([IntPtr]::Zero, 98, 0x4000, 0x70)
 $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
 if ($r) {
-    W "  探测注册成功 -> F1 空闲，pixshot 未持有 F1"
+    W "  探测注册成功 -> F1 空闲，PixShot 未持有 F1"
     [void][P]::UnregisterHotKey([IntPtr]::Zero, 98)
 } else {
-    W "  探测注册失败 error=$err -> $(if ($err -eq 1409) { 'F1 已被 pixshot 持有（注册成功）' } else { '其他原因' })"
+    W "  探测注册失败 error=$err -> $(if ($err -eq 1409) { 'F1 已被 PixShot 持有（注册成功）' } else { '其他原因' })"
 }
 
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 W "=== 诊断结束（已结束测试进程）==="

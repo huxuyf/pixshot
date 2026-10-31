@@ -2611,7 +2611,7 @@ mod preview {
     };
 
     /// 渲染工具条按钮（默认态 / 悬停态 / 关闭悬停态）供人工核对。
-    /// 走的就是 `WM_DRAWITEM` 用的那条双缓冲路径：`cargo test --bin pixshot render_toolbar_preview -- --ignored`
+    /// 走的就是 `WM_DRAWITEM` 用的那条双缓冲路径：`cargo test --bin PixShot render_toolbar_preview -- --ignored`
     #[test]
     #[ignore = "仅在需要人工核对工具条按钮观感时运行"]
     fn render_toolbar_preview() {

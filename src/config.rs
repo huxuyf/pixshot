@@ -1,4 +1,4 @@
-//! 配置：`config.ini`（与 pixshot.exe 同目录，`[section]` + `key = value` 纯文本，零依赖）。
+//! 配置：`config.ini`（与 PixShot.exe 同目录，`[section]` + `key = value` 纯文本，零依赖）。
 //!
 //! 设计约束：
 //! - 手写解析，不引第三方 TOML/YAML 库（保持"零额外依赖"路线）；
@@ -656,7 +656,7 @@ impl Config {
 
 static CACHE: Mutex<Option<Config>> = Mutex::new(None);
 
-/// 配置文件路径：与 pixshot.exe 同目录的 `config.ini`；
+/// 配置文件路径：与 PixShot.exe 同目录的 `config.ini`；
 /// 取不到 exe 路径时（极少见）回退当前工作目录。
 pub fn path() -> PathBuf {
     std::env::current_exe()

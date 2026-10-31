@@ -365,7 +365,7 @@ mod preview {
     };
 
     /// 渲染一张气泡截图供人工核对（需要真实桌面）。运行：
-    /// `cargo test --bin pixshot render_tip_preview -- --ignored`
+    /// `cargo test --bin PixShot render_tip_preview -- --ignored`
     #[test]
     #[ignore = "仅在需要人工核对提示气泡外观时运行"]
     fn render_tip_preview() {

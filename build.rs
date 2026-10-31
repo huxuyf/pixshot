@@ -4,7 +4,8 @@
 //!    四角括号 + 焦点圆点，蓝色→蓝紫渐变），4× 超采样抗锯齿；
 //!    几何定义在 `src/icon_geometry.rs`（与单元测试共用同一份代码）；
 //! 2. 输出多尺寸 .ico（16/24/32/48/64）；
-//! 3. 编译 `1 ICON` 资源对象并链接进 exe ——
+//! 3. 生成 `VERSIONINFO` 资源（产品/文件描述名统一为 PixShot，版本取 CARGO_PKG_VERSION）；
+//! 4. 编译图标 + 版本信息资源对象并链接进 exe ——
 //!    GNU 工具链用 `windres`，MSVC 工具链用 `rc.exe`（均随工具链自带）。
 //!
 //! 失败策略（修复静默降级）：两种编译器都找不到时 **构建失败** 并给出解决方式；
@@ -29,6 +30,8 @@ const GRAD_BOT: [f32; 3] = [70.0, 90.0, 230.0];
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/icon_geometry.rs");
+    // 版本号来自 Cargo.toml；版本变化时重新生成 VERSIONINFO 资源
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     // OCR 随包资产：把 onnxruntime.dll 与 model/*.onnx 摆到 exe 同目录，
     // 使 `target/<profile>/` 自带可运行（发布时整目录即为分发内容）。
@@ -47,7 +50,7 @@ fn main() {
     let sizes: [u32; 5] = [16, 24, 32, 48, 64];
     write_ico(&ico_path, &sizes);
 
-    match embed_icon(&out, &ico_path) {
+    match embed_resources(&out, &ico_path) {
         // 注意：不要给路径加引号——cargo 把该值原样透传给 link.exe（不经 shell
         // 分词），引号会成为文件名的一部分（CI 实测 LNK1104 打不开带引号的文件）
         Ok(res) => println!("cargo:rustc-link-arg-bins={}", res.display()),
@@ -265,14 +268,63 @@ enum RcTool {
     MsvcRc(String),
 }
 
-fn embed_icon(out: &Path, ico: &Path) -> Result<PathBuf, String> {
-    let rc = out.join("icon.rc");
-    // 路径统一成正斜杠：windres / rc 均接受，且免去反斜杠转义歧义
-    fs::write(
-        &rc,
-        format!("1 ICON \"{}\"\n", ico.display().to_string().replace('\\', "/")),
+/// `x.y.z` → 版本资源的三个数值字段（忽略预发布后缀与非数字字符）。
+fn version_numbers(version: &str) -> (u32, u32, u32) {
+    let part = |s: &str| -> u32 {
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().unwrap_or(0)
+    };
+    let mut it = version.split('.');
+    (
+        it.next().map(part).unwrap_or(0),
+        it.next().map(part).unwrap_or(0),
+        it.next().map(part).unwrap_or(0),
     )
-    .map_err(|e| format!("写 icon.rc 失败: {e}"))?;
+}
+
+/// 生成图标 + 版本信息资源脚本并编译。
+///
+/// `FileDescription` / `ProductName` 决定任务管理器「进程」页显示的名称；
+/// `OriginalFilename` 与实际产物文件名保持为 `PixShot.exe`。
+fn embed_resources(out: &Path, ico: &Path) -> Result<PathBuf, String> {
+    let rc = out.join("resources.rc");
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+    let (major, minor, patch) = version_numbers(&version);
+    // 路径统一成正斜杠：windres / rc 均接受，且免去反斜杠转义歧义
+    let icon = ico.display().to_string().replace('\\', "/");
+    let script = format!(
+        "1 ICON \"{icon}\"\n\
+         \n\
+         1 VERSIONINFO\n\
+         FILEVERSION {major},{minor},{patch},0\n\
+         PRODUCTVERSION {major},{minor},{patch},0\n\
+         FILEFLAGSMASK 0x3fL\n\
+         FILEFLAGS 0x0L\n\
+         FILEOS 0x40004L\n\
+         FILETYPE 0x1L\n\
+         FILESUBTYPE 0x0L\n\
+         BEGIN\n\
+         BLOCK \"StringFileInfo\"\n\
+         BEGIN\n\
+         BLOCK \"040904b0\"\n\
+         BEGIN\n\
+         VALUE \"CompanyName\", \"PixShot\"\n\
+         VALUE \"FileDescription\", \"PixShot\"\n\
+         VALUE \"FileVersion\", \"{version}\"\n\
+         VALUE \"InternalName\", \"PixShot\"\n\
+         VALUE \"LegalCopyright\", \"Copyright (C) 2026 PixShot\"\n\
+         VALUE \"OriginalFilename\", \"PixShot.exe\"\n\
+         VALUE \"ProductName\", \"PixShot\"\n\
+         VALUE \"ProductVersion\", \"{version}\"\n\
+         END\n\
+         END\n\
+         BLOCK \"VarFileInfo\"\n\
+         BEGIN\n\
+         VALUE \"Translation\", 0x409, 1200\n\
+         END\n\
+         END\n"
+    );
+    fs::write(&rc, script).map_err(|e| format!("写 resources.rc 失败: {e}"))?;
 
     let tool = find_tool()
         .ok_or_else(|| "PATH 中既没有 windres.exe（MinGW）也没有 rc.exe（MSVC）".to_string())?;

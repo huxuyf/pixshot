@@ -56,4 +56,4 @@ Get-ChildItem $Path -Filter '*.exe' -Recurse -ErrorAction SilentlyContinue |
     Select-Object -First 5 | ForEach-Object { Show-Label $_.FullName }
 
 Write-Host ''
-Write-Host '完成。请重新启动 pixshot.exe 验证：托盘图标应出现，F1 应能截图。' -ForegroundColor Green
+Write-Host '完成。请重新启动 PixShot.exe 验证：托盘图标应出现，F1 应能截图。' -ForegroundColor Green

@@ -1,8 +1,13 @@
 [package]
 name = "pixshot"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2021"
+default-run = "PixShot"
 description = "PixPin 风格的 Windows 桌面工具：框选截图 / 贴图置顶 / OCR 文字识别（Rust + Win32 + 本地 ONNX 推理）"
+
+[[bin]]
+name = "PixShot"
+path = "src/main.rs"
 
 [dependencies]
 # OCR 本地推理：ort 绑定 onnxruntime；load-dynamic 在运行时加载 onnxruntime.dll

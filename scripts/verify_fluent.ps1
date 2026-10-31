@@ -106,7 +106,7 @@ try {
     Log "品红靶标已上屏 (250,250)-(950,750)"
 
     # ── B. 启动（托盘驻留）→ F1 触发 → 拖拽 → 工具栏 → OCR 窗口 → 贴图 ──
-    $proc = Start-Process -FilePath (Join-Path $PSScriptRoot '..\target\release\pixshot.exe') -PassThru
+    $proc = Start-Process -FilePath (Join-Path $PSScriptRoot '..\target\release\PixShot.exe') -PassThru
     $pid0 = $proc.Id
     $mainH = Wait-Enum $pid0 'PixShotMain'
     Start-Sleep -Milliseconds 400

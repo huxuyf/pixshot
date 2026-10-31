@@ -126,7 +126,7 @@ Invoke-Step 'cargo build --release（发布产物）' {
 
 # ------------------------------------------------------------ 5. 体积护栏
 Invoke-Step '发布体积护栏（exe 体积 + OCR 资产齐备）' {
-    $exe = Join-Path $targetRoot 'release\pixshot.exe'
+    $exe = Join-Path $targetRoot 'release\PixShot.exe'
     if (-not (Test-Path $exe)) {
         throw "未找到 $exe"
     }
@@ -156,7 +156,7 @@ if (-not $SkipE2E) {
         if (-not (Test-Path $e2e)) {
             throw "找不到 $e2e"
         }
-        $debugExe = Join-Path $targetRoot 'debug\pixshot.exe'
+        $debugExe = Join-Path $targetRoot 'debug\PixShot.exe'
         if (-not (Test-Path $debugExe)) {
             throw "找不到 $debugExe"
         }

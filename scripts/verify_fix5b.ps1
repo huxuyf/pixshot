@@ -58,9 +58,9 @@ function Children([IntPtr]$h) {
     [void][V]::EnumChildWindows($h, $cb, [IntPtr]::Zero)
     $script:lbls }
 
-$exe = "C:\Users\user\Desktop\pixpin\pixshot\target\release\pixshot.exe"
+$exe = "C:\Users\user\Desktop\pixpin\pixshot\target\release\PixShot.exe"
 $logPath = "C:\Users\user\Desktop\pixpin\pixshot\target\release\pixshot_diag.log"
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 700
 Remove-Item $logPath -ErrorAction SilentlyContinue
 $env:PIXSHOT_NO_UI_ALERTS='1'
@@ -75,7 +75,7 @@ W "靶标窗口: (300,300) 600x400"
 $p = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Seconds 2
 $main = Find-W $p.Id 'PixShotMain'
-W "pixshot PID=$($p.Id) 存活=$(-not $p.HasExited) main=0x$($main.ToString('X'))"
+W "PixShot PID=$($p.Id) 存活=$(-not $p.HasExited) main=0x$($main.ToString('X'))"
 
 W ""
 W "== #1a 托盘右键回调 -> 自绘菜单弹出，点击退出 =="
@@ -88,12 +88,12 @@ if ($menu -ne [IntPtr]::Zero) {
     [void][V]::SendMessageW($menu, 0x0201, [IntPtr]1, (LP 76 25))
     Start-Sleep -Milliseconds 900
     W "  点击[退出]后进程存活: $(-not $p.HasExited)   <- 期望 False"
-    W "  剩余 pixshot 进程数: $((Get-Process pixshot -ErrorAction SilentlyContinue | Measure-Object).Count)  <- 期望 0"
+    W "  剩余 PixShot 进程数: $((Get-Process PixShot -ErrorAction SilentlyContinue | Measure-Object).Count)  <- 期望 0"
 }
 
 W ""
 W "== #1b 直接 WM_CONTEXTMENU 路径 + Esc 关闭 =="
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
 $p2 = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Seconds 2
@@ -157,7 +157,7 @@ if (Test-Path $logPath) {
         if ($l -match 'UI 字体族|自绘菜单|WM_CONTEXTMENU|NIM_ADD 第 1|双击') { W "  $l" }
     }
 }
-Get-Process pixshot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process PixShot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 try { $form.Close() } catch {}
 W "=== 复验结束 ==="
 
