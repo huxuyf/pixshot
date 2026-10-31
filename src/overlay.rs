@@ -118,6 +118,8 @@ pub enum StyleField {
     TextFrame,
     BadgeColor,
     Clear,
+    /// 文字描边开关（追加在末尾，保持既有编号稳定）。
+    TextStroke,
 }
 
 impl StyleField {
@@ -136,6 +138,7 @@ impl StyleField {
             10 => Self::TextFrame,
             11 => Self::BadgeColor,
             12 => Self::Clear,
+            13 => Self::TextStroke,
             _ => return None,
         })
     }
@@ -1789,6 +1792,10 @@ unsafe fn apply_style_message(
         }),
         StyleField::TextItalic => sess.apply_style(StylePatch {
             text_italic: Some(lp != 0),
+            ..Default::default()
+        }),
+        StyleField::TextStroke => sess.apply_style(StylePatch {
+            text_stroke: Some(lp != 0),
             ..Default::default()
         }),
         StyleField::PenKind => sess.apply_style(StylePatch {

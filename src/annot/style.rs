@@ -40,6 +40,8 @@ pub struct TextStyle {
     pub bold: bool,
     /// 斜体（GDI+ `FontStyleItalic`）。
     pub italic: bool,
+    /// 文字描边：在字形四周绘制一圈对比色轮廓，提升复杂背景上的可读性。
+    pub outline: bool,
 }
 
 /// 水印样式（文字水印；参与合成导出）。
@@ -212,6 +214,8 @@ pub struct AnnotPrefs {
     pub pen_kind: PenKind,
     pub text_bold: bool,
     pub text_italic: bool,
+    /// 文字是否带描边。
+    pub text_stroke: bool,
     pub text_frame: TextFrame,
     /// 文字落点靠近线段/箭头时自动挂到线上（见 `AnnotDoc` 的挂线处理）。
     pub text_attach: bool,
@@ -275,6 +279,7 @@ impl Default for AnnotPrefs {
             pen_kind: PenKind::default(),
             text_bold: false,
             text_italic: false,
+            text_stroke: false,
             text_frame: TextFrame::default(),
             text_attach: true,
             stroke_color: DEF_STROKE,
@@ -418,6 +423,6 @@ mod tests {
         let p = AnnotPrefs::default();
         assert!(p.text_attach, "默认自动挂线");
         assert_eq!(p.pen_kind, PenKind::Solid);
-        assert!(!p.text_bold && !p.text_italic);
+        assert!(!p.text_bold && !p.text_italic && !p.text_stroke);
     }
 }

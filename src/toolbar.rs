@@ -4,18 +4,20 @@
 //! 皮肤固定深色（见 `theme::toolbar_skin`），布局按窗口 DPI 换算并在 `WM_DPICHANGED` 重排。
 //!
 //! 按钮为**纯图标**（矢量自绘，见 [`crate::icons`]），依次为
-//! 贴图 / 保存图像 / 复制并关闭 / 复制识别到的文字 ｜ 矩形 / 箭头 / 步骤序号 ｜
-//! 颜色面板 / 更多（…）/ 关闭；前 4 个功能性按钮与后续标注按钮之间绘制一条竖杠分组；
+//! 贴图 / 保存图像 / 复制并关闭 / 复制识别到的文字 ｜ 矩形 / 箭头 / 步骤序号 /
+//! 文字 ｜ 颜色面板 / 更多（…）/ 关闭；前 4 个功能性按钮与后续标注按钮之间绘制一条竖杠分组；
 //! 悬停延时后在图标上方弹出提示气泡（[`crate::tooltip`]）。
 //!
-//! 椭圆 / 线段 / 马赛克 / 画笔 / 文字 / 高亮 / 橡皮 / 水印 8 个标注按钮不再直接
-//! 出现在主工具条上，而是收进「…」按钮的子工具条：悬停「…」后在其下方弹出
-//! 一个带小尖角的圆角浮层（见 [`show_more`]）；光标离开「…」与浮层后自动收起。
+//! 矩形、箭头、文字、更多、颜色面板按钮在悬停超过 1 秒（或矩形/箭头/文字被点击）时
+//! 展开对应的子工具条：矩形/椭圆、箭头/线段、文字样式（粗体/斜体/描边/字体）、
+//! 其余标注工具、8 色调色板。子工具条是共享的顶层圆角浮层（见 [`show_sub`]），
+//! 点击浮层按钮之外的任意位置或光标离开后自动收起。
 //!
 //! 控件 ID 保持稳定（E2E 用 `Find-ChildById` 定位，见 `scripts/gui_e2e_*.ps1`）：
 //! 1=贴图 / 2=复制 / 3=保存 / 4=OCR / 5=关闭；标注工具 6=矩形 / 7=箭头 / 8=步骤序号 /
 //! 9=马赛克 / 10=高亮 / 11=文字；新增图形 12=椭圆 / 13=线段 / 14=画笔；
-//! 15=橡皮 / 16=水印 / 17=颜色面板 / 18=更多（子工具条）。
+//! 15=橡皮 / 16=水印 / 17=颜色面板 / 18=更多（子工具条）；
+//! 19=粗体 / 20=斜体 / 21=描边 / 22=字体下拉框。
 //!
 //! `Ctrl+滚轮` 调整当前选中标注工具的默认尺寸（线宽 / 字号 / 序号半径 /
 //! 橡皮容差），光标无需悬停在按钮上；未选中工具时可按光标下的标注按钮调整。
@@ -35,8 +37,9 @@ use crate::capture::{self, CapturedImage};
 use crate::config;
 use crate::error::Result;
 use crate::overlay::{
-    Selection, WM_APP_ADJUST_SIZE, WM_APP_CHAR, WM_APP_ESC_CLOSE, WM_APP_KEY,
-    WM_APP_QUERY_TYPING, WM_APP_SET_TOOL, WM_APP_STYLE_PANEL_CLOSED, WM_APP_TOOL_CHANGED,
+    Selection, StyleField, WM_APP_ADJUST_SIZE, WM_APP_ANNOT_DIRTY, WM_APP_CHAR, WM_APP_ESC_CLOSE,
+    WM_APP_KEY, WM_APP_QUERY_TYPING, WM_APP_SET_STYLE, WM_APP_SET_TOOL,
+    WM_APP_STYLE_PANEL_CLOSED, WM_APP_TOOL_CHANGED,
 };
 use crate::theme;
 use crate::util::{self, add_button, raw, register_class_w, BtnStyle};
@@ -45,12 +48,14 @@ use crate::{clipboard, icons, imageio, ocr, pin, tooltip};
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush,
-    DeleteDC, DeleteObject, EndPaint, FillRect, LineTo, MoveToEx, Polygon, RedrawWindow, RoundRect,
-    SelectObject, PS_SOLID, SRCCOPY, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+    DeleteDC, DeleteObject, EndPaint, EnumFontFamiliesExW, FillRect, GetDC, LineTo, MoveToEx,
+    Polygon, RedrawWindow, ReleaseDC, RoundRect, SelectObject, GB2312_CHARSET, LOGFONTW,
+    PS_SOLID, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY, TEXTMETRICW,
 };
+use windows::core::PCWSTR;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetAsyncKeyState, GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -78,9 +83,16 @@ const BTN_WATERMARK: usize = 16;
 const BTN_STYLE: usize = 17;
 /// 「更多」按钮：悬停展开标注子工具条（位于颜色面板右侧、关闭按钮左侧）。
 const BTN_MORE: usize = 18;
+/// 文字子工具条按钮：粗体 / 斜体 / 描边（追加在末尾，保持既有 ID 稳定）。
+const BTN_TEXT_BOLD: usize = 19;
+const BTN_TEXT_ITALIC: usize = 20;
+const BTN_TEXT_STROKE: usize = 21;
+/// 文字子工具条中的字体下拉框（非 owner-draw 按钮）。
+const BTN_TEXT_FONT: usize = 22;
+
 /// 主工具条按钮从左到右的排列顺序（图标顺序 = 需求给定顺序）。
-/// 椭圆/线段/马赛克/画笔/文字/高亮/橡皮/水印 8 个标注按钮移入 [`MORE_ORDER`]。
-const BTN_ORDER: [usize; 10] = [
+/// 文字按钮移到「序号」之后；椭圆/线段/马赛克/画笔/高亮/橡皮/水印 收进各自子工具条。
+const BTN_ORDER: [usize; 11] = [
     BTN_PIN,
     BTN_SAVE,
     BTN_COPY,
@@ -88,23 +100,92 @@ const BTN_ORDER: [usize; 10] = [
     BTN_RECT,
     BTN_ARROW,
     BTN_STEP,
+    BTN_TEXT,
     BTN_STYLE,
     BTN_MORE,
     BTN_CLOSE,
 ];
-/// 「更多」子工具条上的 8 个标注按钮（顺序 = 需求给定顺序）。
-const MORE_ORDER: [usize; 8] = [
-    BTN_ELLIPSE,
-    BTN_LINE,
+/// 「更多」子工具条：马赛克 / 画笔 / 高亮 / 橡皮 / 水印。
+const MORE_ORDER: [usize; 5] = [
     BTN_MOSAIC,
     BTN_PEN,
-    BTN_TEXT,
     BTN_HIGHLIGHT,
     BTN_ERASER,
     BTN_WATERMARK,
 ];
+/// 矩形按钮的子工具条：矩形 / 椭圆。
+const SHAPE_ORDER: [usize; 2] = [BTN_RECT, BTN_ELLIPSE];
+/// 箭头按钮的子工具条：箭头 / 线段。
+const ARROW_ORDER: [usize; 2] = [BTN_ARROW, BTN_LINE];
+/// 文字按钮的子工具条：粗体 / 斜体 / 描边（字体下拉框单独创建）。
+const TEXT_STYLE_ORDER: [usize; 3] = [BTN_TEXT_BOLD, BTN_TEXT_ITALIC, BTN_TEXT_STROKE];
+/// 所有可能出现在子工具条里的 owner-draw 按钮（窗口创建时统一建好，按需显示）。
+const SUB_IDS: [usize; 12] = [
+    BTN_ELLIPSE,
+    BTN_LINE,
+    BTN_MOSAIC,
+    BTN_PEN,
+    BTN_HIGHLIGHT,
+    BTN_ERASER,
+    BTN_WATERMARK,
+    BTN_RECT,
+    BTN_ARROW,
+    BTN_TEXT_BOLD,
+    BTN_TEXT_ITALIC,
+    BTN_TEXT_STROKE,
+];
 const MAIN_BTN_COUNT: usize = BTN_ORDER.len();
-const MORE_BTN_COUNT: usize = MORE_ORDER.len();
+const SUB_BTN_COUNT: usize = SUB_IDS.len();
+/// 文字子工具条里字体下拉框的宽度（逻辑像素）。
+const FONT_COMBO_W: i32 = 132;
+/// 字体下拉列表展开后的宽度（逻辑像素）：略宽于控件本身，避免长字体名被截断。
+const FONT_COMBO_DROP_W: i32 = 190;
+
+/// 共享子工具条的四类内容；颜色面板是独立窗口，不在此列。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SubKind {
+    #[default]
+    None,
+    More,
+    Shape,
+    Arrow,
+    Text,
+}
+
+impl SubKind {
+    fn buttons(self) -> &'static [usize] {
+        match self {
+            Self::More => &MORE_ORDER,
+            Self::Shape => &SHAPE_ORDER,
+            Self::Arrow => &ARROW_ORDER,
+            Self::Text => &TEXT_STYLE_ORDER,
+            Self::None => &[],
+        }
+    }
+
+}
+
+/// 主工具条按钮 → 悬停/点击后展开的子工具条种类。
+fn sub_kind_for_anchor(id: usize) -> Option<SubKind> {
+    match id {
+        BTN_MORE => Some(SubKind::More),
+        BTN_RECT => Some(SubKind::Shape),
+        BTN_ARROW => Some(SubKind::Arrow),
+        BTN_TEXT => Some(SubKind::Text),
+        _ => None,
+    }
+}
+
+/// 主工具条按钮的悬停提示（子按钮仍用 [`tip_text`] 的单项名称）。
+fn main_tip_text(id: usize) -> &'static str {
+    match id {
+        BTN_RECT => "矩形/椭圆",
+        BTN_ARROW => "箭头/线段",
+        BTN_MORE => "更多",
+        _ => tip_text(id),
+    }
+}
+
 /// 各按钮的悬停提示文字（子工具条按钮与主工具条共用）。
 fn tip_text(id: usize) -> &'static str {
     match id {
@@ -124,7 +205,11 @@ fn tip_text(id: usize) -> &'static str {
         BTN_ERASER => "橡皮",
         BTN_WATERMARK => "水印",
         BTN_STYLE => "颜色面板",
-        BTN_MORE => "更多标注工具",
+        BTN_MORE => "更多",
+        BTN_TEXT_BOLD => "粗体",
+        BTN_TEXT_ITALIC => "斜体",
+        BTN_TEXT_STROKE => "描边",
+        BTN_TEXT_FONT => "字体",
         BTN_CLOSE => "关闭",
         _ => "",
     }
@@ -155,15 +240,17 @@ fn shortcut_of(id: usize) -> &'static str {
 /// 悬停提示延时（毫秒）由配置提供，见 config.ini [ui] tooltip_delay_ms。
 /// 提示气泡定时器 ID
 const TIMER_TIP: usize = 779;
-/// 「…」子工具条：悬停延时展开 / 可见期间侦测光标离开的定时器 ID。
-const TIMER_MORE_SHOW: usize = 780;
-const TIMER_MORE_POLL: usize = 781;
-/// 悬停「…」后弹出子工具条的延时（毫秒）。
-const MORE_SHOW_DELAY_MS: u32 = 150;
-/// 子工具条可见时轮询光标是否仍停在「…」或浮层上的间隔（毫秒）。
-const MORE_POLL_MS: u32 = 100;
-/// 连续多少次轮询都发现光标在外才收起（容忍从「…」跨过工具条内边距进入浮层的短暂空隙）。
-const MORE_HIDE_MISSES: u8 = 4;
+/// 子工具条：悬停延时展开 / 可见期间侦测光标离开与点击外部的定时器 ID。
+const TIMER_SUB_SHOW: usize = 780;
+const TIMER_SUB_POLL: usize = 781;
+/// 悬停主工具条按钮后弹出子工具条的延时（毫秒）——需求要求超过 1 秒。
+const SUB_SHOW_DELAY_MS: u32 = 1100;
+/// 子工具条可见时轮询光标/鼠标按键的间隔（毫秒）。
+const SUB_POLL_MS: u32 = 40;
+/// 连续多少次轮询都发现光标在外才收起（容忍从按钮跨过工具条内边距进入浮层的短暂空隙）。
+const SUB_HIDE_MISSES: u8 = 8;
+/// 鼠标左键物理状态（GetAsyncKeyState 用）。
+const VK_LBUTTON_CODE: i32 = 0x01;
 /// 自投递：焦点/激活切换后延迟重绘窗口非客户区（清除 DWM 残留的灰色外框）。
 const WM_APP_REFRESH_FRAME: u32 = WM_APP + 100;
 /// 子工具条窗口类名（顶层 popup：子控件可画在主工具条窗口之外）。
@@ -229,18 +316,24 @@ fn logical_size() -> (i32, i32) {
     let h = c.ui_toolbar_pad_v * 2 + c.ui_toolbar_btn_size;
     (w, h)
 }
-/// 「…」子工具条逻辑尺寸：一行 8 个方形按钮 + 顶部/底部小尖角占位。
-fn more_logical_size() -> (i32, i32) {
+/// 子工具条逻辑尺寸：一行按钮（文字子工具条额外含字体下拉框）+ 顶部/底部小尖角占位。
+fn sub_logical_size(kind: SubKind) -> (i32, i32) {
     let c = crate::config::get();
-    let n = MORE_BTN_COUNT as i32;
+    let n = kind.buttons().len() as i32;
+    let extra = if kind == SubKind::Text {
+        FONT_COMBO_W + c.ui_toolbar_gap
+    } else {
+        0
+    };
     let w = c.ui_toolbar_btn_size * n
-        + c.ui_toolbar_gap * (n - 1)
+        + c.ui_toolbar_gap * (n - 1).max(0)
+        + extra
         + c.ui_toolbar_pad_h * 2;
     let h = MORE_TAIL_H + c.ui_toolbar_pad_v * 2 + c.ui_toolbar_btn_size;
     (w, h)
 }
 /// 子工具条圆角卡片在客户区内的上下边界（`above` = 浮层位于工具条上方，尖角朝下）。
-fn more_card_bounds(ch: i32, dpi: i32, above: bool) -> (i32, i32) {
+fn sub_card_bounds(ch: i32, dpi: i32, above: bool) -> (i32, i32) {
     let tail = util::scaled(MORE_TAIL_H, dpi).min((ch - 1).max(1));
     if above {
         (0, (ch - tail).max(1))
@@ -253,20 +346,36 @@ struct ToolbarData {
     image: Arc<CapturedImage>,
     /// 主工具条图标按钮，顺序见 [`BTN_ORDER`]
     buttons: [HWND; MAIN_BTN_COUNT],
-    /// 「…」子工具条窗口（0 = 创建失败：退回仅快捷键可用）
-    more: HWND,
-    /// 子工具条上的标注按钮，顺序见 [`MORE_ORDER`]
-    more_buttons: [HWND; MORE_BTN_COUNT],
+    /// 共享子工具条窗口（0 = 创建失败：退回仅快捷键可用）
+    sub: HWND,
+    /// 当前子工具条展示的按钮集合
+    sub_kind: SubKind,
+    /// 子工具条上的全部按钮（顺序见 [`SUB_IDS`]），按当前种类显示/隐藏
+    sub_buttons: [HWND; SUB_BTN_COUNT],
     /// 子工具条独立的悬停动画引擎（与主工具条分开，避免两个窗口的跟踪定时器互相干扰）
-    more_fx: util::HoverFx,
-    /// 子工具条是否位于工具条上方（尖角朝下），由 [`show_more`] 定位时更新
-    more_above: bool,
-    /// 尖角尖端相对子工具条客户区的 X 坐标（与「…」按钮中心对齐）
-    more_tail_x: i32,
-    /// 是否已武装「…」悬停展开定时器（避免高频 WM_MOUSEMOVE 反复重置）
-    more_show_armed: bool,
+    sub_fx: util::HoverFx,
+    /// 子工具条是否位于工具条上方（尖角朝下），由 [`show_sub`] 定位时更新
+    sub_above: bool,
+    /// 尖角尖端相对子工具条客户区的 X 坐标（与展开按钮中心对齐）
+    sub_tail_x: i32,
+    /// 是否已武装悬停展开定时器（避免高频 WM_MOUSEMOVE 反复重置）
+    sub_show_armed: bool,
+    /// 当前武装悬停展开的按钮 ID
+    sub_armed_id: usize,
     /// 子工具条可见期间「光标不在其上」的连续轮询次数（达到阈值才收起）
-    more_miss: u8,
+    sub_miss: u8,
+    /// 上一次轮询时左键是否按下（用于识别「点击了别处」）
+    sub_mouse_down: bool,
+    /// 当前子工具条锚定的主工具条按钮 ID
+    sub_anchor: usize,
+    /// 文字子工具条的字体下拉框
+    font_combo: HWND,
+    /// 字体下拉框的候选字体族
+    font_names: Vec<String>,
+    /// 文字子工具条三个开关的当前状态（用于按钮高亮）
+    text_bold: bool,
+    text_italic: bool,
+    text_stroke: bool,
     /// 主工具条窗口句柄（子工具条过程据此回投命令/重绘）
     bar: HWND,
     /// 工具栏皮肤：固定深色
@@ -279,6 +388,8 @@ struct ToolbarData {
     tip: tooltip::Tip,
     /// 已武装提示延时的按钮 ID（0 = 无）
     tip_for: usize,
+    /// 提示气泡锚定的按钮句柄（子工具条里同 ID 的按钮与主工具条不同）
+    tip_hwnd: HWND,
     /// 提示气泡当前是否可见
     tip_shown: bool,
     /// 冻结层窗口（转发工具切换/按键；见 5.5）
@@ -333,19 +444,29 @@ unsafe fn run_impl(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()>
     let data = Box::into_raw(Box::new(ToolbarData {
         image,
         buttons: [HWND::default(); MAIN_BTN_COUNT],
-        more: HWND::default(),
-        more_buttons: [HWND::default(); MORE_BTN_COUNT],
-        more_fx: util::HoverFx::new(),
-        more_above: false,
-        more_tail_x: 0,
-        more_show_armed: false,
-        more_miss: 0,
+        sub: HWND::default(),
+        sub_kind: SubKind::None,
+        sub_buttons: [HWND::default(); SUB_BTN_COUNT],
+        sub_fx: util::HoverFx::new(),
+        sub_above: false,
+        sub_tail_x: 0,
+        sub_show_armed: false,
+        sub_armed_id: 0,
+        sub_miss: 0,
+        sub_mouse_down: false,
+        sub_anchor: 0,
+        font_combo: HWND::default(),
+        font_names: Vec::new(),
+        text_bold: config::get().text_bold,
+        text_italic: config::get().text_italic,
+        text_stroke: config::get().text_stroke,
         bar: HWND::default(),
         skin: theme::toolbar_skin(),
         backdrop: false,
         fx: util::HoverFx::new(),
         tip: tooltip::Tip::none(),
         tip_for: 0,
+        tip_hwnd: HWND::default(),
         tip_shown: false,
         overlay: overlay.hwnd(),
         sel: overlay as *const Selection,
@@ -437,14 +558,25 @@ unsafe fn layout(hwnd: HWND) {
     }
 }
 
-/// 「…」子工具条内部布局（窗口过程入口，自行取数据）。
-unsafe fn layout_more(hwnd: HWND) {
+/// 子工具条内部布局（窗口过程入口，自行取数据）。
+unsafe fn layout_sub(hwnd: HWND) {
     let Some(d) = data_of(hwnd) else { return };
-    layout_more_with(d, hwnd);
+    layout_sub_with(d, hwnd);
 }
 
-/// 「…」子工具条内部布局：8 个按钮在圆角卡片内水平等距排布（尖角区域留空）。
-unsafe fn layout_more_with(d: &ToolbarData, hwnd: HWND) {
+/// 子工具条内部布局：当前种类的按钮在圆角卡片内水平等距排布（尖角区域留空）。
+unsafe fn layout_sub_with(d: &ToolbarData, hwnd: HWND) {
+    let ids = d.sub_kind.buttons();
+    // 所有子按钮先隐藏；只显示当前种类用到的
+    for b in d.sub_buttons {
+        let _ = ShowWindow(b, SW_HIDE);
+    }
+    if !d.font_combo.is_invalid() {
+        let _ = ShowWindow(d.font_combo, SW_HIDE);
+    }
+    if ids.is_empty() {
+        return;
+    }
     let mut cr = RECT::default();
     let _ = GetClientRect(hwnd, &mut cr);
     let (cw, ch) = (cr.right, cr.bottom);
@@ -455,15 +587,28 @@ unsafe fn layout_more_with(d: &ToolbarData, hwnd: HWND) {
     }
     let btn = s(btn_sz());
     let gap = s(gap_l());
-    let n = d.more_buttons.len() as i32;
-    let used = btn * n + gap * (n - 1);
+    let combo_w = s(FONT_COMBO_W);
+    let extra = if d.sub_kind == SubKind::Text {
+        combo_w + gap
+    } else {
+        0
+    };
+    let n = ids.len() as i32;
+    let used = btn * n + gap * (n - 1) + extra;
     let x0 = ((cw - used) / 2).max(0);
-    let (card_top, card_bottom) = more_card_bounds(ch, dpi, d.more_above);
+    let (card_top, card_bottom) = sub_card_bounds(ch, dpi, d.sub_above);
     let by = card_top + ((card_bottom - card_top - btn) / 2).max(0);
     let mut bx = x0;
-    for b in d.more_buttons.iter() {
-        let _ = MoveWindow(*b, bx, by, btn, btn, BOOL(1));
+    for id in ids {
+        let Some(b) = sub_button(d, *id) else { continue };
+        let _ = MoveWindow(b, bx, by, btn, btn, BOOL(1));
+        let _ = ShowWindow(b, SW_SHOWNOACTIVATE);
         bx += btn + gap;
+    }
+    if d.sub_kind == SubKind::Text && !d.font_combo.is_invalid() {
+        let combo_h = btn;
+        let _ = MoveWindow(d.font_combo, bx, by, combo_w, combo_h, BOOL(1));
+        let _ = ShowWindow(d.font_combo, SW_SHOWNOACTIVATE);
     }
 }
 
@@ -524,7 +669,7 @@ unsafe fn paint(hwnd: HWND) {
 
 /// 「…」子工具条自绘：色键透明底 + 圆角卡片 + 指向「…」按钮的小尖角。
 /// 透明底让尖角两侧与圆角之外的像素透出桌面（否则是一整块白色方块）。
-unsafe fn paint_more(hwnd: HWND) {
+unsafe fn paint_sub(hwnd: HWND) {
     let Some(d) = data_of(hwnd) else { return };
     let t = d.skin;
     let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
@@ -546,7 +691,7 @@ unsafe fn paint_more(hwnd: HWND) {
     FillRect(hdc, &rc, key);
     let _ = DeleteObject(key);
 
-    let (card_top, card_bottom) = more_card_bounds(ch, dpi, d.more_above);
+    let (card_top, card_bottom) = sub_card_bounds(ch, dpi, d.sub_above);
 
     // 2. 圆角卡片 + 1px 描边（半径按 DPI 缩放；RoundRect 轴长 = 直径）
     let brush = CreateSolidBrush(t.card);
@@ -559,8 +704,8 @@ unsafe fn paint_more(hwnd: HWND) {
 
     // 3. 尖角：先以卡片色填充三角形（顺带遮住卡片底边描边），再描两侧斜边
     let half = s(MORE_TAIL_HALF_W);
-    let tx = d.more_tail_x.clamp(r + half, (cw - r - half).max(r + half));
-    let pts = if d.more_above {
+    let tx = d.sub_tail_x.clamp(r + half, (cw - r - half).max(r + half));
+    let pts = if d.sub_above {
         [
             POINT {
                 x: tx,
@@ -651,7 +796,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             // 图标按钮：按钮不带可见文本（图标自绘），窗口文本保留为提示文案
             // （可访问性/自动化可读）。先以占位尺寸创建，再由 layout 统一定位。
             for (i, &id) in BTN_ORDER.iter().enumerate() {
-                d.buttons[i] = add_button(hwnd, tip_text(id), 0, 0, 10, 10, id);
+                d.buttons[i] = add_button(hwnd, main_tip_text(id), 0, 0, 10, 10, id);
             }
             for b in d.buttons {
                 d.fx.register(b);
@@ -661,13 +806,13 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             d.tip = tooltip::Tip::new(hwnd);
             layout(hwnd);
 
-            // 「…」子工具条：顶层分层 popup（子控件才能画到主窗口之外），初始隐藏。
+            // 共享子工具条：顶层分层 popup（子控件才能画到主窗口之外），初始隐藏。
             // 与主工具条共享同一份 ToolbarData（USERDATA 指向同一结构），
             // 生命周期由主工具条 WM_DESTROY 显式销毁。
-            let (lw, lh) = more_logical_size();
+            let (lw, lh) = sub_logical_size(SubKind::More);
             let dpi = util::dpi_of(hwnd);
             let userdata = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut core::ffi::c_void;
-            let more = util::create_window(
+            let sub = util::create_window(
                 MORE_CLASS,
                 "",
                 WINDOW_EX_STYLE(
@@ -681,13 +826,13 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 userdata,
             )
             .unwrap_or_default();
-            if !more.is_invalid() {
+            if !sub.is_invalid() {
                 // 色键透明：尖角/圆角之外透出桌面
-                let _ = SetLayeredWindowAttributes(more, MORE_KEY, 0, LWA_COLORKEY);
+                let _ = SetLayeredWindowAttributes(sub, MORE_KEY, 0, LWA_COLORKEY);
                 // 与工具条一致：排除出截屏捕获
-                let _ = SetWindowDisplayAffinity(more, WDA_EXCLUDEFROMCAPTURE);
-                d.more = more;
-                layout_more(more);
+                let _ = SetWindowDisplayAffinity(sub, WDA_EXCLUDEFROMCAPTURE);
+                d.sub = sub;
+                layout_sub(sub);
             }
             LRESULT(0)
         }
@@ -709,7 +854,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     } else {
                         BtnStyle::Icon
                     };
-                    let selected = d.active_tool != 0 && id == d.active_tool;
+                    let selected = button_selected(d, id);
                     draw_icon_frame(hwnd, &*dis, style, d.skin, &d.fx, icon_of(id), selected);
                 }
             }
@@ -758,28 +903,18 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     show_tip_for(d);
                     let _ = KillTimer(hwnd, TIMER_TIP);
                     handled = true;
-                } else if wp.0 == TIMER_MORE_SHOW {
-                    // 悬停延时到点：光标仍在「…」上才展开（已移开则直接取消）
-                    d.more_show_armed = false;
-                    if cursor_on_more_button(d)
-                        && !d.more.is_invalid()
-                        && !IsWindowVisible(d.more).as_bool()
-                    {
-                        show_more(d);
-                    } else {
-                        let _ = KillTimer(hwnd, TIMER_MORE_SHOW);
+                } else if wp.0 == TIMER_SUB_SHOW {
+                    // 悬停延时到点：光标仍在原按钮上才展开（已移开则直接取消）
+                    let id = d.sub_armed_id;
+                    d.sub_show_armed = false;
+                    d.sub_armed_id = 0;
+                    if cursor_on_main_button(d, id) {
+                        show_popup_for_anchor(d, id);
                     }
+                    let _ = KillTimer(hwnd, TIMER_SUB_SHOW);
                     handled = true;
-                } else if wp.0 == TIMER_MORE_POLL {
-                    // 子工具条可见期间：光标离开「…」与浮层（连续多次确认）即收起
-                    if cursor_over_more(d) {
-                        d.more_miss = 0;
-                    } else {
-                        d.more_miss = d.more_miss.saturating_add(1);
-                        if d.more_miss >= MORE_HIDE_MISSES {
-                            hide_more(d);
-                        }
-                    }
+                } else if wp.0 == TIMER_SUB_POLL {
+                    poll_popups(d);
                     handled = true;
                 } else {
                     handled = d.fx.on_timer(hwnd, wp.0);
@@ -816,7 +951,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             }
             layout(hwnd);
             if let Some(d) = data_of(hwnd) {
-                hide_more(d); // 尺寸/位置按 DPI 重算，旧浮层位置已失效
+                hide_all_popups(d); // 尺寸/位置按 DPI 重算，旧浮层位置已失效
             }
             let _ = raw::InvalidateRect(hwnd, std::ptr::null(), 1);
             LRESULT(0)
@@ -846,12 +981,18 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             }
             LRESULT(0)
         }
+        // 点击工具条空白处（按钮之间的间隙）同样收起所有子工具条。
+        WM_LBUTTONDOWN => {
+            if let Some(d) = data_of(hwnd) {
+                hide_all_popups(d);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+
         // 拖动工具条（点在按钮行以外的 HTCAPTION 区）时立即收起气泡与子工具条
         WM_NCLBUTTONDOWN => {
             if let Some(d) = data_of(hwnd) {
-                d.tip.hide();
-                d.tip_shown = false;
-                hide_more(d);
+                hide_all_popups(d);
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
@@ -881,6 +1022,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             if let Some(d) = data_of(hwnd) {
                 if d.style_panel.0 as isize == lp.0 {
                     d.style_panel = HWND::default();
+                    stop_poll_if_idle(d);
                 }
             }
             LRESULT(0)
@@ -894,13 +1036,16 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 }
                 // 子工具条是独立顶层窗口，需显式销毁（其 WM_NCDESTROY 只清 USERDATA，
                 // 不重复释放这份共享数据）；先注销子类化登记，再停掉它的悬停定时器。
-                if !data.more.is_invalid() {
-                    for b in data.more_buttons {
+                if !data.font_combo.is_invalid() {
+                    util::unsubclass(data.font_combo);
+                }
+                if !data.sub.is_invalid() {
+                    for b in data.sub_buttons {
                         util::unsubclass(b);
                     }
-                    data.more_fx.stop(data.more);
-                    let _ = DestroyWindow(data.more);
-                    data.more = HWND::default();
+                    data.sub_fx.stop(data.sub);
+                    let _ = DestroyWindow(data.sub);
+                    data.sub = HWND::default();
                 }
                 data.fx.stop(hwnd);
                 data.tip.destroy();
@@ -919,38 +1064,52 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 /// 贴图 / 保存 / 复制 / OCR / 关闭五个动作都走这里 —— 工具条是「一次性操作条」。
 unsafe fn close_bar(hwnd: HWND) {
     if let Some(d) = data_of(hwnd) {
-        d.tip.hide();
-        hide_more(d);
-        if !d.style_panel.is_invalid() {
-            let _ = DestroyWindow(d.style_panel);
-            d.style_panel = HWND::default();
-        }
+        hide_all_popups(d);
     }
     let _ = ShowWindow(hwnd, SW_HIDE);
     PostQuitMessage(0);
 }
 
-/// 切换颜色面板（按钮 17）。
+/// 切换颜色面板（按钮 17）：隐藏 → 打开；已打开 → 关闭。
 unsafe fn toggle_style_panel(hwnd: HWND) {
     let Some(d) = data_of(hwnd) else { return };
-    if !d.style_panel.is_invalid() {
-        if IsWindow(d.style_panel).as_bool() {
-            let _ = DestroyWindow(d.style_panel);
-            d.style_panel = HWND::default();
-            return;
-        }
-        d.style_panel = HWND::default();
+    if popup_style_visible(d) {
+        hide_style_panel(d);
+        return;
     }
     if !config::get().style_panel {
         crate::toast::show("颜色面板已在配置中关闭");
         return;
     }
-    // 颜色面板同样从工具条下方弹出，先收起「…」浮层避免两层叠在一起
-    hide_more(d);
-    let p = crate::style_panel::toggle(hwnd, d.overlay);
+    show_style_panel(d);
+}
+
+/// 打开颜色面板（悬停延时或点击触发）。
+unsafe fn show_style_panel(d: &mut ToolbarData) {
+    if !config::get().style_panel || popup_style_visible(d) {
+        return;
+    }
+    // 颜色面板与共享子工具条不会同时弹出
+    hide_sub(d);
+    let p = crate::style_panel::toggle(d.bar, d.overlay);
     if !p.is_invalid() {
         d.style_panel = p;
+        d.tip.hide();
+        d.tip_shown = false;
+        d.tip_for = 0;
+        d.tip_hwnd = HWND::default();
+        let _ = KillTimer(d.bar, TIMER_TIP);
+        start_poll(d);
     }
+}
+
+/// 关闭颜色面板。
+unsafe fn hide_style_panel(d: &mut ToolbarData) {
+    if !d.style_panel.is_invalid() {
+        let _ = DestroyWindow(d.style_panel);
+        d.style_panel = HWND::default();
+    }
+    stop_poll_if_idle(d);
 }
 
 /// Ctrl 是否按下（读物理按键状态，不依赖焦点/键序）。
@@ -1128,7 +1287,7 @@ unsafe fn handle_annotation_wheel(hwnd: HWND, wp: WPARAM) -> bool {
             let h = WindowFromPoint(pt);
             let parent = GetParent(h).unwrap_or_default();
             // 主工具条按钮与「…」子工具条按钮都算悬停在标注按钮上
-            if !h.is_invalid() && (parent == hwnd || parent == d.more) {
+            if !h.is_invalid() && (parent == hwnd || parent == d.sub) {
                 kind = size_kind_for_button(GetDlgCtrlID(h) as usize);
             }
         }
@@ -1190,6 +1349,9 @@ fn icon_of(id: usize) -> icons::Icon {
         BTN_WATERMARK => icons::Icon::Watermark,
         BTN_STYLE => icons::Icon::Palette,
         BTN_MORE => icons::Icon::More,
+        BTN_TEXT_BOLD => icons::Icon::Bold,
+        BTN_TEXT_ITALIC => icons::Icon::Italic,
+        BTN_TEXT_STROKE => icons::Icon::TextStroke,
         _ => icons::Icon::Close,
     }
 }
@@ -1230,86 +1392,284 @@ fn tool_button_id_from_wp(v: usize) -> usize {
     }
 }
 
-/// 控件 ID → 按钮句柄（主工具条与「…」子工具条分别查表）。
-fn button_hwnd(d: &ToolbarData, id: usize) -> Option<HWND> {
-    if let Some(i) = BTN_ORDER.iter().position(|&x| x == id) {
-        Some(d.buttons[i])
-    } else {
-        MORE_ORDER
-            .iter()
-            .position(|&x| x == id)
-            .map(|i| d.more_buttons[i])
-    }
+/// 主工具条按钮 ID → 按钮句柄。
+fn main_button(d: &ToolbarData, id: usize) -> Option<HWND> {
+    BTN_ORDER
+        .iter()
+        .position(|&x| x == id)
+        .map(|i| d.buttons[i])
 }
 
-/// 重绘全部工具按钮（激活工具变化时同步高亮；主工具条与子工具条都要刷新）。
+/// 子工具条按钮 ID → 按钮句柄。
+fn sub_button(d: &ToolbarData, id: usize) -> Option<HWND> {
+    SUB_IDS
+        .iter()
+        .position(|&x| x == id)
+        .map(|i| d.sub_buttons[i])
+}
+
+/// 按钮是否处于「激活」高亮：标注工具取冻结层回传值，文字开关取本地状态。
+fn button_selected(d: &ToolbarData, id: usize) -> bool {
+    (d.active_tool != 0 && id == d.active_tool)
+        || (id == BTN_TEXT_BOLD && d.text_bold)
+        || (id == BTN_TEXT_ITALIC && d.text_italic)
+        || (id == BTN_TEXT_STROKE && d.text_stroke)
+}
+
+/// 重绘全部工具按钮（激活工具/文字开关变化时同步高亮；主工具条与子工具条都要刷新）。
 unsafe fn refresh_buttons(hwnd: HWND) {
     if let Some(d) = data_of(hwnd) {
         for b in d.buttons {
             let _ = raw::InvalidateRect(b, std::ptr::null(), 1);
         }
-        for b in d.more_buttons {
+        for b in d.sub_buttons {
             let _ = raw::InvalidateRect(b, std::ptr::null(), 1);
         }
     }
 }
 
-/// 光标是否悬停在主工具条的「…」按钮上。
-unsafe fn cursor_on_more_button(d: &ToolbarData) -> bool {
-    let Some(b) = button_hwnd(d, BTN_MORE) else {
-        return false;
-    };
+/// 光标是否落在按钮矩形内。
+unsafe fn cursor_on_button(btn: HWND) -> bool {
     let mut pt = POINT::default();
     let mut br = RECT::default();
-    if GetCursorPos(&mut pt).is_err() || GetWindowRect(b, &mut br).is_err() {
+    if GetCursorPos(&mut pt).is_err() || GetWindowRect(btn, &mut br).is_err() {
         return false;
     }
     pt.x >= br.left && pt.x < br.right && pt.y >= br.top && pt.y < br.bottom
 }
 
-/// 光标是否仍停在「…」按钮或其浮层内（浮层子按钮也在浮层矩形范围内）。
-unsafe fn cursor_over_more(d: &ToolbarData) -> bool {
-    let Some(b) = button_hwnd(d, BTN_MORE) else {
+/// 光标是否悬停在主工具条指定按钮上。
+unsafe fn cursor_on_main_button(d: &ToolbarData, id: usize) -> bool {
+    main_button(d, id).is_some_and(|b| cursor_on_button(b))
+}
+
+fn popup_sub_visible(d: &ToolbarData) -> bool {
+    !d.sub.is_invalid() && d.sub_kind != SubKind::None && unsafe { IsWindowVisible(d.sub).as_bool() }
+}
+
+fn popup_style_visible(d: &ToolbarData) -> bool {
+    !d.style_panel.is_invalid() && unsafe { IsWindowVisible(d.style_panel).as_bool() }
+}
+
+fn popup_visible(d: &ToolbarData) -> bool {
+    popup_sub_visible(d) || popup_style_visible(d)
+}
+
+/// 字体下拉框是否已展开（展开时列表是独立弹窗，不能按子工具条矩形判断）。
+unsafe fn font_dropdown_open(d: &ToolbarData) -> bool {
+    d.sub_kind == SubKind::Text
+        && !d.font_combo.is_invalid()
+        && SendMessageW(d.font_combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 != 0
+}
+
+/// 光标是否仍停留在共享子工具条（按钮 + 浮层 + 按钮到浮层的走廊）。
+unsafe fn cursor_over_sub_area(d: &ToolbarData) -> bool {
+    if !popup_sub_visible(d) {
+        return false;
+    }
+    if font_dropdown_open(d) {
+        return true;
+    }
+    let Some(anchor) = main_button(d, d.sub_anchor) else {
         return false;
     };
     let mut pt = POINT::default();
-    let mut br = RECT::default();
-    if GetCursorPos(&mut pt).is_err() || GetWindowRect(b, &mut br).is_err() {
+    let mut ar = RECT::default();
+    let mut sr = RECT::default();
+    if GetCursorPos(&mut pt).is_err()
+        || GetWindowRect(anchor, &mut ar).is_err()
+        || GetWindowRect(d.sub, &mut sr).is_err()
+    {
         return false;
     }
-    if pt.x >= br.left && pt.x < br.right && pt.y >= br.top && pt.y < br.bottom {
+    if pt.x >= ar.left && pt.x < ar.right && pt.y >= ar.top && pt.y < ar.bottom {
         return true;
     }
-    if d.more.is_invalid() {
-        return false;
-    }
-    let mut mr = RECT::default();
-    if GetWindowRect(d.more, &mut mr).is_err() {
-        return false;
-    }
-    if pt.x >= mr.left && pt.x < mr.right && pt.y >= mr.top && pt.y < mr.bottom {
+    if pt.x >= sr.left && pt.x < sr.right && pt.y >= sr.top && pt.y < sr.bottom {
         return true;
     }
-    // 「…」到浮层之间的竖直走廊（跨过工具条内边距的空白时也不立刻收起，
-    // 否则光标从按钮移向浮层的途中会被误判为离开）
-    pt.x >= mr.left
-        && pt.x < mr.right
-        && pt.y >= br.top.min(mr.top)
-        && pt.y < br.bottom.max(mr.bottom)
+    // 按钮到浮层之间的走廊（跨过工具条内边距时不立刻收起）
+    pt.x >= sr.left
+        && pt.x < sr.right
+        && pt.y >= ar.top.min(sr.top)
+        && pt.y < ar.bottom.max(sr.bottom)
 }
 
-/// 展开「…」子工具条：定位在主工具条下方并让尖角对准「…」按钮；
-/// 下方空间不足时翻到工具条上方（尖角改为朝下）。
-unsafe fn show_more(d: &mut ToolbarData) {
-    if d.more.is_invalid() {
+/// 光标是否仍停留在颜色面板（按钮 + 面板 + 走廊）。
+unsafe fn cursor_over_style_area(d: &ToolbarData) -> bool {
+    if !popup_style_visible(d) {
+        return false;
+    }
+    let Some(anchor) = main_button(d, BTN_STYLE) else {
+        return false;
+    };
+    let mut pt = POINT::default();
+    let mut ar = RECT::default();
+    let mut pr = RECT::default();
+    if GetCursorPos(&mut pt).is_err()
+        || GetWindowRect(anchor, &mut ar).is_err()
+        || GetWindowRect(d.style_panel, &mut pr).is_err()
+    {
+        return false;
+    }
+    if pt.x >= ar.left && pt.x < ar.right && pt.y >= ar.top && pt.y < ar.bottom {
+        return true;
+    }
+    if pt.x >= pr.left && pt.x < pr.right && pt.y >= pr.top && pt.y < pr.bottom {
+        return true;
+    }
+    pt.x >= pr.left
+        && pt.x < pr.right
+        && pt.y >= ar.top.min(pr.top)
+        && pt.y < ar.bottom.max(pr.bottom)
+}
+
+unsafe fn cursor_over_popup_area(d: &ToolbarData) -> bool {
+    cursor_over_sub_area(d) || cursor_over_style_area(d)
+}
+
+/// 点击是否落在子工具条自己的可交互控件上（用于「点击别处收起」判定）。
+///
+/// 点击锚定按钮本身也视为工具条控件（展开矩形/箭头/文字后再次点击该按钮不收起）。
+unsafe fn cursor_over_popup_control(d: &ToolbarData) -> bool {
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() {
+        return false;
+    }
+    let h = WindowFromPoint(pt);
+    if popup_sub_visible(d) {
+        // 字体列表是原生下拉弹窗（独立窗口），点击其条目属于子工具条操作
+        if font_dropdown_open(d) && is_combo_list_window(h) {
+            return true;
+        }
+        // 矩形/箭头/文字按钮点击本身要展开（不能先被点击外部判定收起）；
+        // 「更多」按钮没有点击展开语义，点击它应视为「点击别处」。
+        let anchor_expands = matches!(d.sub_anchor, BTN_RECT | BTN_ARROW | BTN_TEXT);
+        if (anchor_expands && cursor_on_main_button(d, d.sub_anchor)) || h == d.font_combo {
+            return true;
+        }
+        if !h.is_invalid() && GetParent(h).is_ok_and(|p| p == d.sub) {
+            return true;
+        }
+    }
+    if popup_style_visible(d) {
+        if cursor_on_main_button(d, BTN_STYLE) {
+            return true;
+        }
+        if !h.is_invalid() && GetParent(h).is_ok_and(|p| p == d.style_panel) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 原生 combo 的下拉列表窗口类名固定为 `ComboLBox`。
+unsafe fn is_combo_list_window(h: HWND) -> bool {
+    if h.is_invalid() {
+        return false;
+    }
+    let mut buf = [0u16; 32];
+    let n = GetClassNameW(h, &mut buf);
+    let name: String = buf[..n as usize]
+        .iter()
+        .filter_map(|&c| char::from_u32(c as u32))
+        .collect();
+    name == "ComboLBox"
+}
+
+unsafe fn mouse_left_down() -> bool {
+    (GetAsyncKeyState(VK_LBUTTON_CODE) as u16) & 0x8000 != 0
+}
+
+/// 子工具条/颜色面板可见期间启动轮询：光标离开或点击别处即收起。
+unsafe fn start_poll(d: &mut ToolbarData) {
+    if !popup_visible(d) {
+        stop_poll_if_idle(d);
         return;
     }
+    d.sub_mouse_down = mouse_left_down();
+    d.sub_miss = 0;
+    let _ = SetTimer(d.bar, TIMER_SUB_POLL, SUB_POLL_MS, None);
+}
+
+unsafe fn stop_poll_if_idle(d: &ToolbarData) {
+    if !popup_visible(d) {
+        let _ = KillTimer(d.bar, TIMER_SUB_POLL);
+    }
+}
+
+/// 轮询：点击浮层之外的任意位置 → 立即收起；光标离开浮层过久 → 收起。
+unsafe fn poll_popups(d: &mut ToolbarData) {
+    if !popup_visible(d) {
+        let _ = KillTimer(d.bar, TIMER_SUB_POLL);
+        return;
+    }
+    let down = mouse_left_down();
+    let pressed = down && !d.sub_mouse_down;
+    d.sub_mouse_down = down;
+    if pressed && !cursor_over_popup_control(d) {
+        hide_all_popups(d);
+        return;
+    }
+    if cursor_over_popup_area(d) {
+        d.sub_miss = 0;
+    } else {
+        d.sub_miss = d.sub_miss.saturating_add(1);
+        if d.sub_miss >= SUB_HIDE_MISSES {
+            hide_all_popups(d);
+            return;
+        }
+    }
+    stop_poll_if_idle(d);
+}
+
+/// 收起所有子工具条（含颜色面板）与提示气泡。
+unsafe fn hide_all_popups(d: &mut ToolbarData) {
+    hide_sub(d);
+    hide_style_panel(d);
+    d.tip.hide();
+    d.tip_shown = false;
+    d.tip_for = 0;
+    d.tip_hwnd = HWND::default();
+    let _ = KillTimer(d.bar, TIMER_TIP);
+}
+
+/// 按主工具条按钮展开对应的子工具条（`BTN_STYLE` 对应颜色面板）。
+unsafe fn show_popup_for_anchor(d: &mut ToolbarData, id: usize) {
+    if id == BTN_STYLE {
+        if !popup_style_visible(d) {
+            show_style_panel(d);
+        }
+    } else if let Some(kind) = sub_kind_for_anchor(id) {
+        show_sub(d, kind, id);
+    }
+}
+
+unsafe fn close_font_dropdown(d: &ToolbarData) {
+    if !d.font_combo.is_invalid() {
+        let _ = SendMessageW(d.font_combo, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// 展开共享子工具条：定位在主工具条下方并让尖角对准锚定按钮；
+/// 下方空间不足时翻到工具条上方（尖角改为朝下）。
+unsafe fn show_sub(d: &mut ToolbarData, kind: SubKind, anchor_id: usize) {
+    if d.sub.is_invalid() || kind == SubKind::None {
+        return;
+    }
+    if popup_sub_visible(d) && d.sub_kind == kind && d.sub_anchor == anchor_id {
+        start_poll(d);
+        return;
+    }
+    hide_style_panel(d);
+    close_font_dropdown(d);
+
     let hwnd = d.bar;
     let dpi = util::dpi_of(hwnd);
     let s = |v: i32| util::scaled(v, dpi);
-    let (lw, lh) = more_logical_size();
+    let (lw, lh) = sub_logical_size(kind);
     let (w, h) = (s(lw), s(lh));
-    let Some(btn) = button_hwnd(d, BTN_MORE) else {
+    let Some(btn) = main_button(d, anchor_id) else {
         return;
     };
     let mut br = RECT::default();
@@ -1319,22 +1679,23 @@ unsafe fn show_more(d: &mut ToolbarData) {
     }
 
     let (vx, vy, vw, vh) = capture::virtual_screen_rect();
-    let x = (br.left + ((br.right - br.left) - w) / 2)
-        .clamp(vx, (vx + vw - w).max(vx));
+    let x = (br.left + ((br.right - br.left) - w) / 2).clamp(vx, (vx + vw - w).max(vx));
     let (y, above) = if tr.bottom + h <= vy + vh {
         (tr.bottom, false)
     } else {
         ((tr.top - h).max(vy), true)
     };
 
-    d.more_above = above;
+    d.sub_kind = kind;
+    d.sub_anchor = anchor_id;
+    d.sub_above = above;
     let r = s(radius_l()).max(1);
     let half = s(MORE_TAIL_HALF_W);
     let tip_x = br.left + (br.right - br.left) / 2 - x;
-    d.more_tail_x = tip_x.clamp(r + half, (w - r - half).max(r + half));
+    d.sub_tail_x = tip_x.clamp(r + half, (w - r - half).max(r + half));
 
     let _ = SetWindowPos(
-        d.more,
+        d.sub,
         HWND_TOPMOST,
         x,
         y,
@@ -1342,31 +1703,44 @@ unsafe fn show_more(d: &mut ToolbarData) {
         h,
         SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
-    layout_more_with(d, d.more);
-    let _ = raw::InvalidateRect(d.more, std::ptr::null(), 1);
+    layout_sub_with(d, d.sub);
+    let _ = raw::InvalidateRect(d.sub, std::ptr::null(), 1);
 
-    // 浮层已展开：收起「…」的悬停提示，并开始侦测光标离开
+    // 浮层已展开：收起锚定按钮的悬停提示，并开始侦测光标离开/点击别处
     d.tip.hide();
     d.tip_shown = false;
     d.tip_for = 0;
+    d.tip_hwnd = HWND::default();
     let _ = KillTimer(hwnd, TIMER_TIP);
-    let _ = KillTimer(hwnd, TIMER_MORE_SHOW);
-    d.more_show_armed = false;
-    d.more_miss = 0;
-    let _ = SetTimer(hwnd, TIMER_MORE_POLL, MORE_POLL_MS, None);
+    let _ = KillTimer(hwnd, TIMER_SUB_SHOW);
+    d.sub_show_armed = false;
+    d.sub_armed_id = 0;
+    start_poll(d);
 }
 
-/// 收起「…」子工具条（光标离开「…」与浮层后由轮询定时器调用）。
-unsafe fn hide_more(d: &mut ToolbarData) {
-    if !d.more.is_invalid() {
-        let _ = ShowWindow(d.more, SW_HIDE);
+/// 收起共享子工具条（光标离开/点击别处后由轮询定时器调用）。
+unsafe fn hide_sub(d: &mut ToolbarData) {
+    close_font_dropdown(d);
+    if !d.sub.is_invalid() {
+        let _ = ShowWindow(d.sub, SW_HIDE);
         // 复位悬停淡出状态，避免下次展开时沿用旧的悬停底
-        d.more_fx.stop(d.more);
+        d.sub_fx.stop(d.sub);
     }
-    let _ = KillTimer(d.bar, TIMER_MORE_SHOW);
-    let _ = KillTimer(d.bar, TIMER_MORE_POLL);
-    d.more_show_armed = false;
-    d.more_miss = 0;
+    d.sub_kind = SubKind::None;
+    d.sub_anchor = 0;
+    let _ = KillTimer(d.bar, TIMER_SUB_SHOW);
+    d.sub_show_armed = false;
+    d.sub_armed_id = 0;
+    d.sub_miss = 0;
+    screen_tip_reset(d);
+    stop_poll_if_idle(d);
+}
+
+unsafe fn screen_tip_reset(d: &mut ToolbarData) {
+    d.tip.hide();
+    d.tip_shown = false;
+    d.tip_for = 0;
+    d.tip_hwnd = HWND::default();
 }
 
 /// 导出前把标注合成进成品图（无标注时零拷贝，见 6）。
@@ -1380,14 +1754,26 @@ unsafe fn compose(d: &ToolbarData) -> Arc<CapturedImage> {
 
 /// 弹出 `d.tip_for` 对应按钮的提示气泡（延时到点后由其屏幕矩形定位）。
 unsafe fn show_tip_for(d: &mut ToolbarData) {
-    let Some(btn) = button_hwnd(d, d.tip_for) else {
+    let btn = if !d.tip_hwnd.is_invalid() {
+        d.tip_hwnd
+    } else if let Some(b) = main_button(d, d.tip_for) {
+        b
+    } else if let Some(b) = sub_button(d, d.tip_for) {
+        b
+    } else {
         return;
     };
     let mut r = RECT::default();
     if GetWindowRect(btn, &mut r).is_err() {
         return;
     }
-    d.tip.show(tip_text(d.tip_for), shortcut_of(d.tip_for), &r);
+    // 主工具条锚定按钮用组合提示（如「矩形/椭圆」）；子按钮用单项名称。
+    let label = if GetParent(btn).is_ok_and(|p| p == d.bar) {
+        main_tip_text(d.tip_for)
+    } else {
+        tip_text(d.tip_for)
+    };
+    d.tip.show(label, shortcut_of(d.tip_for), &r);
     d.tip_shown = true;
 }
 
@@ -1406,14 +1792,21 @@ unsafe extern "system" fn more_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let Some(d) = data_of(hwnd) else {
                 return LRESULT(-1);
             };
-            for (i, &id) in MORE_ORDER.iter().enumerate() {
-                d.more_buttons[i] = add_button(hwnd, tip_text(id), 0, 0, 10, 10, id);
+            for (i, &id) in SUB_IDS.iter().enumerate() {
+                d.sub_buttons[i] = add_button(hwnd, tip_text(id), 0, 0, 10, 10, id);
             }
-            for b in d.more_buttons {
-                d.more_fx.register(b);
+            for b in d.sub_buttons {
+                d.sub_fx.register(b);
                 util::subclass(b, btn_proc);
             }
-            layout_more(hwnd);
+            // 字体下拉框（文字子工具条专用），初始隐藏
+            let (combo, names) = create_font_combo(hwnd);
+            d.font_combo = combo;
+            d.font_names = names;
+            if !d.font_combo.is_invalid() {
+                util::subclass(d.font_combo, combo_proc);
+            }
+            layout_sub(hwnd);
             LRESULT(0)
         }
 
@@ -1422,7 +1815,17 @@ unsafe extern "system" fn more_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_ERASEBKGND => LRESULT(1),
 
         WM_PAINT => {
-            paint_more(hwnd);
+            paint_sub(hwnd);
+            LRESULT(0)
+        }
+
+        // 点击浮层背景（而不是按钮）也视为「点击别处」：收起浮层
+        WM_LBUTTONDOWN => {
+            if let Some(d) = data_of(hwnd) {
+                if !cursor_over_sub_button(d) {
+                    hide_all_popups(d);
+                }
+            }
             LRESULT(0)
         }
 
@@ -1431,13 +1834,13 @@ unsafe extern "system" fn more_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if !dis.is_null() {
                 if let Some(d) = data_of(hwnd) {
                     let id = (wp.0 & 0xFFFF) as usize;
-                    let selected = d.active_tool != 0 && id == d.active_tool;
+                    let selected = button_selected(d, id);
                     draw_icon_frame(
                         d.bar,
                         &*dis,
                         BtnStyle::Icon,
                         d.skin,
-                        &d.more_fx,
+                        &d.sub_fx,
                         icon_of(id),
                         selected,
                     );
@@ -1448,14 +1851,14 @@ unsafe extern "system" fn more_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 
         WM_MOUSEMOVE => {
             if let Some(d) = data_of(hwnd) {
-                d.more_fx.on_mouse_move(hwnd);
+                d.sub_fx.on_mouse_move(hwnd);
             }
             LRESULT(0)
         }
 
         util::WM_MOUSELEAVE => {
             if let Some(d) = data_of(hwnd) {
-                d.more_fx.on_mouse_leave(hwnd);
+                d.sub_fx.on_mouse_leave(hwnd);
             }
             LRESULT(0)
         }
@@ -1468,7 +1871,7 @@ unsafe extern "system" fn more_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     let _ = KillTimer(hwnd, TIMER_TIP);
                     handled = true;
                 } else {
-                    handled = d.more_fx.on_timer(hwnd, wp.0);
+                    handled = d.sub_fx.on_timer(hwnd, wp.0);
                 }
             }
             if handled {
@@ -1481,10 +1884,21 @@ unsafe extern "system" fn more_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_COMMAND => {
             if let Some(d) = data_of(hwnd) {
                 let id = (wp.0 & 0xFFFF) as usize;
-                handle_command(d.bar, id);
-                // 选中子工具条的标注工具后收起浮层（避免遮住画布操作区）
-                if MORE_ORDER.contains(&id) {
-                    hide_more(d);
+                let code = ((wp.0 >> 16) & 0xFFFF) as u32;
+                if id == BTN_TEXT_FONT && code == CBN_SELCHANGE {
+                    apply_font_choice(d);
+                } else if id == BTN_TEXT_BOLD
+                    || id == BTN_TEXT_ITALIC
+                    || id == BTN_TEXT_STROKE
+                {
+                    toggle_text_style(d, id);
+                } else if SUB_IDS.contains(&id) {
+                    handle_command(d.bar, id);
+                    // 选中子工具条的标注工具后收起浮层（避免遮住画布操作区）；
+                    // 文字样式开关则保持浮层打开，便于连续切换。
+                    if !TEXT_STYLE_ORDER.contains(&id) {
+                        hide_sub(d);
+                    }
                 }
             }
             LRESULT(0)
@@ -1529,57 +1943,78 @@ unsafe extern "system" fn btn_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             match msg {
                 WM_MOUSEMOVE => {
                     if is_sub {
-                        d.more_fx.on_mouse_move(parent);
+                        d.sub_fx.on_mouse_move(parent);
                     } else {
                         // 悬停高亮：父窗口在按钮上方收不到 WM_MOUSEMOVE，这里代它驱动
                         d.fx.on_mouse_move(parent);
                     }
                     // 移到另一个按钮：旧气泡若尚未消失，必须先隐藏，再为新按钮重新计时；
-                    // 保证同一时刻只显示最新的 tip。「…」展开浮层，不显示 tip。
-                    if d.tip_for != id {
+                    // 保证同一时刻只显示最新的 tip。
+                    if d.tip_for != id || d.tip_hwnd != hwnd {
                         if d.tip_shown {
                             d.tip.hide();
                             d.tip_shown = false;
                         }
                         d.tip_for = id;
-                        if id != BTN_MORE {
-                            let _ = SetTimer(
-                                parent,
-                                TIMER_TIP,
-                                crate::config::get().ui_tooltip_delay_ms,
-                                None,
-                            );
+                        d.tip_hwnd = hwnd;
+                        // 会弹出子工具条的锚定按钮：提示必须在 1 秒展开前出现，
+                        // 因此把延时上限压到展开前 200ms（默认 450ms 不受影响）。
+                        let opens_sub = !is_sub
+                            && (id == BTN_MORE
+                                || id == BTN_STYLE
+                                || sub_kind_for_anchor(id).is_some());
+                        let mut delay = crate::config::get().ui_tooltip_delay_ms;
+                        if opens_sub {
+                            delay = delay.min(SUB_SHOW_DELAY_MS.saturating_sub(200));
                         }
+                        let _ = SetTimer(parent, TIMER_TIP, delay, None);
                     }
-                    // 悬停「…」延时展开子工具条（只在主工具条按钮上触发）
-                    if id == BTN_MORE
-                        && !d.more.is_invalid()
-                        && !IsWindowVisible(d.more).as_bool()
-                        && !d.more_show_armed
-                    {
-                        d.more_show_armed = true;
-                        let _ = SetTimer(d.bar, TIMER_MORE_SHOW, MORE_SHOW_DELAY_MS, None);
+                    // 悬停主工具条按钮超过 1 秒：展开对应子工具条。
+                    // 只对主工具条按钮武装；子工具条内部不再嵌套弹层。
+                    if !is_sub {
+                        let should_arm = if id == BTN_STYLE {
+                            !popup_style_visible(d)
+                        } else {
+                            sub_kind_for_anchor(id).is_some_and(|_| {
+                                !(popup_sub_visible(d) && d.sub_anchor == id)
+                            })
+                        };
+                        if should_arm && (!d.sub_show_armed || d.sub_armed_id != id) {
+                            d.sub_show_armed = true;
+                            d.sub_armed_id = id;
+                            let _ =
+                                SetTimer(d.bar, TIMER_SUB_SHOW, SUB_SHOW_DELAY_MS, None);
+                        }
                     }
                 }
                 util::WM_MOUSELEAVE => {
                     if is_sub {
                         // 收尾高亮轮询（移到父窗口其它区域时会由父窗口的 WM_MOUSEMOVE 重新开启）
-                        d.more_fx.on_mouse_leave(parent);
+                        d.sub_fx.on_mouse_leave(parent);
                     } else {
                         d.fx.on_mouse_leave(parent);
                     }
                     d.tip.hide();
                     d.tip_shown = false;
                     d.tip_for = 0;
+                    d.tip_hwnd = HWND::default();
                     let _ = KillTimer(parent, TIMER_TIP);
-                    if id == BTN_MORE {
-                        d.more_show_armed = false;
-                        let _ = KillTimer(d.bar, TIMER_MORE_SHOW);
+                    if d.sub_armed_id == id {
+                        d.sub_show_armed = false;
+                        d.sub_armed_id = 0;
+                        let _ = KillTimer(d.bar, TIMER_SUB_SHOW);
                     }
                 }
                 WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
                     d.tip.hide();
                     d.tip_shown = false;
+                    // 矩形/箭头/文字按钮：点击即展开对应子工具条（无需等待 1 秒）
+                    if msg == WM_LBUTTONDOWN
+                        && !is_sub
+                        && matches!(id, BTN_RECT | BTN_ARROW | BTN_TEXT)
+                    {
+                        show_popup_for_anchor(d, id);
+                    }
                 }
                 // 按钮持有焦点/位于光标下时，Ctrl+滚轮调整标注尺寸
                 WM_MOUSEWHEEL => {
@@ -1617,6 +2052,219 @@ unsafe extern "system" fn btn_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     dwHoverTime: 0,
                 };
                 let _ = TrackMouseEvent(&mut tme);
+            }
+        }
+    }
+    util::call_orig(hwnd, msg, wp, lp)
+}
+
+/// 点击是否落在子工具条的按钮或字体下拉框上（浮层背景不算）。
+unsafe fn cursor_over_sub_button(d: &ToolbarData) -> bool {
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() {
+        return false;
+    }
+    let h = WindowFromPoint(pt);
+    if h.is_invalid() {
+        return false;
+    }
+    if h == d.font_combo {
+        return true;
+    }
+    d.sub_buttons.contains(&h) && GetParent(h).is_ok_and(|p| p == d.sub)
+}
+
+/// 切换文字粗体/斜体/描边，并同步给冻结层与配置文件。
+unsafe fn toggle_text_style(d: &mut ToolbarData, id: usize) {
+    let (field, value) = match id {
+        BTN_TEXT_BOLD => {
+            d.text_bold = !d.text_bold;
+            (StyleField::TextBold, d.text_bold)
+        }
+        BTN_TEXT_ITALIC => {
+            d.text_italic = !d.text_italic;
+            (StyleField::TextItalic, d.text_italic)
+        }
+        BTN_TEXT_STROKE => {
+            d.text_stroke = !d.text_stroke;
+            (StyleField::TextStroke, d.text_stroke)
+        }
+        _ => return,
+    };
+    config::update(|c| match id {
+        BTN_TEXT_BOLD => c.text_bold = value,
+        BTN_TEXT_ITALIC => c.text_italic = value,
+        BTN_TEXT_STROKE => c.text_stroke = value,
+        _ => {}
+    });
+    let _ = PostMessageW(
+        d.overlay,
+        WM_APP_SET_STYLE,
+        WPARAM(field as usize),
+        LPARAM(value as isize),
+    );
+    if let Some(b) = sub_button(d, id) {
+        let _ = raw::InvalidateRect(b, std::ptr::null(), 1);
+    }
+}
+
+/// 字体下拉选择变化：更新全局文字字体并触发冻结层重绘。
+unsafe fn apply_font_choice(d: &mut ToolbarData) {
+    if d.font_combo.is_invalid() {
+        return;
+    }
+    let idx = SendMessageW(d.font_combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+    if idx < 0 {
+        return;
+    }
+    let Some(font) = d.font_names.get(idx as usize).cloned() else {
+        return;
+    };
+    config::update(|c| c.text_font = font);
+    let _ = PostMessageW(d.overlay, WM_APP_ANNOT_DIRTY, WPARAM(0), LPARAM(0));
+}
+
+/// 枚举常见汉字字体（GB2312 字符集）；枚举失败时补充一组 Windows 内置字体。
+unsafe fn chinese_fonts() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let hdc = GetDC(HWND::default());
+    if !hdc.is_invalid() {
+        let mut lf: LOGFONTW = std::mem::zeroed();
+        lf.lfCharSet = GB2312_CHARSET;
+        let _ = EnumFontFamiliesExW(
+            hdc,
+            &lf,
+            Some(enum_font_proc),
+            LPARAM(&mut names as *mut Vec<String> as isize),
+            0,
+        );
+        let _ = ReleaseDC(HWND::default(), hdc);
+    }
+    if names.len() < 3 {
+        for f in [
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "微软雅黑",
+            "宋体",
+            "SimSun",
+            "黑体",
+            "SimHei",
+            "楷体",
+            "KaiTi",
+            "仿宋",
+            "FangSong",
+            "等线",
+            "DengXian",
+            "新宋体",
+            "NSimSun",
+        ] {
+            names.push(f.to_string());
+        }
+    }
+    names.sort_by_key(|s| s.to_lowercase());
+    names.dedup();
+    // 当前配置字体置顶，保证下拉框初始选中项一定在列表里。
+    let current = config::get().text_font;
+    names.retain(|n| *n != current);
+    names.insert(0, current);
+    names
+}
+
+unsafe extern "system" fn enum_font_proc(
+    lf: *const LOGFONTW,
+    _tm: *const TEXTMETRICW,
+    _font_type: u32,
+    lp: LPARAM,
+) -> i32 {
+    if lf.is_null() || lp.0 == 0 {
+        return 1;
+    }
+    let names = &mut *(lp.0 as *mut Vec<String>);
+    let face = (*lf).lfFaceName;
+    let name: String = face
+        .iter()
+        .take_while(|&&c| c != 0)
+        .filter_map(|&c| char::from_u32(c as u32))
+        .collect();
+    if !name.is_empty() && !name.starts_with('@') {
+        names.push(name);
+    }
+    1
+}
+
+/// 创建文字子工具条的字体下拉框（初始隐藏，字体列表填充一次）。
+unsafe fn create_font_combo(parent: HWND) -> (HWND, Vec<String>) {
+    let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
+    let combo = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        PCWSTR::from_raw(util::to_wide("COMBOBOX").as_ptr()),
+        PCWSTR::null(),
+        WS_CHILD | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+        0,
+        0,
+        10,
+        10,
+        parent,
+        HMENU(BTN_TEXT_FONT as *mut _),
+        hinst,
+        None,
+    )
+    .unwrap_or_default();
+    if combo.is_invalid() {
+        return (combo, Vec::new());
+    }
+    let font = util::gui_font(parent, 9, 400);
+    let _ = SendMessageW(combo, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    let names = chinese_fonts();
+    let mut selected = 0usize;
+    let current = config::get().text_font;
+    for name in names.iter() {
+        let w = util::to_wide(name);
+        let idx = SendMessageW(
+            combo,
+            CB_ADDSTRING,
+            WPARAM(0),
+            LPARAM(w.as_ptr() as isize),
+        )
+        .0;
+        if idx >= 0 {
+            if *name == current {
+                selected = idx as usize;
+            }
+        }
+    }
+    let _ = SendMessageW(combo, CB_SETCURSEL, WPARAM(selected), LPARAM(0));
+    let dpi = util::dpi_of(parent);
+    let _ = SendMessageW(
+        combo,
+        CB_SETDROPPEDWIDTH,
+        WPARAM(util::scaled(FONT_COMBO_DROP_W, dpi).max(1) as usize),
+        LPARAM(0),
+    );
+    (combo, names)
+}
+
+/// 字体下拉框子类化：转发 Ctrl+滚轮调整尺寸与快捷键，其余行为走原过程。
+unsafe extern "system" fn combo_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    if let Ok(parent) = GetParent(hwnd) {
+        if let Some(d) = data_of(parent) {
+            match msg {
+                WM_MOUSEWHEEL => {
+                    if handle_annotation_wheel(d.bar, wp) {
+                        return LRESULT(0);
+                    }
+                }
+                WM_KEYDOWN => {
+                    if handle_shortcut(d.bar, wp.0) {
+                        return LRESULT(0);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1740,20 +2388,44 @@ mod group_layout {
     }
 
     #[test]
-    fn secondary_annotation_tools_live_only_in_more_subbar() {
-        // 8 个标注类按钮不再直接展示在主工具条上
+    fn text_button_sits_after_step_and_before_style() {
+        let step = BTN_ORDER.iter().position(|&x| x == BTN_STEP).unwrap();
+        let text = BTN_ORDER.iter().position(|&x| x == BTN_TEXT).unwrap();
+        let style = BTN_ORDER.iter().position(|&x| x == BTN_STYLE).unwrap();
+        assert!(step < text, "文字按钮应位于序号按钮之后");
+        assert!(text < style, "文字按钮应位于颜色面板之前");
+    }
+
+    #[test]
+    fn secondary_annotation_tools_live_only_in_their_subbars() {
+        // 「更多」子工具条只保留马赛克/画笔/高亮/橡皮/水印
         for id in MORE_ORDER {
             assert!(!BTN_ORDER.contains(&id), "id={id} 不应出现在主工具条");
-        }
-        // 子工具条只装这 8 个，不重复主工具条按钮
-        for id in [BTN_RECT, BTN_ARROW, BTN_STEP, BTN_STYLE, BTN_MORE, BTN_CLOSE] {
-            assert!(!MORE_ORDER.contains(&id), "id={id} 不应出现在子工具条");
-        }
-        // 子工具条 8 个按钮提示文案齐全（不会因为迁移丢失）
-        for id in MORE_ORDER {
             assert!(!tip_text(id).is_empty(), "id={id} 缺少提示文案");
             assert!(button_id_tool(id) != annot::Tool::None, "id={id} 不是标注工具");
         }
+        // 矩形/箭头按钮的子工具条各自含原工具 + 同类新工具
+        assert_eq!(SHAPE_ORDER, [BTN_RECT, BTN_ELLIPSE]);
+        assert_eq!(ARROW_ORDER, [BTN_ARROW, BTN_LINE]);
+        // 主工具条的锚定按钮提示为组合名称
+        assert_eq!(main_tip_text(BTN_RECT), "矩形/椭圆");
+        assert_eq!(main_tip_text(BTN_ARROW), "箭头/线段");
+        assert_eq!(main_tip_text(BTN_MORE), "更多");
+        // 文字样式子工具条含粗体/斜体/描边，字体下拉框单独存在
+        assert_eq!(TEXT_STYLE_ORDER, [BTN_TEXT_BOLD, BTN_TEXT_ITALIC, BTN_TEXT_STROKE]);
+        for id in TEXT_STYLE_ORDER {
+            assert!(!tip_text(id).is_empty(), "id={id} 缺少提示文案");
+            assert!(!SUB_IDS.contains(&BTN_TEXT_FONT), "字体下拉框不是 owner-draw 按钮");
+        }
+        // 四类子工具条互不混入主工具条的功能/样式按钮
+        for id in [BTN_STEP, BTN_STYLE, BTN_MORE, BTN_CLOSE] {
+            assert!(!SUB_IDS.contains(&id), "id={id} 不应出现在子工具条");
+        }
+    }
+
+    #[test]
+    fn hover_delay_is_over_one_second() {
+        assert!(SUB_SHOW_DELAY_MS > 1000, "悬浮弹出子工具条需超过 1 秒");
     }
 
     #[test]

@@ -296,6 +296,7 @@ mod tests {
                 font_px: 20,
                 bold: false,
                 italic: false,
+                outline: false,
             },
             frame: super::super::style::TextFrame::None,
             attach: None,

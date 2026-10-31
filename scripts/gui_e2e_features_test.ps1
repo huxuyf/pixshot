@@ -420,19 +420,26 @@ try {
 
     Check '工具条含「更多」按钮（ID 18）' ((Find-ChildById $tb 18) -ne [IntPtr]::Zero)
     Check '工具条含颜色面板按钮（ID 17）' ((Find-ChildById $tb 17) -ne [IntPtr]::Zero)
-    # ── 悬停「更多」→ 子工具条弹出，8 个标注按钮都在子工具条上 ──
+    # ── 悬停「更多」超过 1 秒 → 子工具条弹出，只含马赛克/画笔/高亮/橡皮/水印 ──
     $bMore = Find-ChildById $tb 18
     if ($bMore -ne [IntPtr]::Zero) {
         $bm = Get-Center2 $bMore
         [void][Win32a]::SetCursorPos($bm[0], $bm[1])
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 1400
         $sub = Wait-Window 'PixShotToolbarMore' 2000
-        Check '悬停「更多」-> 子工具条弹出' `
+        Check '悬停「更多」超过 1 秒 -> 子工具条弹出' `
             (($sub -ne [IntPtr]::Zero) -and [Win32a]::IsWindowVisible($sub))
         if ($sub -ne [IntPtr]::Zero) {
-            Check '子工具条含橡皮按钮（ID 15）' ((Find-ChildById $sub 15) -ne [IntPtr]::Zero)
-            Check '子工具条含水印按钮（ID 16）' ((Find-ChildById $sub 16) -ne [IntPtr]::Zero)
-            # 主工具条不再直接展示标注类按钮（ID 12..16）
+            foreach ($id in 9, 14, 10, 15, 16) {
+                Check "更多子工具条显示按钮（ID $id）" `
+                    ([Win32a]::IsWindowVisible((Find-ChildById $sub $id)))
+            }
+            # 椭圆/线段/文字已分别移到矩形、箭头、文字按钮的子工具条
+            foreach ($id in 11, 12, 13) {
+                Check "更多子工具条不再显示按钮（ID $id）" `
+                    (-not [Win32a]::IsWindowVisible((Find-ChildById $sub $id)))
+            }
+            # 主工具条不再直接展示椭圆/线段按钮
             Check '主工具条不再直接展示椭圆按钮（ID 12）' ((Find-ChildById $tb 12) -eq [IntPtr]::Zero)
         }
         # 光标移开 → 子工具条自动收起

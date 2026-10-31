@@ -61,6 +61,12 @@ pub enum Icon {
     Palette,
     /// 「更多」：三个点（展开子工具条）。
     More,
+    /// 文字子工具条：粗体。
+    Bold,
+    /// 文字子工具条：斜体。
+    Italic,
+    /// 文字子工具条：描边。
+    TextStroke,
 }
 
 /// 图标对应的 Lucide 路径数据（24×24 viewBox，`stroke-width: 2`）。
@@ -140,6 +146,16 @@ fn lucide_paths(icon: Icon) -> &'static [&'static str] {
         "M12 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
         "M19 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
     ];
+    // bold（粗体）
+    const BOLD: &str = "M6 12h9a4 4 0 0 1 0 8H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h7a4 4 0 0 1 0 8";
+    // italic（斜体）
+    const ITALIC: [&str; 3] = ["M19 4h-9", "M14 20H5", "M15 4 9 20"];
+    // 描边：字母 A + 外框轮廓
+    const TEXT_STROKE: [&str; 3] = [
+        "M4 20 10 4l6 16",
+        "M6.5 14h7",
+        "m5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-14a2 2 0 0 1-2-2v-14a2 2 0 0 1 2-2z",
+    ];
 
     match icon {
         Icon::Pin => std::slice::from_ref(&PIN),
@@ -160,6 +176,9 @@ fn lucide_paths(icon: Icon) -> &'static [&'static str] {
         Icon::Watermark => &WATERMARK,
         Icon::Palette => &PALETTE,
         Icon::More => &MORE,
+        Icon::Bold => std::slice::from_ref(&BOLD),
+        Icon::Italic => &ITALIC,
+        Icon::TextStroke => &TEXT_STROKE,
     }
 }
 

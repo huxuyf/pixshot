@@ -155,6 +155,8 @@ pub struct StylePatch {
     pub text_size: Option<i32>,
     pub text_bold: Option<bool>,
     pub text_italic: Option<bool>,
+    /// Some(true/false) = 打开/关闭文字描边。
+    pub text_stroke: Option<bool>,
     pub pen_kind: Option<PenKind>,
     pub mosaic_mode: Option<MosaicMode>,
     pub highlight_mode: Option<HighlightMode>,
@@ -1085,6 +1087,7 @@ impl AnnotSession {
             font_px: self.s(self.prefs.text_size),
             bold: self.prefs.text_bold,
             italic: self.prefs.text_italic,
+            outline: self.prefs.text_stroke,
         }
     }
 
@@ -1434,6 +1437,7 @@ fn restyle_shape(cur: &Shape, p: &StylePatch, _dpi: i32) -> Shape {
                 font_px: p.text_size.map(s).unwrap_or(style.font_px),
                 bold: p.text_bold.unwrap_or(style.bold),
                 italic: p.text_italic.unwrap_or(style.italic),
+                outline: p.text_stroke.unwrap_or(style.outline),
             };
             st.font_px = st.font_px.max(1);
             let (w, h) = text_est_size(text, st.font_px);
@@ -1460,6 +1464,7 @@ fn restyle_shape(cur: &Shape, p: &StylePatch, _dpi: i32) -> Shape {
                 font_px: p.text_size.map(s).unwrap_or(style.font_px).max(1),
                 bold: p.text_bold.unwrap_or(style.bold),
                 italic: p.text_italic.unwrap_or(style.italic),
+                outline: p.text_stroke.unwrap_or(style.outline),
             },
             wm: *wm,
         },
@@ -1485,6 +1490,9 @@ fn apply_prefs(mut prefs: AnnotPrefs, p: &StylePatch) -> AnnotPrefs {
     }
     if let Some(v) = p.text_italic {
         prefs.text_italic = v;
+    }
+    if let Some(v) = p.text_stroke {
+        prefs.text_stroke = v;
     }
     if let Some(v) = p.pen_kind {
         prefs.pen_kind = v;

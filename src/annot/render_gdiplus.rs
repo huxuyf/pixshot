@@ -432,14 +432,13 @@ unsafe fn draw_text(g: *mut GpGraphics, origin: Pt, text: &str, style: &TextStyl
     }
     // 默认 StringFormat = 左上对齐：从 layout 原点直接排布
     let wide: Vec<u16> = text.encode_utf16().collect();
-    let layout = RectF {
-        X: origin.x as f32,
-        Y: origin.y as f32,
-        Width: 16384.0,
-        Height: 16384.0,
-    };
-    let b = make_brush(style.color);
-    if !b.is_null() {
+    let draw_at = |dx: f32, dy: f32, brush: *mut GpBrush| {
+        let layout = RectF {
+            X: origin.x as f32 + dx,
+            Y: origin.y as f32 + dy,
+            Width: 16384.0,
+            Height: 16384.0,
+        };
         let _ = GdipDrawString(
             g,
             PCWSTR::from_raw(wide.as_ptr()),
@@ -447,12 +446,48 @@ unsafe fn draw_text(g: *mut GpGraphics, origin: Pt, text: &str, style: &TextStyl
             font,
             &layout,
             sf,
-            b as *const GpBrush,
+            brush as *const GpBrush,
         );
+    };
+
+    // 描边：用对比色在字形四周偏移绘制一圈，再以正文色覆盖中心。
+    if style.outline {
+        let step = (style.font_px / 10).max(1) as f32;
+        let outline = make_brush(outline_color(style.color));
+        if !outline.is_null() {
+            for (dx, dy) in [
+                (-step, 0.0),
+                (step, 0.0),
+                (0.0, -step),
+                (0.0, step),
+                (-step, -step),
+                (-step, step),
+                (step, -step),
+                (step, step),
+            ] {
+                draw_at(dx, dy, outline);
+            }
+            let _ = GdipDeleteBrush(outline);
+        }
+    }
+
+    let b = make_brush(style.color);
+    if !b.is_null() {
+        draw_at(0.0, 0.0, b);
         let _ = GdipDeleteBrush(b);
     }
     let _ = GdipDeleteStringFormat(sf);
     let _ = GdipDeleteFont(font);
+}
+
+/// 文字描边色：按正文字色亮度取反（深色字配白描边、浅色字配黑描边）。
+fn outline_color(c: Rgba) -> Rgba {
+    let luma = 0.299 * c.r as f32 + 0.587 * c.g as f32 + 0.114 * c.b as f32;
+    if luma >= 128.0 {
+        Rgba::new(0, 0, 0, 0xFF)
+    } else {
+        Rgba::new(0xFF, 0xFF, 0xFF, 0xFF)
+    }
 }
 
 /// 文字输入光标：正文末尾 2px 竖线（GdipMeasureString 量测末行宽高定位）。

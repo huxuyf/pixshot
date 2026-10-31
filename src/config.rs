@@ -116,6 +116,8 @@ pub struct Config {
     pub text_bold: bool,
     /// 文字标注是否斜体。
     pub text_italic: bool,
+    /// 文字标注是否描边。
+    pub text_stroke: bool,
     /// 文字外框：无 / 气泡 / 爆炸云。
     pub text_frame: TextFrame,
     /// 文字落点靠近线段/箭头时是否自动挂线（随线段移动）。
@@ -470,6 +472,7 @@ impl Default for Config {
             pen_kind: PenKind::default(),
             text_bold: false,
             text_italic: false,
+            text_stroke: false,
             text_frame: TextFrame::default(),
             text_attach: true,
             stroke_color: DEF_STROKE,
@@ -615,6 +618,7 @@ impl Config {
             pen_kind: self.pen_kind,
             text_bold: self.text_bold,
             text_italic: self.text_italic,
+            text_stroke: self.text_stroke,
             text_frame: self.text_frame,
             text_attach: self.text_attach,
             stroke_color: self.stroke_color,
@@ -812,8 +816,13 @@ pub fn render(c: &Config) -> String {
     s.push_str(&format!("highlight_mode = {}\n", c.highlight_mode.label()));
     s.push_str("# 画笔形态：solid（硬笔）/ soft（软笔，按笔速渐细）/ fade（渐隐笔）\n");
     s.push_str(&format!("pen_mode = {}\n", c.pen_kind.label()));
-    s.push_str("# 文字是否加粗 / 斜体：0 / 1\n");
-    s.push_str(&format!("text_bold = {}\ntext_italic = {}\n", b(c.text_bold), b(c.text_italic)));
+    s.push_str("# 文字是否加粗 / 斜体 / 描边：0 / 1\n");
+    s.push_str(&format!(
+        "text_bold = {}\ntext_italic = {}\ntext_stroke = {}\n",
+        b(c.text_bold),
+        b(c.text_italic),
+        b(c.text_stroke)
+    ));
     s.push_str("# 文字外框：none（无）/ bubble（对话气泡）/ burst（爆炸云）\n");
     s.push_str(&format!("text_frame = {}\n", c.text_frame.label()));
     s.push_str("# 文字落点靠近线段/箭头时自动挂线（随线段移动）：0 / 1\n");
@@ -1126,6 +1135,7 @@ pub fn parse_detailed(text: &str) -> (Config, Vec<String>) {
             },
             "text_bold" => c.text_bold = parse_bool(val).unwrap_or(false),
             "text_italic" => c.text_italic = parse_bool(val).unwrap_or(false),
+            "text_stroke" => c.text_stroke = parse_bool(val).unwrap_or(false),
             "text_attach" => c.text_attach = parse_bool(val).unwrap_or(true),
             "stroke_color" => c.stroke_color = parse_color_or(val, c.stroke_color, "stroke_color", &mut warnings),
             "text_color" => c.text_color = parse_color_or(val, c.text_color, "text_color", &mut warnings),
