@@ -133,7 +133,7 @@ pub enum Mode {
         cur: Pt,
     },
     /// 文字输入中（Text 工具单击落点后）：正文为瞬态，完成后才作为一条
-    /// Add 命令落入文档（参照 SnowShot：Enter 换行、Esc / 点击别处完成）。
+    /// Add 命令落入文档（Enter 确认提交、Esc / 点击别处完成）。
     Typing {
         anchor: Pt,
         text: String,
@@ -690,7 +690,7 @@ impl AnnotSession {
     pub fn on_key(&mut self, vk: usize, ctrl: bool, shift: bool) -> Action {
         let before = self.transient_bbox();
 
-        // 输入中：编辑键（换行/退格/正文）经 `on_char`；这里只处理 Esc
+        // 输入中：编辑键（回车提交/退格/正文）经 `on_char`；这里只处理 Esc
         // —— 有内容即完成（避免误删正文，参照 SnowShot），空则退出输入；
         // 其余按键（Ctrl+Z 等）在输入中一律忽略。Esc 永不直接关闭会话。
         if matches!(self.mode, Mode::Typing { .. }) {
@@ -795,15 +795,20 @@ impl AnnotSession {
     }
 
     /// 输入中的字符（工具条经 `WM_APP_CHAR` 转发的 `WM_CHAR`）：
-    /// `'\r'` = 换行、`'\u{8}'` = 退格、可打印字符 = 追加。仅 Typing 模式消费。
+    /// `'\r'/'\n'` = 确认提交、`'\u{8}'` = 退格、可打印字符 = 追加。仅 Typing 模式消费。
     pub fn on_char(&mut self, c: char) -> Action {
         if !matches!(self.mode, Mode::Typing { .. }) {
             return Action::default();
         }
         let before = self.transient_bbox();
+        if matches!(c, '\r' | '\n') {
+            // 回车即确认提交（与文字输入子进程的 Enter 语义一致）
+            let mut a = self.commit_text();
+            a.redraw = union_opt(before, a.redraw);
+            return a;
+        }
         if let Mode::Typing { text, .. } = &mut self.mode {
             match c {
-                '\r' | '\n' => text.push('\n'),
                 '\u{8}' => {
                     text.pop();
                 }
@@ -1844,22 +1849,23 @@ mod tests {
     }
 
     #[test]
-    fn text_enter_newline_backspace_and_empty_esc() {
+    fn text_enter_commits_and_backspace_edits() {
         let mut s = sess();
         s.set_tool(Tool::Text);
         s.on_l_down(Pt::new(5, 5), false);
         s.on_char('a');
         s.on_char('b');
-        s.on_char('\r'); // Enter 换行
-        s.on_char('c');
-        s.on_char('\u{8}'); // 退格
-        s.on_key(VK_ESCAPE, false, false);
+        s.on_char('\u{8}'); // 退格 → "a"
+        let a = s.on_char('\r'); // Enter 即确认提交
+        assert!(!s.typing(), "回车后应退出输入");
+        assert_eq!(s.doc.len(), 1, "回车提交后应落入文档");
+        assert!(a.redraw.is_some(), "提交需重绘脏区");
         match &s.doc.shapes()[0].shape {
-            Shape::Text { text, .. } => assert_eq!(text, "ab\n"),
+            Shape::Text { text, .. } => assert_eq!(text, "a"),
             other => panic!("应为文字，得到 {other:?}"),
         }
         // 空文字 Esc：退出输入、不产生标注、不透传。
-        // （Esc 完成第一处文字后工具仍是 Text，直接再次落点开始第二处输入）
+        // （Enter 完成第一处文字后工具仍是 Text，直接再次落点开始第二处输入）
         s.on_l_down(Pt::new(9, 9), false);
         s.on_l_up(Pt::new(9, 9), false);
         let a = s.on_key(VK_ESCAPE, false, false);

@@ -49,11 +49,11 @@ use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, R
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush,
     DeleteDC, DeleteObject, EndPaint, EnumFontFamiliesExW, FillRect, GetDC, LineTo, MoveToEx,
-    Polygon, RedrawWindow, ReleaseDC, RoundRect, SelectObject, GB2312_CHARSET, LOGFONTW,
+    Polygon, RedrawWindow, ReleaseDC, RoundRect, SelectObject, DEFAULT_CHARSET, LOGFONTW,
     PS_SOLID, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY, TEXTMETRICW,
 };
 use windows::core::PCWSTR;
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
+use windows::Win32::UI::Controls::{CB_SETMINVISIBLE, DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -140,6 +140,30 @@ const SUB_BTN_COUNT: usize = SUB_IDS.len();
 const FONT_COMBO_W: i32 = 132;
 /// 字体下拉列表展开后的宽度（逻辑像素）：略宽于控件本身，避免长字体名被截断。
 const FONT_COMBO_DROP_W: i32 = 190;
+/// 文字子工具条的字体候选（显示名 + 系统中可能的字体族名，按需求顺序）。
+/// 只有至少一个别名已安装时才显示该项；配置里保存解析到的实际字体族名。
+const TEXT_FONT_FAMILIES: [(&str, &[&str]); 8] = [
+    (
+        "微软雅黑",
+        &["微软雅黑", "Microsoft YaHei UI", "Microsoft YaHei"],
+    ),
+    ("宋体", &["宋体", "SimSun"]),
+    ("楷体", &["楷体", "KaiTi"]),
+    ("黑体", &["黑体", "SimHei"]),
+    ("新宋体", &["新宋体", "NSimSun"]),
+    (
+        "汉仪中黑",
+        &["汉仪中黑", "汉仪中黑 197", "HYZhongHeiTi-197", "HYZhongHeiJ"],
+    ),
+    (
+        "方正小标宋简体",
+        &["方正小标宋简体", "FZXiaoBiaoSong-B05S", "FZXBSJW"],
+    ),
+    (
+        "方正隶书简体",
+        &["方正隶书简体", "FZLiShu-S01S", "FZLiShu II-S06S", "FZLSJW"],
+    ),
+];
 
 /// 共享子工具条的四类内容；颜色面板是独立窗口，不在此列。
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -234,6 +258,16 @@ fn shortcut_of(id: usize) -> &'static str {
         BTN_WATERMARK => "M",
         BTN_CLOSE => "Esc",
         _ => "",
+    }
+}
+
+/// 提示气泡里显示的快捷键：R/A 只属于子工具条里的「矩形」「箭头」按钮，
+/// 主工具条的「矩形/椭圆」「箭头/线段」入口不显示快捷键说明。
+fn tip_shortcut_text(id: usize, is_main: bool) -> &'static str {
+    if is_main && matches!(id, BTN_RECT | BTN_ARROW) {
+        ""
+    } else {
+        shortcut_of(id)
     }
 }
 /// 悬停后弹出提示气泡的延时（毫秒）
@@ -370,8 +404,8 @@ struct ToolbarData {
     sub_anchor: usize,
     /// 文字子工具条的字体下拉框
     font_combo: HWND,
-    /// 字体下拉框的候选字体族
-    font_names: Vec<String>,
+    /// 字体下拉框每一项对应的实际字体族名（显示名见 [`TEXT_FONT_FAMILIES`]）
+    font_faces: Vec<String>,
     /// 文字子工具条三个开关的当前状态（用于按钮高亮）
     text_bold: bool,
     text_italic: bool,
@@ -456,7 +490,7 @@ unsafe fn run_impl(image: Arc<CapturedImage>, overlay: &Selection) -> Result<()>
         sub_mouse_down: false,
         sub_anchor: 0,
         font_combo: HWND::default(),
-        font_names: Vec::new(),
+        font_faces: Vec::new(),
         text_bold: config::get().text_bold,
         text_italic: config::get().text_italic,
         text_stroke: config::get().text_stroke,
@@ -606,8 +640,40 @@ unsafe fn layout_sub_with(d: &ToolbarData, hwnd: HWND) {
         bx += btn + gap;
     }
     if d.sub_kind == SubKind::Text && !d.font_combo.is_invalid() {
-        let combo_h = btn;
-        let _ = MoveWindow(d.font_combo, bx, by, combo_w, combo_h, BOOL(1));
+        // 下拉列表的展开高度由 combo 窗口高度决定：按候选数量把窗口撑高。
+        // 闭合时 Windows 仍按字体把可见选择框收缩到自然高度，但会保留展开高度。
+        let item_h = SendMessageW(d.font_combo, CB_GETITEMHEIGHT, WPARAM(0), LPARAM(0))
+            .0
+            .max(1) as i32;
+        let rows = d.font_faces.len().max(1) as i32;
+        let drop_h = item_h * rows + s(2);
+        let _ = MoveWindow(
+            d.font_combo,
+            bx,
+            by,
+            combo_w,
+            btn + drop_h,
+            BOOL(1),
+        );
+        // 取系统实际采用的闭合态高度，把字体框与同行按钮的垂直中心对齐
+        let mut rr = RECT::default();
+        let _ = GetWindowRect(d.font_combo, &mut rr);
+        let field_h = (rr.bottom - rr.top).max(1);
+        let combo_y = by + ((btn - field_h) / 2).max(0);
+        let _ = MoveWindow(
+            d.font_combo,
+            bx,
+            combo_y,
+            combo_w,
+            btn + drop_h,
+            BOOL(1),
+        );
+        let _ = SendMessageW(
+            d.font_combo,
+            CB_SETMINVISIBLE,
+            WPARAM(rows.min(10) as usize),
+            LPARAM(0),
+        );
         let _ = ShowWindow(d.font_combo, SW_SHOWNOACTIVATE);
     }
 }
@@ -1768,12 +1834,14 @@ unsafe fn show_tip_for(d: &mut ToolbarData) {
         return;
     }
     // 主工具条锚定按钮用组合提示（如「矩形/椭圆」）；子按钮用单项名称。
-    let label = if GetParent(btn).is_ok_and(|p| p == d.bar) {
+    let is_main = GetParent(btn).is_ok_and(|p| p == d.bar);
+    let label = if is_main {
         main_tip_text(d.tip_for)
     } else {
         tip_text(d.tip_for)
     };
-    d.tip.show(label, shortcut_of(d.tip_for), &r);
+    d.tip
+        .show(label, tip_shortcut_text(d.tip_for, is_main), &r);
     d.tip_shown = true;
 }
 
@@ -1800,9 +1868,9 @@ unsafe extern "system" fn more_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 util::subclass(b, btn_proc);
             }
             // 字体下拉框（文字子工具条专用），初始隐藏
-            let (combo, names) = create_font_combo(hwnd);
+            let (combo, faces) = create_font_combo(hwnd);
             d.font_combo = combo;
-            d.font_names = names;
+            d.font_faces = faces;
             if !d.font_combo.is_invalid() {
                 util::subclass(d.font_combo, combo_proc);
             }
@@ -1887,18 +1955,22 @@ unsafe extern "system" fn more_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 let code = ((wp.0 >> 16) & 0xFFFF) as u32;
                 if id == BTN_TEXT_FONT && code == CBN_SELCHANGE {
                     apply_font_choice(d);
+                    // 子工具条也可能是悬停弹出的（此时主工具条「文字」按钮未被点击），
+                    // 选中字体后同样进入文字标注，避免用户落点却仍是旧工具。
+                    handle_command(d.bar, BTN_TEXT);
                 } else if id == BTN_TEXT_BOLD
                     || id == BTN_TEXT_ITALIC
                     || id == BTN_TEXT_STROKE
                 {
                     toggle_text_style(d, id);
+                    // 悬停弹出时主按钮未点击：点样式按钮也自动进入文字标注
+                    handle_command(d.bar, BTN_TEXT);
+                    // 与其他子工具条一致：点中任一按钮后收起浮层
+                    hide_sub(d);
                 } else if SUB_IDS.contains(&id) {
                     handle_command(d.bar, id);
-                    // 选中子工具条的标注工具后收起浮层（避免遮住画布操作区）；
-                    // 文字样式开关则保持浮层打开，便于连续切换。
-                    if !TEXT_STYLE_ORDER.contains(&id) {
-                        hide_sub(d);
-                    }
+                    // 点中任一子工具条按钮后收起浮层（避免遮住画布操作区）
+                    hide_sub(d);
                 }
             }
             LRESULT(0)
@@ -2117,20 +2189,21 @@ unsafe fn apply_font_choice(d: &mut ToolbarData) {
     if idx < 0 {
         return;
     }
-    let Some(font) = d.font_names.get(idx as usize).cloned() else {
+    let Some(face) = d.font_faces.get(idx as usize).cloned() else {
         return;
     };
-    config::update(|c| c.text_font = font);
+    config::update(|c| c.text_font = face);
     let _ = PostMessageW(d.overlay, WM_APP_ANNOT_DIRTY, WPARAM(0), LPARAM(0));
 }
 
-/// 枚举常见汉字字体（GB2312 字符集）；枚举失败时补充一组 Windows 内置字体。
-unsafe fn chinese_fonts() -> Vec<String> {
+/// 枚举系统已安装的字体族名（需求列表的过滤依据）。
+unsafe fn installed_font_families() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let hdc = GetDC(HWND::default());
     if !hdc.is_invalid() {
         let mut lf: LOGFONTW = std::mem::zeroed();
-        lf.lfCharSet = GB2312_CHARSET;
+        // DEFAULT_CHARSET + 空 FaceName：枚举全部字体族（含中文/英文家族名）
+        lf.lfCharSet = DEFAULT_CHARSET;
         let _ = EnumFontFamiliesExW(
             hdc,
             &lf,
@@ -2140,34 +2213,37 @@ unsafe fn chinese_fonts() -> Vec<String> {
         );
         let _ = ReleaseDC(HWND::default(), hdc);
     }
-    if names.len() < 3 {
-        for f in [
-            "Microsoft YaHei UI",
-            "Microsoft YaHei",
-            "微软雅黑",
-            "宋体",
-            "SimSun",
-            "黑体",
-            "SimHei",
-            "楷体",
-            "KaiTi",
-            "仿宋",
-            "FangSong",
-            "等线",
-            "DengXian",
-            "新宋体",
-            "NSimSun",
-        ] {
-            names.push(f.to_string());
+    names
+}
+
+/// 在已安装字体里按别名解析出实际字体族名（精确匹配优先，再容忍带后缀的家族名）。
+fn resolve_font_face(installed: &[String], aliases: &[&str]) -> Option<String> {
+    for alias in aliases {
+        if let Some(name) = installed.iter().find(|n| n.eq_ignore_ascii_case(alias)) {
+            return Some(name.clone());
         }
     }
-    names.sort_by_key(|s| s.to_lowercase());
-    names.dedup();
-    // 当前配置字体置顶，保证下拉框初始选中项一定在列表里。
-    let current = config::get().text_font;
-    names.retain(|n| *n != current);
-    names.insert(0, current);
-    names
+    for alias in aliases {
+        let lower = alias.to_lowercase();
+        if let Some(name) = installed.iter().find(|n| {
+            let n = n.to_lowercase();
+            n.starts_with(&lower) && !n.contains("light")
+        }) {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+/// 需求字体列表 → 系统中确实可用的（显示名, 实际字体族名），保持需求顺序。
+unsafe fn text_font_choices() -> Vec<(String, String)> {
+    let installed = installed_font_families();
+    TEXT_FONT_FAMILIES
+        .iter()
+        .filter_map(|(label, aliases)| {
+            resolve_font_face(&installed, aliases).map(|face| ((*label).to_string(), face))
+        })
+        .collect()
 }
 
 unsafe extern "system" fn enum_font_proc(
@@ -2215,11 +2291,12 @@ unsafe fn create_font_combo(parent: HWND) -> (HWND, Vec<String>) {
     }
     let font = util::gui_font(parent, 9, 400);
     let _ = SendMessageW(combo, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-    let names = chinese_fonts();
-    let mut selected = 0usize;
+    let choices = text_font_choices();
     let current = config::get().text_font;
-    for name in names.iter() {
-        let w = util::to_wide(name);
+    let mut selected = 0usize;
+    let mut faces = Vec::with_capacity(choices.len());
+    for (i, (label, face)) in choices.iter().enumerate() {
+        let w = util::to_wide(label);
         let idx = SendMessageW(
             combo,
             CB_ADDSTRING,
@@ -2228,12 +2305,24 @@ unsafe fn create_font_combo(parent: HWND) -> (HWND, Vec<String>) {
         )
         .0;
         if idx >= 0 {
-            if *name == current {
-                selected = idx as usize;
-            }
+            faces.push(face.clone());
+        }
+        let aliases = TEXT_FONT_FAMILIES
+            .iter()
+            .find(|(l, _)| *l == label.as_str())
+            .map(|(_, a)| *a)
+            .unwrap_or(&[]);
+        if face.eq_ignore_ascii_case(&current)
+            || label.eq_ignore_ascii_case(&current)
+            || aliases.iter().any(|a| a.eq_ignore_ascii_case(&current))
+        {
+            selected = i;
         }
     }
-    let _ = SendMessageW(combo, CB_SETCURSEL, WPARAM(selected), LPARAM(0));
+    if !faces.is_empty() {
+        let selected = selected.min(faces.len() - 1);
+        let _ = SendMessageW(combo, CB_SETCURSEL, WPARAM(selected), LPARAM(0));
+    }
     let dpi = util::dpi_of(parent);
     let _ = SendMessageW(
         combo,
@@ -2241,7 +2330,7 @@ unsafe fn create_font_combo(parent: HWND) -> (HWND, Vec<String>) {
         WPARAM(util::scaled(FONT_COMBO_DROP_W, dpi).max(1) as usize),
         LPARAM(0),
     );
-    (combo, names)
+    (combo, faces)
 }
 
 /// 字体下拉框子类化：转发 Ctrl+滚轮调整尺寸与快捷键，其余行为走原过程。
@@ -2426,6 +2515,65 @@ mod group_layout {
     #[test]
     fn hover_delay_is_over_one_second() {
         assert!(SUB_SHOW_DELAY_MS > 1000, "悬浮弹出子工具条需超过 1 秒");
+    }
+
+    #[test]
+    fn shortcut_tips_only_on_text_subbar_for_rect_and_arrow() {
+        // 主工具条入口不显示 R/A，子工具条的「矩形」「箭头」仍显示
+        assert_eq!(tip_shortcut_text(BTN_RECT, true), "");
+        assert_eq!(tip_shortcut_text(BTN_ARROW, true), "");
+        assert_eq!(tip_shortcut_text(BTN_RECT, false), "R");
+        assert_eq!(tip_shortcut_text(BTN_ARROW, false), "A");
+        // 其余主工具条按钮的快捷键保持一致
+        assert_eq!(tip_shortcut_text(BTN_STEP, true), "N");
+        assert_eq!(tip_shortcut_text(BTN_TEXT, true), "T");
+    }
+
+    #[test]
+    fn text_font_list_matches_required_order() {
+        assert_eq!(
+            TEXT_FONT_FAMILIES.map(|(label, _)| label),
+            [
+                "微软雅黑",
+                "宋体",
+                "楷体",
+                "黑体",
+                "新宋体",
+                "汉仪中黑",
+                "方正小标宋简体",
+                "方正隶书简体",
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "仅用于人工核对本机实际可用的需求字体"]
+    fn print_installed_text_font_choices() {
+        unsafe {
+            for (label, face) in text_font_choices() {
+                println!("{label} => {face}");
+            }
+        }
+    }
+
+    #[test]
+    fn font_face_resolution_prefers_exact_alias_then_suffix_variant() {
+        let installed = vec![
+            "Microsoft YaHei UI".to_string(),
+            "宋体".to_string(),
+            "汉仪中黑 197".to_string(),
+        ];
+        assert_eq!(
+            resolve_font_face(&installed, &["宋体", "SimSun"]).as_deref(),
+            Some("宋体")
+        );
+        // 「汉仪中黑 197」这类带后缀的家族名也能解析
+        assert_eq!(
+            resolve_font_face(&installed, &["汉仪中黑", "HYZhongHeiJ"]).as_deref(),
+            Some("汉仪中黑 197")
+        );
+        // 系统未安装时返回 None（列表不显示该项）
+        assert_eq!(resolve_font_face(&installed, &["楷体"]), None);
     }
 
     #[test]

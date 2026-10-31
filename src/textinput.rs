@@ -141,6 +141,8 @@ const ALIVE_POLL_MS: u32 = 400;
 /// Edit 通知码 `EN_CHANGE`（WinUser）。
 const EN_CHANGE_CODE: u32 = 0x0300;
 const VK_ESCAPE_K: usize = 0x1B;
+/// VK_RETURN：输入框内回车即确认提交（不再插入换行）。
+const VK_RETURN_K: usize = 0x0D;
 
 /// 子进程窗口状态（`GWLP_USERDATA`）。
 struct Helper {
@@ -201,7 +203,8 @@ unsafe fn run_window(owner: HWND, x: i32, y: i32, font_px: i32) -> i32 {
     let hinst = GetModuleHandleW(None).unwrap_or_default();
 
     let w = (font_px * 14).clamp(200, 720);
-    let h = font_px * 2 + 16;
+    // 单行输入高度（行高 + 上下内边距）；回车已改为确认提交，不再需要两行高度
+    let h = font_px + 20;
 
     let data = Box::into_raw(Box::new(Helper {
         owner,
@@ -347,11 +350,9 @@ unsafe extern "system" fn helper_proc(
             d.bg = CreateSolidBrush(COLORREF(0x00FF_FFFF));
             d.border = CreateSolidBrush(COLORREF(0x0080_8080));
 
-            // ES_MULTILINE(0x4) | ES_AUTOVSCROLL(0x40) | ES_WANTRETURN(0x1000)
-            let edit_style = WINDOW_STYLE(0x0004 | 0x0040 | 0x1000)
-                | WS_CHILD
-                | WS_VISIBLE
-                | WS_VSCROLL;
+            // ES_MULTILINE(0x4) + ES_AUTOVSCROLL(0x40)：保留自动换行与纵向跟随光标，
+            // 但**不加 WS_VSCROLL**（输入框不显示滚动条）；回车由子类过程接管为确认提交。
+            let edit_style = WINDOW_STYLE(0x0004 | 0x0040) | WS_CHILD | WS_VISIBLE;
             let edit = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 windows::core::w!("EDIT"),
@@ -527,7 +528,8 @@ unsafe extern "system" fn edit_subproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 
     if !p.is_null() {
         match msg {
-            WM_KEYDOWN if wp.0 == VK_ESCAPE_K => {
+            WM_KEYDOWN if wp.0 == VK_ESCAPE_K || wp.0 == VK_RETURN_K => {
+                // Esc = 结束输入；Enter = 确认提交（两者都走统一的收尾流程）
                 finish(parent, p);
                 return LRESULT(0);
             }

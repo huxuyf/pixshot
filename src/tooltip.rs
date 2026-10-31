@@ -15,16 +15,18 @@ use crate::theme;
 use crate::util::{self, raw, register_class_w};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, GetDC, GetMonitorInfoW, HDC,
-    MonitorFromRect, ReleaseDC, RoundRect, SelectObject, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    PAINTSTRUCT, PS_SOLID,
+    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC,
+    GetMonitorInfoW, HDC, MonitorFromRect, ReleaseDC, RoundRect, SelectObject, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 气泡窗口类名。
 const CLASS: &str = "PixShotTip";
+/// 分层窗口色键：圆角之外的像素透出桌面（否则未绘制区域会显示黑色）。
+const TIP_KEY: COLORREF = COLORREF(0x00FF_00FF);
 /// 内边距 / 与按钮间距 / 最大宽度（逻辑像素）由配置提供，见 config.ini [ui] 的
 /// tooltip_pad_x / tooltip_pad_y / tooltip_gap / tooltip_max_width。
 fn metrics() -> (i32, i32, i32, i32) {
@@ -88,7 +90,7 @@ impl Tip {
         let hinst =
             windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
             PCWSTR::from_raw(util::to_wide(CLASS).as_ptr()),
             PCWSTR::from_raw(util::to_wide("").as_ptr()),
             WS_POPUP,
@@ -108,6 +110,8 @@ impl Tip {
                 hwnd: HWND::default(),
             };
         }
+        // 圆角之外用色键透明，避免弹出时四角出现黑色底块
+        let _ = SetLayeredWindowAttributes(hwnd, TIP_KEY, 0, LWA_COLORKEY);
         // 与工具条一致：排除出截屏捕获
         let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         Tip { hwnd }
@@ -277,6 +281,10 @@ unsafe fn paint(hwnd: HWND, d: &TipData) {
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut cr = RECT::default();
     let _ = GetClientRect(hwnd, &mut cr);
+    // 先铺色键底：圆角卡片之外的像素透出桌面（否则是上电残留的黑色）
+    let key = CreateSolidBrush(TIP_KEY);
+    FillRect(hdc, &cr, key);
+    let _ = DeleteObject(key);
     paint_card(hwnd, hdc, cr.right, cr.bottom, d);
     let _ = EndPaint(hwnd, &ps);
 }
