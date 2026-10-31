@@ -53,6 +53,14 @@ pub enum Icon {
     Highlight,
     /// 标注：文字。
     Text,
+    /// 标注：对象橡皮。
+    Eraser,
+    /// 标注：水印。
+    Watermark,
+    /// 颜色面板（调色盘）。
+    Palette,
+    /// 「更多」：三个点（展开子工具条）。
+    More,
 }
 
 /// 图标对应的 Lucide 路径数据（24×24 viewBox，`stroke-width: 2`）。
@@ -111,6 +119,27 @@ fn lucide_paths(icon: Icon) -> &'static [&'static str] {
     ];
     // type（文字）
     const TYPE: [&str; 3] = ["M4 7V4h16v3", "M9 20h6", "M12 4v16"];
+    // eraser（对象橡皮）
+    const ERASER: [&str; 3] = [
+        "m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21",
+        "M22 21H7",
+        "m5 11 9 9",
+    ];
+    // watermark（倾斜文字线条，提示语义）
+    const WATERMARK: [&str; 4] = ["M4 6h16", "M8 12h8", "M10 18h4", "M3 3l18 18"];
+    // palette（调色盘 + 三个色点）
+    const PALETTE: [&str; 4] = [
+        "M12 22a10 10 0 1 1 0-20c5.5 0 10 4.5 10 10 0 1.5-1.5 3-3 3h-2.5a2.5 2.5 0 0 0 0 5c0 1.1-.9 2-2 2z",
+        "M7 9a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
+        "M11 5a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
+        "M16 8a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
+    ];
+    // more-horizontal（三个等距圆点）：三点各为一枚 r=1 的整圆
+    const MORE: [&str; 3] = [
+        "M5 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
+        "M12 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
+        "M19 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
+    ];
 
     match icon {
         Icon::Pin => std::slice::from_ref(&PIN),
@@ -127,6 +156,10 @@ fn lucide_paths(icon: Icon) -> &'static [&'static str] {
         Icon::Mosaic => &MOSAIC,
         Icon::Highlight => &HIGHLIGHTER,
         Icon::Text => &TYPE,
+        Icon::Eraser => &ERASER,
+        Icon::Watermark => &WATERMARK,
+        Icon::Palette => &PALETTE,
+        Icon::More => &MORE,
     }
 }
 

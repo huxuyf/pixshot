@@ -18,7 +18,7 @@ pub mod session;
 pub mod shape;
 pub mod style;
 
-pub use controller::{Action, AnnotSession, CursorKind, Tool};
+pub use controller::{Action, AnnotSession, CursorKind, SizeKind, Tool};
 pub use doc::AnnotDoc;
 pub use geometry::{Pt, Rect};
 pub use session::{composite, render_into, BaseSource, DibSurface};

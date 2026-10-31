@@ -18,6 +18,7 @@
 #![windows_subsystem = "windows"]
 
 mod annot;
+mod assist;
 mod autostart;
 mod capture;
 mod clipboard;
@@ -30,8 +31,10 @@ mod imageio;
 mod menu;
 mod ocr;
 mod overlay;
+mod pick;
 mod pin;
 mod rtfimg;
+mod style_panel;
 mod svgpath;
 mod textimg;
 mod textinput;

@@ -532,10 +532,10 @@ pub unsafe fn render_into(
     let env = render_gdiplus::RenderEnv::from_config(&crate::config::get());
     // 拖动/缩放中的提交副本（预览分支另画），以及选中态形状（chrome 分支统一画）：
     // 主循环都跳过——选中形状画两遍会让文字抗锯齿边缘与渐隐笔重复混合变深。
-    let skip = session.render_skip_id();
+    let skip = session.render_skip_ids();
     let attach = session.attach_preview_delta();
     for ann in session.doc.shapes() {
-        if Some(ann.id) == skip {
+        if skip.contains(&ann.id) {
             continue;
         }
         // 挂线文字预览跟随：所挂线段正被拖动时按同一位移画瞬态位置（不落文档）

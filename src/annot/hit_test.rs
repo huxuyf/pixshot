@@ -110,6 +110,8 @@ pub fn hit_shape(shape: &Shape, p: Pt, tol: i32) -> bool {
         Shape::Mosaic { bbox, .. } | Shape::Highlight { bbox, .. } => bbox.inflate(tol).contains(p),
         // 文字按估算 bbox 命中
         Shape::Text { bbox, .. } => bbox.inflate(tol).contains(p),
+        // 水印按覆盖区域命中（全选区）
+        Shape::Watermark { bbox, .. } => bbox.inflate(tol).contains(p),
         Shape::Arrow { from, to, style, .. } => {
             dist_point_segment(p, *from, *to) <= (style.width as f32) / 2.0 + tol as f32
         }
@@ -125,7 +127,10 @@ pub fn hit_shape(shape: &Shape, p: Pt, tol: i32) -> bool {
 
 /// 点是否命中某个控制柄（StepNo / Text 不参与缩放，恒 `None`）。
 pub fn hit_handle(shape: &Shape, p: Pt, tol: i32) -> Option<Handle> {
-    if matches!(shape, Shape::StepNo { .. } | Shape::Text { .. }) {
+    if matches!(
+        shape,
+        Shape::StepNo { .. } | Shape::Text { .. } | Shape::Watermark { .. }
+    ) {
         return None;
     }
     let bbox = shape.bbox();

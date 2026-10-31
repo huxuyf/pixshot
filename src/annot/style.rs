@@ -42,6 +42,40 @@ pub struct TextStyle {
     pub italic: bool,
 }
 
+/// 水印样式（文字水印；参与合成导出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatermarkStyle {
+    /// 旋转角度（-90..90，默认 -30）。
+    pub angle_deg: i32,
+    /// 不透明度（0..255）。
+    pub opacity: u8,
+    /// 是否平铺覆盖整个选区。
+    pub tile: bool,
+    /// 平铺间距（逻辑像素）。
+    pub gap: i32,
+}
+
+impl Default for WatermarkStyle {
+    fn default() -> Self {
+        Self {
+            angle_deg: -30,
+            opacity: 64,
+            tile: true,
+            gap: 240,
+        }
+    }
+}
+
+impl WatermarkStyle {
+    /// 角度/透明度/间距钳制（配置与颜色面板的脏值都被收敛到合法范围）。
+    pub fn clamped(mut self, dpi: i32) -> Self {
+        self.angle_deg = self.angle_deg.clamp(-90, 90);
+        self.opacity = self.opacity.min(255);
+        self.gap = crate::util::scaled(self.gap, dpi).max(80);
+        self
+    }
+}
+
 /// 画笔形态（自由绘制）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PenKind {
@@ -221,6 +255,16 @@ pub struct AnnotPrefs {
     pub arrow_len_min: i32,
     /// 箭头头部长度上限（逻辑像素）。
     pub arrow_len_max: i32,
+    /// 橡皮擦除命中容差（逻辑像素）。
+    pub eraser_tol: i32,
+    /// 水印默认角度（-90..90）。
+    pub watermark_angle: i32,
+    /// 水印默认透明度（0..255）。
+    pub watermark_opacity: u8,
+    /// 水印默认平铺。
+    pub watermark_tile: bool,
+    /// 水印平铺间距（逻辑像素）。
+    pub watermark_gap: i32,
 }
 
 impl Default for AnnotPrefs {
@@ -253,6 +297,11 @@ impl Default for AnnotPrefs {
             arrow_width_ratio: 3.5,
             arrow_len_min: 12,
             arrow_len_max: 48,
+            eraser_tol: 6,
+            watermark_angle: -30,
+            watermark_opacity: 64,
+            watermark_tile: true,
+            watermark_gap: 240,
         }
     }
 }

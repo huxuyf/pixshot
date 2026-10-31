@@ -1,7 +1,8 @@
 //! 贴图窗口：置顶无边框显示截图，图像四周带柔和投影。
 //!
-//! 支持：拖动（按住左键）、滚轮缩放（以光标为锚点）、双击关闭、
-//! 右键菜单（复制图像 / 保存（按配置格式）/ OCR / 重置缩放 / 关闭）、Esc 关闭。
+//! 支持：拖动（按住左键 / 边缘热区缩放）、普通滚轮缩放（以光标为锚点）、
+//! `Ctrl+滚轮` 调整透明度、双击关闭、右键菜单（复制 / 保存 / OCR / 重置缩放 /
+//! 锁定 / 置顶 / 阴影 / 关闭）、Esc 关闭。
 //!
 //! 窗口采用 `WS_EX_LAYERED` + `UpdateLayeredWindow`（逐像素 alpha）：窗口比图像
 //! 四周各多出一圈留白（`pin_shadow_margin`），留白内自绘柔和投影，投影之外
@@ -26,7 +27,7 @@ use crate::imageio;
 use crate::menu::{self, Item};
 use crate::ocr;
 use crate::theme;
-use crate::util::{error_msgbox, register_class_w, to_wide};
+use crate::util::{self, error_msgbox, register_class_w, to_wide};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
@@ -40,13 +41,67 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_RBUTTON,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const VK_ESCAPE: usize = 0x1B;
 
+// 右键菜单 ID（自绘菜单返回下标，这里仅用于常量可读性）
+const MENU_COPY: usize = 0;
+const MENU_SAVE: usize = 1;
+const MENU_OCR: usize = 2;
+const MENU_RESET_ZOOM: usize = 3;
+const MENU_LOCK: usize = 4;
+const MENU_TOPMOST: usize = 5;
+const MENU_SHADOW: usize = 6;
+const MENU_CLOSE: usize = 7;
+
 // 贴图缩放上下限、阴影留白/峰值、滚轮步进、初始贴合比例均由配置提供
 // （见 config.ini [pin]）。
+
+/// 贴图边缘（用于缩放热区）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinEdge {
+    N,
+    E,
+    S,
+    W,
+    NE,
+    NW,
+    SE,
+    SW,
+}
+
+impl PinEdge {
+    fn has_west(self) -> bool {
+        matches!(self, Self::W | Self::NW | Self::SW)
+    }
+    fn has_east(self) -> bool {
+        matches!(self, Self::E | Self::NE | Self::SE)
+    }
+    fn has_north(self) -> bool {
+        matches!(self, Self::N | Self::NE | Self::NW)
+    }
+    fn has_south(self) -> bool {
+        matches!(self, Self::S | Self::SE | Self::SW)
+    }
+}
+
+/// 贴图交互状态。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PinInteraction {
+    None,
+    #[allow(dead_code)]
+    Moving,
+    Resizing {
+        edge: PinEdge,
+        start_cursor: POINT,
+        start_rect: RECT,
+        start_scale: f32,
+    },
+}
 
 /// 每个贴图窗口的私有数据（指针存在 GWLP_USERDATA，WM_DESTROY 时释放）。
 pub struct PinData {
@@ -60,6 +115,141 @@ pub struct PinData {
     /// 外框矩形缓存（zoom/菜单等高频路径，避免重复 GetWindowRect 内核调用）
     pub rect: RECT,
     pub rect_valid: bool,
+    /// 不透明度（10..255）。
+    pub opacity: u8,
+    /// 锁定位置：不能拖动/缩放，但仍可右键菜单/Esc 关闭。
+    pub locked: bool,
+    /// 置顶。
+    pub topmost: bool,
+    /// 阴影（关闭后 margin=0，窗口收缩）。
+    pub shadow: bool,
+    /// 窗口 DPI（边缘热区/留白换算）。
+    pub dpi: i32,
+    /// 当前拖动/缩放交互。
+    pub interaction: PinInteraction,
+}
+
+/// 最低不透明度：10%（alpha 26/255）。
+const MIN_OPACITY_ALPHA: u8 = 26;
+
+fn clamp_opacity(v: u8) -> u8 {
+    v.max(MIN_OPACITY_ALPHA)
+}
+
+/// 边缘缩放：根据鼠标位移与起始矩形计算新 scale / 新窗口矩形（纯函数，可单测）。
+#[allow(clippy::too_many_arguments)]
+pub fn resize_geometry(
+    start_rect: RECT,
+    img_w: i32,
+    img_h: i32,
+    margin: i32,
+    edge: PinEdge,
+    dx: i32,
+    dy: i32,
+    min_scale: f32,
+    max_scale: f32,
+    min_px: i32,
+) -> (f32, RECT) {
+    let m = margin.max(0);
+    let start_img_w = (start_rect.right - start_rect.left - m * 2).max(1);
+    let start_img_h = (start_rect.bottom - start_rect.top - m * 2).max(1);
+    let min_px = min_px.max(1);
+    let lo = min_scale
+        .max(min_px as f32 / img_w.max(1) as f32)
+        .max(min_px as f32 / img_h.max(1) as f32)
+        .max(0.01);
+    let hi = max_scale.max(lo);
+
+    let h_changed = edge.has_east() || edge.has_west();
+    let v_changed = edge.has_north() || edge.has_south();
+    let raw_w = if edge.has_east() {
+        start_img_w + dx
+    } else if edge.has_west() {
+        start_img_w - dx
+    } else {
+        start_img_w
+    }
+    .max(1);
+    let raw_h = if edge.has_south() {
+        start_img_h + dy
+    } else if edge.has_north() {
+        start_img_h - dy
+    } else {
+        start_img_h
+    }
+    .max(1);
+
+    let scale = if h_changed && v_changed {
+        // 角柄：取 x/y 两个 scale 的较小值以保持宽高比
+        (raw_w as f32 / img_w.max(1) as f32)
+            .min(raw_h as f32 / img_h.max(1) as f32)
+    } else if h_changed {
+        raw_w as f32 / img_w.max(1) as f32
+    } else if v_changed {
+        raw_h as f32 / img_h.max(1) as f32
+    } else {
+        start_img_w as f32 / img_w.max(1) as f32
+    }
+    .clamp(lo, hi);
+
+    let new_img_w = ((img_w.max(1) as f32) * scale).round() as i32;
+    let new_img_h = ((img_h.max(1) as f32) * scale).round() as i32;
+    let win_w = new_img_w.max(1) + m * 2;
+    let win_h = new_img_h.max(1) + m * 2;
+
+    let left = if edge.has_west() {
+        start_rect.right - win_w
+    } else {
+        start_rect.left
+    };
+    let top = if edge.has_north() {
+        start_rect.bottom - win_h
+    } else {
+        start_rect.top
+    };
+    (
+        scale,
+        RECT {
+            left,
+            top,
+            right: left + win_w,
+            bottom: top + win_h,
+        },
+    )
+}
+
+/// 边缘命中（设备像素）。返回 None 表示不在缩放热区。
+unsafe fn hit_edge(d: &PinData, screen_x: i32, screen_y: i32, hwnd: HWND) -> Option<PinEdge> {
+    let m = d.margin.max(0);
+    let r = if d.rect_valid {
+        d.rect
+    } else {
+        let mut rr = RECT::default();
+        if GetWindowRect(hwnd, &mut rr).is_err() {
+            return None;
+        }
+        rr
+    };
+    let zone = util::scaled(crate::config::get().pin_edge_hit, d.dpi).clamp(3, 24);
+    let (ix0, iy0, ix1, iy1) = (r.left + m, r.top + m, r.right - m, r.bottom - m);
+    if screen_x < ix0 || screen_x >= ix1 || screen_y < iy0 || screen_y >= iy1 {
+        return None;
+    }
+    let west = screen_x < ix0 + zone;
+    let east = screen_x >= ix1 - zone;
+    let north = screen_y < iy0 + zone;
+    let south = screen_y >= iy1 - zone;
+    match (north, south, west, east) {
+        (true, _, true, _) => Some(PinEdge::NW),
+        (true, _, _, true) => Some(PinEdge::NE),
+        (_, true, true, _) => Some(PinEdge::SW),
+        (_, true, _, true) => Some(PinEdge::SE),
+        (true, _, _, _) => Some(PinEdge::N),
+        (_, true, _, _) => Some(PinEdge::S),
+        (_, _, true, _) => Some(PinEdge::W),
+        (_, _, _, true) => Some(PinEdge::E),
+        _ => None,
+    }
 }
 
 /// 逻辑留白 → 设备像素（钳制，避免极端 DPI 下留白过大/过小）。
@@ -104,7 +294,13 @@ unsafe fn create_impl(img: &CapturedImage) -> Result<HWND> {
         .min(sh as f32 * cfg.pin_fit_ratio / img.height as f32)
         .min(1.0)
         .max(cfg.pin_min_scale);
-    let margin = margin_for_dpi(monitor_dpi_at(img.x, img.y));
+    let dpi = monitor_dpi_at(img.x, img.y) as i32;
+    let margin = if cfg.pin_shadow {
+        margin_for_dpi(dpi as u32)
+    } else {
+        0
+    };
+    let topmost = cfg.pin_topmost;
 
     let data = Box::into_raw(Box::new(PinData {
         image: img.data.clone(), // Arc 克隆，不复制像素
@@ -114,6 +310,12 @@ unsafe fn create_impl(img: &CapturedImage) -> Result<HWND> {
         margin,
         rect: RECT::default(),
         rect_valid: false,
+        opacity: clamp_opacity(cfg.pin_opacity),
+        locked: cfg.pin_locked,
+        topmost,
+        shadow: cfg.pin_shadow,
+        dpi,
+        interaction: PinInteraction::None,
     }));
 
     // 一次创建即给出最终几何：避免窗口先以 1×1 出现被外部（E2E）读到中间态。
@@ -131,8 +333,11 @@ unsafe fn create_impl(img: &CapturedImage) -> Result<HWND> {
     };
     d.rect_valid = true;
 
+    let ex = WS_EX_LAYERED
+        | WS_EX_TOOLWINDOW
+        | if topmost { WS_EX_TOPMOST } else { WINDOW_EX_STYLE(0) };
     let hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        ex,
         PCWSTR::from_raw(to_wide("PixShotPin").as_ptr()),
         PCWSTR::null(),
         // WS_POPUP 且不带 WS_VISIBLE：先把分层位图推上去再显示，避免首帧空白。
@@ -158,7 +363,9 @@ unsafe fn create_impl(img: &CapturedImage) -> Result<HWND> {
 
     unsafe {
         render(hwnd);
-        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        if topmost {
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        }
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         // Fluent：保持直角（贴图是图像内容，圆角会裁掉像素）
         theme::frame_pin(hwnd);
@@ -217,17 +424,14 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
 
-        // 投影留白区（图像之外）不接收鼠标：交还给下层窗口，同时避免从阴影上误拖动
+        // 投影留白区（图像之外）不接收鼠标；图像区按 锁定/边缘热区 区分拖动与缩放。
         WM_NCHITTEST => {
             let x = (lp.0 & 0xFFFF) as u16 as i16 as i32;
             let y = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-            let (m, cached) = data_of(hwnd)
-                .map(|d| (d.margin, d.rect_valid.then_some(d.rect)))
-                .unwrap_or((0, None));
-            if m <= 0 {
-                return LRESULT(HTCLIENT as isize);
-            }
-            // 高频路径优先用 WM_WINDOWPOSCHANGED 缓存的矩形，避免每次 GetWindowRect
+            let (m, cached, locked) = data_of(hwnd)
+                .map(|d| (d.margin, d.rect_valid.then_some(d.rect), d.locked))
+                .unwrap_or((0, None, false));
+            // 无阴影（margin=0）时整个客户区都是图像
             let r = match cached {
                 Some(r) => r,
                 None => {
@@ -239,29 +443,147 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
             };
             let in_image = x >= r.left + m && x < r.right - m && y >= r.top + m && y < r.bottom - m;
-            if in_image {
-                LRESULT(HTCLIENT as isize)
-            } else {
-                LRESULT(HTTRANSPARENT as isize)
+            if !in_image {
+                return LRESULT(HTTRANSPARENT as isize);
             }
+            if locked {
+                return LRESULT(HTCLIENT as isize);
+            }
+            if data_of(hwnd)
+                .and_then(|d| hit_edge(d, x, y, hwnd))
+                .is_some()
+            {
+                return LRESULT(HTCLIENT as isize);
+            }
+            // 右键保持 HTCLIENT：否则命中标题栏会走系统菜单，收不到 WM_CONTEXTMENU。
+            if (GetKeyState(VK_RBUTTON.0 as i32) as u16) & 0x8000 != 0 {
+                return LRESULT(HTCLIENT as isize);
+            }
+            LRESULT(HTCAPTION as isize)
         }
 
-        // 按住左键拖动：伪造标题栏按下，交给系统移动
+        // 按住左键：边缘热区 → 自实现缩放；图像正文 → 交给系统拖动（保留吸附）。
         WM_LBUTTONDOWN => {
-            let _ = ReleaseCapture();
-            SendMessageW(hwnd, WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
+            let mut start_resize: Option<PinInteraction> = None;
+            if let Some(d) = data_of(hwnd) {
+                if d.locked {
+                    return LRESULT(0);
+                }
+                let pt = {
+                    let mut p = POINT::default();
+                    if GetCursorPos(&mut p).is_err() {
+                        return LRESULT(0);
+                    }
+                    p
+                };
+                if let Some(edge) = hit_edge(d, pt.x, pt.y, hwnd) {
+                    let r = if d.rect_valid {
+                        d.rect
+                    } else {
+                        let mut rr = RECT::default();
+                        if GetWindowRect(hwnd, &mut rr).is_err() {
+                            return LRESULT(0);
+                        }
+                        rr
+                    };
+                    start_resize = Some(PinInteraction::Resizing {
+                        edge,
+                        start_cursor: pt,
+                        start_rect: r,
+                        start_scale: d.scale,
+                    });
+                }
+            }
+            if let Some(inter) = start_resize {
+                if let Some(d) = data_of(hwnd) {
+                    d.interaction = inter;
+                }
+                SetCapture(hwnd);
+            } else {
+                let _ = ReleaseCapture();
+                SendMessageW(hwnd, WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
+            }
+            LRESULT(0)
+        }
+
+        // 缩放拖动：按起始矩形 + 光标位移重算 scale/窗口矩形。
+        WM_MOUSEMOVE => {
+            let Some(d) = data_of(hwnd) else {
+                return LRESULT(0);
+            };
+            if let PinInteraction::Resizing {
+                edge,
+                start_cursor,
+                start_rect,
+                ..
+            } = d.interaction
+            {
+                let mut pt = POINT::default();
+                if GetCursorPos(&mut pt).is_err() {
+                    return LRESULT(0);
+                }
+                let cfg = crate::config::get();
+                let (scale, rc) = resize_geometry(
+                    start_rect,
+                    d.img_w,
+                    d.img_h,
+                    d.margin,
+                    edge,
+                    pt.x - start_cursor.x,
+                    pt.y - start_cursor.y,
+                    cfg.pin_min_scale,
+                    cfg.pin_max_scale,
+                    util::scaled(cfg.pin_min_visible_px, d.dpi).max(8),
+                );
+                d.scale = scale;
+                d.rect = rc;
+                d.rect_valid = true;
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    rc.left,
+                    rc.top,
+                    rc.right - rc.left,
+                    rc.bottom - rc.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                render(hwnd);
+            }
+            LRESULT(0)
+        }
+
+        WM_LBUTTONUP => {
+            if let Some(d) = data_of(hwnd) {
+                if matches!(d.interaction, PinInteraction::Resizing { .. }) {
+                    let _ = ReleaseCapture();
+                    d.interaction = PinInteraction::None;
+                }
+            }
             LRESULT(0)
         }
 
         // 双击左键：退出（关闭）该贴图。依赖窗口类的 CS_DBLCLKS 样式。
         WM_LBUTTONDBLCLK => {
-            crate::diag::log("[pin] 双击左键 -> 关闭贴图");
+            crate::diag::log("[pin] 双击左键(客户区) -> 关闭贴图");
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+
+        // 图像正文走 HTCAPTION 以便保留系统拖动；因此双击会以**非客户区**双击到达，
+        // 必须单独处理，否则双击关闭贴图会失效（DefWindowProc 还可能误最大化）。
+        WM_NCLBUTTONDBLCLK => {
+            crate::diag::log("[pin] 双击左键(标题区/图像正文) -> 关闭贴图");
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
 
         WM_MOUSEWHEEL => {
-            zoom(hwnd, wp);
+            // Ctrl+滚轮 = 调整透明度；普通滚轮 = 缩放（保持既有交互）
+            if ctrl_down() {
+                wheel_opacity(hwnd, wp);
+            } else {
+                zoom(hwnd, wp);
+            }
             LRESULT(0)
         }
 
@@ -290,9 +612,35 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+unsafe fn ctrl_down() -> bool {
+    (GetKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 != 0
+}
+
+/// Ctrl+滚轮：按配置档位调整透明度（上滚更不透明、下滚更透明）。
+unsafe fn wheel_opacity(hwnd: HWND, wp: WPARAM) {
+    let Some(data) = data_of(hwnd) else { return };
+    let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+    if delta == 0 {
+        return;
+    }
+    let next = bump_opacity(data, delta > 0);
+    if next == data.opacity {
+        return;
+    }
+    set_opacity(hwnd, data, next);
+    crate::toast::show(&format!("透明度 {}%", opacity_percent(next)));
+    crate::diag::log(&format!(
+        "[pin] Ctrl+Wheel opacity -> {}%",
+        opacity_percent(next)
+    ));
+}
+
 /// 滚轮缩放：以光标为锚点，保持光标下的图像位置不变。
 unsafe fn zoom(hwnd: HWND, wp: WPARAM) {
     let Some(data) = data_of(hwnd) else { return };
+    if data.locked {
+        return;
+    }
     let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
     if delta == 0 {
         return;
@@ -424,7 +772,7 @@ unsafe fn render(hwnd: HWND) {
     let blend = BLENDFUNCTION {
         BlendOp: AC_SRC_OVER as u8,
         BlendFlags: 0,
-        SourceConstantAlpha: 255,
+        SourceConstantAlpha: data.opacity,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
     let _ = UpdateLayeredWindow(
@@ -579,8 +927,83 @@ unsafe fn draw_image(
     let _ = DeleteDC(sdc);
 }
 
+/// 透明度百分比（用于菜单文案）。
+fn opacity_percent(v: u8) -> u8 {
+    ((v as u16 * 100 + 127) / 255) as u8
+}
+
+fn opacity_from_percent(p: u8) -> u8 {
+    ((((p as u16 * 255) + 50) / 100) as u8).clamp(MIN_OPACITY_ALPHA, 255)
+}
+
+unsafe fn set_opacity(hwnd: HWND, d: &mut PinData, opacity: u8) {
+    d.opacity = clamp_opacity(opacity);
+    render(hwnd);
+}
+
+/// 开关阴影：重算 margin、按"图像左上角不动"修正窗口位置，窗口尺寸立即收缩/恢复。
+unsafe fn set_shadow(hwnd: HWND, d: &mut PinData, on: bool) {
+    let old_m = d.margin.max(0);
+    let r = if d.rect_valid {
+        d.rect
+    } else {
+        let mut rr = RECT::default();
+        if GetWindowRect(hwnd, &mut rr).is_err() {
+            return;
+        }
+        rr
+    };
+    let img_left = r.left + old_m;
+    let img_top = r.top + old_m;
+    let new_m = if on { margin_for_dpi(d.dpi as u32) } else { 0 };
+    let (iw, ih) = scaled_size(d, d.scale);
+    let x = img_left - new_m;
+    let y = img_top - new_m;
+    let cw = iw + new_m * 2;
+    let ch = ih + new_m * 2;
+    d.margin = new_m;
+    d.shadow = on;
+    d.rect = RECT {
+        left: x,
+        top: y,
+        right: x + cw,
+        bottom: y + ch,
+    };
+    d.rect_valid = true;
+    let _ = SetWindowPos(
+        hwnd,
+        HWND::default(),
+        x,
+        y,
+        cw,
+        ch,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    render(hwnd);
+}
+
+unsafe fn set_topmost(hwnd: HWND, d: &mut PinData, on: bool) {
+    d.topmost = on;
+    let insert = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    let _ = SetWindowPos(hwnd, insert, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+/// 按 1% 步长调整透明度：`up=true` 更不透明，`false` 更透明（不循环）。
+fn bump_opacity(d: &PinData, up: bool) -> u8 {
+    let cur = opacity_percent(d.opacity) as i32;
+    let next = if up {
+        (cur + 1).min(100)
+    } else {
+        (cur - 1).max(10)
+    };
+    opacity_from_percent(next as u8)
+}
+
 unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
     let cfg = config::get();
+    let (locked, topmost, shadow) = data_of(hwnd)
+        .map(|d| (d.locked, d.topmost, d.shadow))
+        .unwrap_or((false, true, true));
 
     // 快捷键与工具条保持一致（Ctrl+C 复制 / Ctrl+S 保存 / Ctrl+O OCR）
     let items = [
@@ -588,6 +1011,9 @@ unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
         Item::accel(format!("保存为 {}…", cfg.format.label()), "Ctrl+S"),
         Item::accel("识别文字 (OCR)", "Ctrl+O"),
         Item::sep("重置缩放 (100%)"),
+        Item::new(if locked { "解锁位置" } else { "锁定位置" }),
+        Item::new(if topmost { "取消置顶" } else { "保持置顶" }),
+        Item::new(if shadow { "隐藏阴影" } else { "显示阴影" }),
         Item::sep("关闭贴图 (Esc)"),
     ];
 
@@ -608,11 +1034,11 @@ unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
     let Some(data) = data_of(hwnd) else { return };
     let img: &[u8] = &data.image;
     match choice {
-        0 => match clipboard::copy_image(img, data.img_w, data.img_h) {
+        MENU_COPY => match clipboard::copy_image(img, data.img_w, data.img_h) {
             Ok(()) => crate::toast::show("已复制图像到剪贴板"),
             Err(e) => error_msgbox(&format!("复制失败：{e}")),
         },
-        1 => match imageio::save_with_dialog(
+        MENU_SAVE => match imageio::save_with_dialog(
             hwnd,
             img,
             data.img_w,
@@ -624,10 +1050,8 @@ unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
             Ok(None) => {}
             Err(e) => error_msgbox(&format!("保存失败：{e}")),
         },
-        // OCR：与工具条「复制识别到的文字」完全一致 —— 后台识别 → 写入剪贴板 →
-        // 主窗口弹 Toast，**不弹出结果窗口**（见 ocr::recognize_to_clipboard_async）。
-        2 => ocr::recognize_to_clipboard_async(data.image.clone(), data.img_w, data.img_h),
-        3 => {
+        MENU_OCR => ocr::recognize_to_clipboard_async(data.image.clone(), data.img_w, data.img_h),
+        MENU_RESET_ZOOM => {
             // 重置缩放：图像左上角保持不动（窗口位置不变，只改尺寸）
             data.scale = 1.0;
             let (iw, ih) = scaled_size(data, 1.0);
@@ -646,7 +1070,17 @@ unsafe fn context_menu(hwnd: HWND, lp: LPARAM) {
             }
             render(hwnd);
         }
-        4 => {
+        MENU_LOCK => {
+            data.locked = !data.locked;
+            crate::toast::show(if data.locked {
+                "已锁定贴图位置"
+            } else {
+                "已解锁贴图位置"
+            });
+        }
+        MENU_TOPMOST => set_topmost(hwnd, data, !topmost),
+        MENU_SHADOW => set_shadow(hwnd, data, !shadow),
+        MENU_CLOSE => {
             let _ = DestroyWindow(hwnd);
         }
         _ => {}
@@ -719,5 +1153,167 @@ mod tests {
         assert!(alpha(1.0) < alpha(0.0));
         assert!(alpha(8.0) < alpha(1.0));
         assert_eq!(alpha(16.0), 0, "留白外缘必须完全透明");
+    }
+
+    fn start_rect() -> RECT {
+        RECT {
+            left: 100,
+            top: 100,
+            right: 100 + 200 + 32,
+            bottom: 100 + 100 + 32,
+        }
+    }
+
+    #[test]
+    fn resize_east_keeps_left_and_grows_width() {
+        let (scale, r) = resize_geometry(
+            start_rect(),
+            200,
+            100,
+            16,
+            PinEdge::E,
+            60,
+            0,
+            0.05,
+            8.0,
+            24,
+        );
+        assert_eq!(r.left, 100);
+        assert_eq!(r.right - r.left, 260 + 32);
+        assert!((scale - 260.0 / 200.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn resize_west_keeps_right() {
+        let (_, r) = resize_geometry(
+            start_rect(),
+            200,
+            100,
+            16,
+            PinEdge::W,
+            40,
+            0,
+            0.05,
+            8.0,
+            24,
+        );
+        assert_eq!(r.right, 100 + 200 + 32);
+        assert_eq!(r.right - r.left, 160 + 32);
+        assert!(r.left > 100);
+    }
+
+    #[test]
+    fn corner_resize_keeps_aspect_ratio() {
+        let (scale, r) = resize_geometry(
+            start_rect(),
+            200,
+            100,
+            16,
+            PinEdge::SE,
+            80,
+            20,
+            0.05,
+            8.0,
+            24,
+        );
+        let iw = r.right - r.left - 32;
+        let ih = r.bottom - r.top - 32;
+        assert!((iw as f32 / ih as f32 - 2.0).abs() < 0.02, "宽高比应保持");
+        assert!(scale > 1.0);
+        assert_eq!((r.left, r.top), (100, 100));
+    }
+
+    #[test]
+    fn resize_clamps_min_and_max() {
+        let (s, r) = resize_geometry(
+            start_rect(),
+            200,
+            100,
+            16,
+            PinEdge::E,
+            -1000,
+            0,
+            0.05,
+            8.0,
+            24,
+        );
+        assert!(r.right - r.left >= 24 + 32, "不小于 min_px");
+        assert!((s - 24.0f32.max(0.05 * 200.0) / 200.0).abs() < 1e-3 || s >= 0.05);
+        let (s, _) = resize_geometry(
+            start_rect(),
+            200,
+            100,
+            16,
+            PinEdge::E,
+            100000,
+            0,
+            0.05,
+            8.0,
+            24,
+        );
+        assert!(s <= 8.0, "不得超过 max_scale");
+    }
+
+    #[test]
+    fn resize_without_margin_equals_image_size() {
+        let (_, r) = resize_geometry(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 200,
+                bottom: 100,
+            },
+            200,
+            100,
+            0,
+            PinEdge::E,
+            50,
+            0,
+            0.05,
+            8.0,
+            24,
+        );
+        assert_eq!(r.right - r.left, 250);
+        assert_eq!(r.bottom - r.top, 125, "无留白时高宽按比例同步");
+    }
+
+    #[test]
+    fn opacity_clamp_and_cycle() {
+        assert_eq!(clamp_opacity(0), 26, "最低 10%");
+        assert_eq!(clamp_opacity(255), 255);
+        assert_eq!(opacity_percent(255), 100);
+        assert_eq!(opacity_percent(128), 50);
+        assert_eq!(opacity_from_percent(50), 128);
+        assert_eq!(opacity_from_percent(0), 26, "低于 10% 钳到 10%");
+        assert_eq!(opacity_from_percent(10), 26);
+    }
+
+    #[test]
+    fn opacity_wheel_steps() {
+        let data = |op: u8| PinData {
+            image: Arc::from(vec![0u8; 4]),
+            img_w: 1,
+            img_h: 1,
+            scale: 1.0,
+            margin: 0,
+            rect: RECT::default(),
+            rect_valid: false,
+            opacity: op,
+            locked: false,
+            topmost: true,
+            shadow: false,
+            dpi: 96,
+            interaction: PinInteraction::None,
+        };
+        // 1% 步长：上滚更不透明，下滚更透明
+        assert_eq!(opacity_percent(bump_opacity(&data(229), false)), 89);
+        assert_eq!(opacity_percent(bump_opacity(&data(229), true)), 91);
+        // 到边界保持当前值，不循环
+        assert_eq!(opacity_percent(bump_opacity(&data(255), true)), 100);
+        assert_eq!(opacity_percent(bump_opacity(&data(128), false)), 49);
+        assert_eq!(opacity_percent(bump_opacity(&data(128), true)), 51);
+        // 最低 10%
+        assert_eq!(opacity_percent(bump_opacity(&data(26), false)), 10);
+        assert_eq!(bump_opacity(&data(26), false), 26);
     }
 }

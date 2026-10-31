@@ -29,6 +29,8 @@ pub enum Command {
     DeleteGroup { items: Vec<(usize, Annotation)> },
     /// 几何变换：记旧/新形状（不做增量 delta）。可含多个形状以合并成一步。
     Transform { changes: Vec<ShapeChange> },
+    /// 只替换形状本身，**不触发** attach 重排/解绑逻辑（颜色面板用）。
+    Restyle { id: u64, old: Shape, new: Shape },
 }
 
 /// 标注文档。
@@ -163,6 +165,88 @@ impl AnnotDoc {
         dirty
     }
 
+    /// 修改样式：保留 Text/Watermark 的 `attach` 与 `origin`，仅替换样式相关字段
+    ///（由调用方保证"克隆原形状后只改样式"）。返回新旧包围盒的并集（脏区）。
+    ///
+    /// **禁止**用 [`transform`](Self::transform) 改样式：它会解除文字挂线。
+    pub fn restyle(&mut self, id: u64, new: Shape) -> Option<Rect> {
+        let i = self.index_of(id)?;
+        let old = self.shapes[i].shape.clone();
+        debug_assert_eq!(
+            std::mem::discriminant(&old),
+            std::mem::discriminant(&new),
+            "restyle 只允许同类型替换（调用方 bug）"
+        );
+        let dirty = rect_union(old.bbox(), new.bbox());
+        self.shapes[i].shape = new.clone();
+        self.push_undo(Command::Restyle { id, old, new });
+        Some(dirty)
+    }
+
+    /// 批量删除：自动去重、自动连带删除挂在被删形状上的文字。
+    /// 一次调用 = 一条撤销记录。
+    pub fn delete_many(&mut self, ids: &[u64]) -> Option<Rect> {
+        // 去重 + 限定存在的 id
+        let mut uniq: Vec<u64> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.index_of(*id).is_some() && !uniq.contains(id) {
+                uniq.push(*id);
+            }
+        }
+        if uniq.is_empty() {
+            return None;
+        }
+        // 连带挂线文字
+        let mut targets = uniq.clone();
+        for a in &self.shapes {
+            if let Shape::Text { attach: Some(x), .. } = &a.shape {
+                if uniq.contains(x) && !targets.contains(&a.id) {
+                    targets.push(a.id);
+                }
+            }
+        }
+        let mut items: Vec<(usize, Annotation)> = targets
+            .iter()
+            .filter_map(|t| self.index_of(*t).map(|i| (i, self.shapes[i].clone())))
+            .collect();
+        items.sort_by_key(|(i, _)| *i);
+        if items.is_empty() {
+            return None;
+        }
+        let mut dirty: Option<Rect> = None;
+        for (_, ann) in &items {
+            dirty = Some(match dirty {
+                Some(prev) => rect_union(prev, ann.shape.bbox()),
+                None => ann.shape.bbox(),
+            });
+        }
+        for (index, _) in items.iter().rev() {
+            if *index < self.shapes.len() {
+                self.shapes.remove(*index);
+            }
+        }
+        self.push_undo(Command::DeleteGroup { items });
+        dirty
+    }
+
+    /// 清空全部标注（一条撤销记录）；空文档返回 `None`，不产生撤销记录。
+    pub fn clear_all(&mut self) -> Option<Rect> {
+        if self.shapes.is_empty() {
+            return None;
+        }
+        let items: Vec<(usize, Annotation)> = self.shapes.iter().cloned().enumerate().collect();
+        let mut dirty: Option<Rect> = None;
+        for (_, ann) in &items {
+            dirty = Some(match dirty {
+                Some(prev) => rect_union(prev, ann.shape.bbox()),
+                None => ann.shape.bbox(),
+            });
+        }
+        self.shapes.clear();
+        self.push_undo(Command::DeleteGroup { items });
+        dirty
+    }
+
     /// 几何变换（移动/缩放）；`old` 为变换前的形状。返回新旧包围盒的并集（脏区）。
     ///
     /// 挂线联动：变换线段/箭头时，挂在其上的文字重新居中到新中点（合并为同一步）；
@@ -274,6 +358,12 @@ impl AnnotDoc {
                 }
                 dirty.unwrap_or(Rect::new(0, 0, 0, 0))
             }
+            Command::Restyle { id, old, new } => {
+                if let Some(i) = self.index_of(*id) {
+                    self.shapes[i].shape = old.clone();
+                }
+                rect_union(old.bbox(), new.bbox())
+            }
         }
     }
 
@@ -311,6 +401,12 @@ impl AnnotDoc {
                     });
                 }
                 dirty.unwrap_or(Rect::new(0, 0, 0, 0))
+            }
+            Command::Restyle { id, old, new } => {
+                if let Some(i) = self.index_of(*id) {
+                    self.shapes[i].shape = new.clone();
+                }
+                rect_union(old.bbox(), new.bbox())
             }
         }
     }
@@ -353,8 +449,7 @@ fn center_text_on(shape: Shape, c: Pt) -> Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::style::{DEF_BADGE, DEF_STROKE};
-    use super::super::style::StrokeStyle;
+    use super::super::style::{Rgba, StrokeStyle, DEF_BADGE, DEF_STROKE};
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Shape {
         Shape::Rect {
@@ -562,5 +657,96 @@ mod tests {
         assert_eq!(n, UNDO_LIMIT, "撤销步数不超过上限（最旧记录被丢弃）");
         // 最早的 50 条已被挤出：文档还剩 50 个形状
         assert_eq!(d.len(), 50);
+    }
+
+    #[test]
+    fn restyle_rect_color_and_undo() {
+        let mut d = AnnotDoc::new();
+        let id = d.add(rect(0, 0, 10, 10));
+        let old = d.find(id).unwrap().clone();
+        let Shape::Rect { bbox, fill, .. } = old else { panic!() };
+        let new = Shape::Rect {
+            bbox,
+            style: StrokeStyle {
+                color: Rgba::new(0x00, 0x80, 0xFF, 0xFF),
+                width: 3,
+            },
+            fill,
+        };
+        let dirty = d.restyle(id, new.clone()).unwrap();
+        assert_eq!(d.find(id), Some(&new));
+        assert_eq!(dirty, rect(0, 0, 10, 10).bbox(), "脏区并集");
+        d.undo();
+        assert_eq!(d.find(id), Some(&Shape::Rect {
+            bbox: old.bbox(),
+            style: StrokeStyle {
+                color: DEF_STROKE,
+                width: 3,
+            },
+            fill: None,
+        }));
+    }
+
+    #[test]
+    fn restyle_text_preserves_attach() {
+        let mut d = AnnotDoc::new();
+        let lid = d.add(line(Pt::new(0, 0), Pt::new(100, 0)));
+        let tid = d.add(text(50, 0, Some(lid)));
+        let old = d.find(tid).unwrap().clone();
+        let Shape::Text { origin, text, .. } = old else { panic!() };
+        let new = Shape::Text {
+            origin,
+            text,
+            bbox: Rect::new(40, -8, 20, 16),
+            style: super::super::style::TextStyle {
+                color: super::super::style::DEF_STROKE,
+                font_px: 32,
+                bold: true,
+                italic: false,
+            },
+            frame: super::super::style::TextFrame::None,
+            attach: Some(lid),
+        };
+        d.restyle(tid, new.clone()).unwrap();
+        match d.find(tid).unwrap() {
+            Shape::Text { attach, .. } => assert_eq!(*attach, Some(lid), "改样式不得解除挂线"),
+            _ => panic!(),
+        }
+        d.undo();
+        assert!(matches!(
+            d.find(tid).unwrap(),
+            Shape::Text { attach: Some(x), .. } if *x == lid
+        ));
+    }
+
+    #[test]
+    fn delete_many_dedups_and_deletes_attached_text() {
+        let mut d = AnnotDoc::new();
+        let a = d.add(rect(0, 0, 10, 10));
+        let b = d.add(rect(20, 20, 10, 10));
+        let lid = d.add(line(Pt::new(0, 50), Pt::new(100, 50)));
+        let tid = d.add(text(50, 50, Some(lid)));
+        let dirty = d.delete_many(&[a, a, b, lid]).unwrap();
+        assert!(d.find(a).is_none() && d.find(b).is_none());
+        assert!(d.find(lid).is_none() && d.find(tid).is_none());
+        assert!(dirty.intersects(rect(0, 0, 10, 10).bbox()));
+        d.undo();
+        assert_eq!(d.len(), 4, "一次撤销全部恢复");
+    }
+
+    #[test]
+    fn clear_all_is_one_undo_and_empty_is_none() {
+        let mut d = AnnotDoc::new();
+        assert_eq!(d.clear_all(), None);
+        d.add(rect(0, 0, 10, 10));
+        d.add(rect(20, 20, 10, 10));
+        d.add(rect(40, 40, 10, 10));
+        let dirty = d.clear_all().unwrap();
+        assert!(d.is_empty());
+        assert!(dirty.w > 0);
+        d.undo();
+        assert_eq!(d.len(), 3, "一次撤销恢复全部");
+        d.redo();
+        assert!(d.is_empty(), "一次重做再次清空（clear_all 只占 1 格）");
     }
 }

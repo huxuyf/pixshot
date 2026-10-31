@@ -6,6 +6,7 @@
 use super::geometry::{norm_rect, Pt, Rect};
 use super::style::{
     BadgeStyle, HighlightMode, MosaicMode, PenStyle, Rgba, StrokeStyle, TextFrame, TextStyle,
+    WatermarkStyle,
 };
 
 /// 箭头头部长度：`clamp(width × ratio, min, max)`（物理像素，见设计文档 4.3 / 7）。
@@ -70,6 +71,13 @@ pub enum Shape {
         frame: TextFrame,
         attach: Option<u64>,
     },
+    /// 水印：覆盖整个选区（或按 `wm` 平铺）的倾斜半透明文字。
+    Watermark {
+        bbox: Rect,
+        text: String,
+        style: TextStyle,
+        wm: WatermarkStyle,
+    },
 }
 
 /// 文字包围盒估算（CJK 全角 1.0em / 其余 0.55em 每字符）。
@@ -122,6 +130,7 @@ impl Shape {
             | Shape::Mosaic { bbox, .. }
             | Shape::Highlight { bbox, .. } => *bbox,
             Shape::Text { bbox, .. } => *bbox,
+            Shape::Watermark { bbox, .. } => *bbox,
             Shape::Line { from, to, style } => {
                 norm_rect(*from, *to).inflate((style.width / 2).max(1))
             }
@@ -213,6 +222,17 @@ impl Shape {
                 frame: *frame,
                 attach: *attach,
             },
+            Shape::Watermark {
+                bbox,
+                text,
+                style,
+                wm,
+            } => Shape::Watermark {
+                bbox: Rect::new(bbox.x + d.x, bbox.y + d.y, bbox.w, bbox.h),
+                text: text.clone(),
+                style: style.clone(),
+                wm: *wm,
+            },
             Shape::Arrow {
                 from,
                 to,
@@ -278,6 +298,12 @@ impl Shape {
                 style: style.clone(),
             },
             Shape::Text { .. } | Shape::StepNo { .. } => self.clone(),
+            Shape::Watermark { text, style, wm, .. } => Shape::Watermark {
+                bbox: new,
+                text: text.clone(),
+                style: style.clone(),
+                wm: *wm,
+            },
             Shape::Line { from, to, style } => Shape::Line {
                 from: map(*from),
                 to: map(*to),

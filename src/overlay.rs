@@ -47,8 +47,12 @@
 
 use std::sync::Arc;
 
-use crate::annot::{self, AnnotDoc, AnnotSession, CursorKind, DibSurface, Pt, Rect, Tool};
+use crate::annot::{self, AnnotDoc, AnnotSession, CursorKind, DibSurface, Pt, Rect, SizeKind, Tool};
+use crate::annot::shape::Shape;
+use crate::annot::style::{HighlightMode, MosaicMode, PenKind, Rgba, TextFrame};
+use crate::assist::{self, ColorFormat};
 use crate::capture::{self, CapturedImage};
+use crate::pick::{PickEngine, PickLevel, PickTarget};
 use crate::util::{self, register_class_w, to_wide};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -80,9 +84,67 @@ pub const WM_APP_CHAR: u32 = WM_APP + 6;
 /// 自定义消息：工具条 → 冻结层（同步查询是否处于文字输入中）。
 /// 返回 1 = 输入中（工具条的字母键应放行为正文输入，不当工具快捷键）。
 pub const WM_APP_QUERY_TYPING: u32 = WM_APP + 7;
+/// 颜色面板 → 标注会话（投递给 overlay 窗口）。`wp` = [`StyleField`]，`lp` 打包值。
+pub const WM_APP_SET_STYLE: u32 = WM_APP + 8;
+/// 标注会话 → 颜色面板（选中项/偏好变化时同步）。`wp` = [`StyleField`]，`lp` 打包值。
+pub const WM_APP_STYLE_SYNC: u32 = WM_APP + 9;
+/// 颜色面板 → 标注会话：清空全部标注。
+pub const WM_APP_CLEAR_ALL: u32 = WM_APP + 10;
+/// 查询当前选中（E2E 用）：返回 1 + 选中 id 的低 15 位（无选中返回 0）。
+pub const WM_APP_QUERY_STYLE: u32 = WM_APP + 11;
+/// 查询当前智能选区候选（E2E 用）：返回 1 表示有候选。
+pub const WM_APP_QUERY_PICK: u32 = WM_APP + 12;
+/// 工具条 → 冻结层：Ctrl+滚轮调整标注尺寸。`wp` = [`SizeKind`] 编码，`lp` = ±1。
+pub const WM_APP_ADJUST_SIZE: u32 = WM_APP + 13;
+/// 颜色面板 → 工具条：面板已销毁（选色 / Esc / 工具条主动关闭）。
+/// `lp` = 面板窗口句柄，工具条据此清空缓存句柄，避免留下失效 HWND。
+pub const WM_APP_STYLE_PANEL_CLOSED: u32 = WM_APP + 14;
+
+/// 样式字段编号（避免字符串协议）。
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StyleField {
+    /// 同时设置描边色与文字色（面板色块）。
+    Color = 0,
+    StrokeColor = 1,
+    StrokeWidth,
+    TextColor,
+    TextSize,
+    TextBold,
+    TextItalic,
+    PenKind,
+    MosaicMode,
+    HighlightMode,
+    TextFrame,
+    BadgeColor,
+    Clear,
+}
+
+impl StyleField {
+    pub fn from_u32(v: u32) -> Option<Self> {
+        Some(match v {
+            0 => Self::Color,
+            1 => Self::StrokeColor,
+            2 => Self::StrokeWidth,
+            3 => Self::TextColor,
+            4 => Self::TextSize,
+            5 => Self::TextBold,
+            6 => Self::TextItalic,
+            7 => Self::PenKind,
+            8 => Self::MosaicMode,
+            9 => Self::HighlightMode,
+            10 => Self::TextFrame,
+            11 => Self::BadgeColor,
+            12 => Self::Clear,
+            _ => return None,
+        })
+    }
+}
 
 /// 冻结层窗口类名（供冻结层反向定位工具条窗口）。
 const TOOLBAR_CLASS: &str = "PixShotToolbar";
+/// 标注颜色面板窗口类名。
+pub const STYLE_PANEL_CLASS: &str = "PixShotStylePanel";
 
 /// 选区（虚拟屏幕坐标，物理像素）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +252,33 @@ enum OverlayMode {
     Annotating,
 }
 
+struct AssistState {
+    enabled_magnifier: bool,
+    enabled_aux: bool,
+    enabled_info: bool,
+    grid: bool,
+    format: ColorFormat,
+    /// 放大镜边长（物理像素，创建时按 DPI 换算）。
+    lens_size: i32,
+    /// 放大倍数。
+    lens_zoom: i32,
+    /// 上一帧辅助层脏区（精确擦除）。
+    last_dirty: Vec<Rect4>,
+    /// 光标最后一次位置（屏幕坐标）。
+    cursor: Option<POINT>,
+    /// 信息条文本缓冲。
+    info: String,
+}
+
+struct PickUi {
+    /// 当前候选（悬停预览）。
+    hover: Option<PickTarget>,
+    /// 上次探测的光标位置与时间（节流用）。
+    last_probe: Option<(i32, i32, u32)>,
+    /// 上次绘制的候选框（用于精确擦除）。
+    last_drew: Option<Rect4>,
+}
+
 struct State {
     /// 确认时从整屏快照裁出的成品（小图）；`Some` 即表示"选区已确认"，
     /// `run()` 结尾取出交给 [`Selection`]。
@@ -236,6 +325,22 @@ struct State {
     /// 当前文字输入子进程所服务的**标注锚点**（选区局部坐标）。`Some` 表示子进程
     /// 正在运行；锚点变化（点别处重新落点）时重挂子进程。`None` 表示未在输入。
     text_helper_anchor: Option<Pt>,
+    /// 截图辅助（放大镜 / 辅助线 / 信息条 / 取色）。
+    assist: AssistState,
+    /// 智能选区候选状态。
+    pick: PickUi,
+    /// 智能选区引擎（UIA 不可用时内部自动退化为窗口级）。
+    pick_engine: Option<PickEngine>,
+    /// 当前拾取级别。
+    pick_level: PickLevel,
+    /// 候选框额外外扩（逻辑像素）。
+    pick_padding: i32,
+    /// 单击是否自动扩充为窗口矩形。
+    pick_auto_expand: bool,
+    /// 探测节流（毫秒）。
+    pick_probe_interval_ms: u32,
+    /// 是否显示候选标签。
+    pick_show_label: bool,
 }
 
 
@@ -304,6 +409,20 @@ unsafe fn run() -> Option<Selection> {
 
     register_class_w("PixShotOverlay", overlay_proc, true, false, false);
     let hinst = GetModuleHandleW(None).unwrap_or_default();
+    let cfg = crate::config::get();
+    let dpi = overlay_dpi();
+    let assist_state = AssistState {
+        enabled_magnifier: cfg.assist_magnifier,
+        enabled_aux: cfg.assist_aux_lines,
+        enabled_info: cfg.assist_show_info,
+        grid: cfg.assist_aux_grid,
+        format: cfg.assist_color_format,
+        lens_size: util::scaled(cfg.assist_magnifier_size, dpi).max(48),
+        lens_zoom: cfg.assist_magnifier_zoom.clamp(1, 16),
+        last_dirty: Vec::new(),
+        cursor: None,
+        info: String::new(),
+    };
 
     let state = Box::into_raw(Box::new(State {
         result_image: None,
@@ -336,6 +455,22 @@ unsafe fn run() -> Option<Selection> {
             .unwrap_or(std::ptr::null_mut()),
         label_text: String::new(),
         text_helper_anchor: None,
+        assist: assist_state,
+        pick: PickUi {
+            hover: None,
+            last_probe: None,
+            last_drew: None,
+        },
+        pick_engine: {
+            let mut e = PickEngine::new();
+            e.set_max_depth(cfg.pick_max_depth);
+            Some(e)
+        },
+        pick_level: cfg.pick_level,
+        pick_padding: cfg.pick_padding,
+        pick_auto_expand: cfg.pick_auto_expand,
+        pick_probe_interval_ms: cfg.pick_probe_interval_ms.max(16),
+        pick_show_label: cfg.pick_show_label,
     }));
 
     // 不带 WS_VISIBLE：先提交一次"全透明"内容，避免显示瞬间出现不透明黑屏
@@ -526,6 +661,12 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 if s.mode == OverlayMode::Annotating {
                     let p = annot_local_from_lparam(lp, s);
                     let shift = shift_down();
+                    crate::diag::log(&format!(
+                        "[overlay] annot down p=({},{}) tool={:?}",
+                        p.x,
+                        p.y,
+                        s.annot.tool()
+                    ));
                     let a = s.annot.on_l_down(p, shift);
                     // 进入绘制/拖动/缩放即捕获鼠标（见 5.1）
                     if s.annot.capturing() {
@@ -535,6 +676,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     return LRESULT(0);
                 }
                 SetCapture(hwnd);
+                // 开始拖拽前先擦掉悬停辅助层/候选框，避免与新框线互相覆盖
+                clear_hover_layer(hwnd, s);
                 s.dragging = true;
                 s.start = point_from_lparam(lp, s.vx, s.vy);
                 s.cur = s.start;
@@ -555,6 +698,11 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 if s.dragging {
                     s.cur = point_from_lparam(lp, s.vx, s.vy);
                     repaint_frame(hwnd, s);
+                } else {
+                    let pt = point_from_lparam(lp, s.vx, s.vy);
+                    s.assist.cursor = Some(pt);
+                    update_pick_hover(hwnd, s, pt);
+                    repaint_hover(hwnd, s);
                 }
             }
             LRESULT(0)
@@ -566,8 +714,16 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     let p = annot_local_from_lparam(lp, s);
                     let shift = shift_down();
                     let a = s.annot.on_l_up(p, shift);
+                    crate::diag::log(&format!(
+                        "[overlay] annot up p=({},{}) tool={:?} annotations={}",
+                        p.x,
+                        p.y,
+                        s.annot.tool(),
+                        s.annot.doc.len()
+                    ));
                     let _ = ReleaseCapture();
                     annot_apply(hwnd, s, a);
+                    sync_style_to_panel(hwnd, s);
                     return LRESULT(0);
                 }
             }
@@ -606,17 +762,49 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             DefWindowProcW(hwnd, msg, wp, lp)
         }
 
+        WM_MOUSEWHEEL => {
+            if let Some(s) = state_of(hwnd) {
+                let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                if delta != 0 && ctrl_down() {
+                    match s.mode {
+                        // 选区阶段：Ctrl+滚轮调放大镜倍率
+                        OverlayMode::Selecting => {
+                            let step = if delta > 0 { 1 } else { -1 };
+                            s.assist.lens_zoom = (s.assist.lens_zoom + step).clamp(1, 16);
+                            repaint_hover(hwnd, s);
+                            crate::diag::log(&format!(
+                                "[assist] lens_zoom={}x cursor={:?}",
+                                s.assist.lens_zoom, s.assist.cursor
+                            ));
+                            return LRESULT(0);
+                        }
+                        // 标注阶段：已选中工具时，光标在画布上滚轮也调整该工具尺寸
+                        OverlayMode::Annotating => {
+                            if let Some(kind) = SizeKind::for_tool(s.annot.tool()) {
+                                adjust_annot_size(hwnd, s, kind, if delta > 0 { 1 } else { -1 });
+                            }
+                            return LRESULT(0);
+                        }
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+
         WM_KEYDOWN => {
             if let Some(s) = state_of(hwnd) {
                 if s.mode == OverlayMode::Annotating {
                     let ctrl = ctrl_down();
-                    annot_key(hwnd, s, wp.0, ctrl);
+                    let shift = shift_down();
+                    annot_key(hwnd, s, wp.0, ctrl, shift);
                     return LRESULT(0);
                 }
                 if wp.0 == VK_ESCAPE {
                     // 选区确认前：Esc 取消框选拆窗（确认后由工具条/标注侧处理）。
                     let _ = DestroyWindow(hwnd);
+                    return LRESULT(0);
                 }
+                handle_selecting_key(hwnd, s, wp.0, shift_down());
             }
             LRESULT(0)
         }
@@ -626,6 +814,10 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             if let Some(s) = state_of(hwnd) {
                 if s.mode == OverlayMode::Annotating {
                     let tool = tool_from_usize(wp.0);
+                    crate::diag::log(&format!(
+                        "[overlay] set_tool wp={} -> {:?}",
+                        wp.0, tool
+                    ));
                     let (a, cur_tool) = {
                         let sess = &mut s.annot;
                         let a = sess.set_tool(tool);
@@ -638,11 +830,13 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
 
-        // 工具条 → 冻结层：转发按键（wp = VK，lp = Ctrl）
+        // 工具条 → 冻结层：转发按键（wp = VK，lp bit0=Ctrl / bit1=Shift）
         WM_APP_KEY => {
             if let Some(s) = state_of(hwnd) {
                 if s.mode == OverlayMode::Annotating {
-                    annot_key(hwnd, s, wp.0, lp.0 != 0);
+                    let ctrl = lp.0 & 1 != 0;
+                    let shift = lp.0 & 2 != 0;
+                    annot_key(hwnd, s, wp.0, ctrl, shift);
                 }
             }
             LRESULT(0)
@@ -694,6 +888,61 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 }
             }
             LRESULT(0)
+        }
+
+        // 颜色面板 → 标注会话：应用样式补丁
+        WM_APP_SET_STYLE => {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    let field = StyleField::from_u32(wp.0 as u32);
+                    if let Some(f) = field {
+                        let a = apply_style_message(&mut s.annot, f, lp.0);
+                        annot_apply(hwnd, s, a);
+                        sync_style_to_panel(hwnd, s);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
+        // 颜色面板 → 标注会话：清空全部（一条撤销记录）
+        WM_APP_CLEAR_ALL => {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    let a = s.annot.clear_all();
+                    annot_apply(hwnd, s, a);
+                    sync_style_to_panel(hwnd, s);
+                }
+            }
+            LRESULT(0)
+        }
+
+        // 工具条 → 冻结层：Ctrl+滚轮调整标注默认尺寸
+        WM_APP_ADJUST_SIZE => {
+            if let Some(s) = state_of(hwnd) {
+                if s.mode == OverlayMode::Annotating {
+                    if let Some(kind) = SizeKind::from_u32(wp.0 as u32) {
+                        adjust_annot_size(hwnd, s, kind, lp.0 as i32);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
+        // E2E 只读查询：当前选中 id
+        WM_APP_QUERY_STYLE => {
+            let id = state_of(hwnd)
+                .and_then(|s| s.annot.selected_id())
+                .unwrap_or(0);
+            LRESULT((id > 0) as isize + ((id as isize) & 0x7FFF))
+        }
+
+        // E2E 只读查询：当前智能选区候选是否存在
+        WM_APP_QUERY_PICK => {
+            let has = state_of(hwnd)
+                .map(|s| s.pick.hover.is_some())
+                .unwrap_or(false);
+            LRESULT(has as isize)
         }
 
         // 文字输入子进程 → 冻结层：正文变化 / 结束输入（`dwData` 0=变化 1=结束）。
@@ -750,8 +999,9 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     }
 }
 
-/// 鼠标松开：拖动够大则取选区并**保留红框**；过小（含单击）则擦掉框线，留在框选状态。
-unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
+/// 鼠标松开：拖动够大则取选区并**保留红框**；单击在智能选区开启时自动扩充；
+/// 过小且无候选则擦掉框线，留在框选状态。
+unsafe fn finish_selection(hwnd: HWND, lp: LPARAM) {
     let Some(s) = state_of(hwnd) else { return };
     if !s.dragging {
         return;
@@ -761,81 +1011,122 @@ unsafe fn finish_selection(hwnd: HWND, _lp: LPARAM) {
 
     let r = norm_rect(s.start, s.cur);
     let cfg = crate::config::get();
-    let (dim, frame_px) = (cfg.ui_overlay_dim, packed(cfg.ui_overlay_frame_color));
     let min_side = util::scaled(cfg.ui_overlay_min_drag, overlay_dpi());
     if r.2 >= min_side && r.3 >= min_side {
         let region = clamp_region(r, s.vx, s.vy, s.vw, s.vh);
-        let sel_c = (region.x - s.vx, region.y - s.vy, region.width, region.height);
-        let width = util::scaled(cfg.ui_overlay_frame_width, overlay_dpi());
-        // 收敛到最终选区：擦上一帧与标签（还原为暗化像素）、提亮最终选区（快照
-        // 原像素）、画框线 —— 表面此后保持"暗化周边 + 提亮选区"，屏幕**继续冻结**，
-        // 直到工具条关闭（见 [`Selection::dismiss`]）。
-        if let Some(shot) = &s.snapshot {
-            // 防御路径（last != sel_c）：旧提亮区必须一并还原为暗化
-            if let Some(last) = s.last {
-                if last != sel_c {
-                    restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, last, dim);
-                }
+        if begin_annotating(hwnd, region) {
+            return;
+        }
+    }
+
+    // 单击（位移 ≤ 4px）且智能选区开启：点击自动扩充为光标处窗口/元素。
+    let click = (s.cur.x - s.start.x).abs() <= 4 && (s.cur.y - s.start.y).abs() <= 4;
+    if click && s.pick_level != PickLevel::None && s.pick_auto_expand {
+        let sp = point_from_lparam(lp, s.vx, s.vy);
+        let mut target = s.pick.hover.clone();
+        if target.is_none() {
+            target = probe_at(s, hwnd, sp.x, sp.y, effective_level(s.pick_level), true);
+        }
+        if let Some(t) = target {
+            let region = clamp_region(
+                (t.rect.x, t.rect.y, t.rect.w, t.rect.h),
+                s.vx,
+                s.vy,
+                s.vw,
+                s.vh,
+            );
+            if region.width >= min_side && region.height >= min_side
+                && begin_annotating(hwnd, region)
+            {
+                crate::diag::log(&format!(
+                    "[pick] click auto-expand -> {}×{} @ {},{}",
+                    region.width, region.height, region.x, region.y
+                ));
+                return;
             }
-            if let Some(ll) = s.last_label.take() {
-                restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, ll, dim);
-            }
-            restore_rect(s.surface_bits, s.vw, s.vh, shot, sel_c);
-            draw_frame(s.surface_bits, s.vw, s.vh, sel_c, width, frame_px);
         }
-        s.last_label = None;
-        // 成品从整屏快照裁出后**立即释放快照**（用于裁剪的整屏资源及时回收）。
-        // 显示中的冻结画面留在窗口表面上（不额外占内存），随窗口在会话结束时一并销毁。
-        let cropped = s
-            .snapshot
-            .take()
-            .map(|shot| Arc::new(shot.crop(region.x, region.y, region.width, region.height)));
-        commit(hwnd, s, (0, 0, s.vw, s.vh));
-        s.last = Some(sel_c);
-        s.result_image = cropped;
-        // 进入标注模式（见设计文档 1.2 A）：不转鼠标穿透，冻结层继续接收鼠标用于标注。
-        s.region = region;
-        s.annot = AnnotSession::new_with_prefs(
-            Rect::new(0, 0, region.width, region.height),
-            overlay_dpi(),
-            crate::config::get().annot_prefs(),
-        );
-        s.annot_base = DibSurface::new(region.width, region.height);
-        if s.annot_base.is_none() {
-            // 内存不足等：标注层将完全不显示（repaint_annot 早退），必须留下线索
-            crate::diag::log(&format!(
-                "[overlay] 标注底图创建失败（{}×{}）：本次会话标注将不可见",
-                region.width, region.height
-            ));
-        }
-        if let Some(base) = &s.annot_base {
-            // 底图 = 冻结画面 + 选区红框（此后不可变）
-            base.blit_from(s.surface_dc, sel_c.0, sel_c.1, sel_c.2, sel_c.3);
-        }
-        s.mode = OverlayMode::Annotating;
-        crate::diag::log(&format!(
-            "[overlay] 选区确认 {}×{} @ {},{}：已裁出成品、建立标注底图（进入标注模式）",
-            region.width, region.height, region.x, region.y
-        ));
-        // 结束框选模态循环但**不拆窗**，由调用方持有的 Selection 负责后续关闭；
-        // 冻结层继续显示（不再是鼠标穿透），标注交互挂在其窗口过程上。
-        PostQuitMessage(0);
-        return;
     }
 
     // 单击 / 过小的拖动：不产生选区，擦掉已画的框线与标签（还原为暗化像素），
     // 继续等待框选。脏区必须覆盖框线与标签的**并集**——漏掉标签会让它残留在屏幕上。
-    if let Some(last) = s.last.take() {
+    if let Some(bits) = s.last.take() {
         let label = s.last_label.take();
-        let dirty = label.map(|ll| union_rect(last, ll)).unwrap_or(last);
+        let dirty = label.map(|ll| union_rect(bits, ll)).unwrap_or(bits);
         if let Some(shot) = &s.snapshot {
-            restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, last, dim);
+            restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, bits, cfg.ui_overlay_dim);
             if let Some(ll) = label {
-                restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, ll, dim);
+                restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, ll, cfg.ui_overlay_dim);
             }
         }
         commit(hwnd, s, dirty);
     }
+}
+
+/// 以 `region`（屏幕物理像素）作为最终选区，进入标注模式。
+/// 负责：从 snapshot 裁图、构造 AnnotSession、创建 annot_base、切换 mode、重绘。
+/// 返回 `false` 表示区域非法（过小/越界），调用方回退到 `Selecting`。
+unsafe fn begin_annotating(hwnd: HWND, region: SelectedRegion) -> bool {
+    let Some(s) = state_of(hwnd) else { return false };
+    if region.width < 1 || region.height < 1 {
+        return false;
+    }
+    clear_hover_layer(hwnd, s);
+    let cfg = crate::config::get();
+    let dpi = overlay_dpi();
+    let (dim, frame_px) = (cfg.ui_overlay_dim, packed(cfg.ui_overlay_frame_color));
+    let sel_c = (
+        region.x - s.vx,
+        region.y - s.vy,
+        region.width,
+        region.height,
+    );
+    let width = util::scaled(cfg.ui_overlay_frame_width, dpi);
+    // 擦上一帧/标签（还原为暗化像素）、提亮最终选区、画框线。
+    if let Some(shot) = &s.snapshot {
+        if let Some(last) = s.last {
+            if last != sel_c {
+                restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, last, dim);
+            }
+        }
+        if let Some(ll) = s.last_label.take() {
+            restore_dim_rect(s.surface_bits, s.vw, s.vh, shot, ll, dim);
+        }
+        restore_rect(s.surface_bits, s.vw, s.vh, shot, sel_c);
+        draw_frame(s.surface_bits, s.vw, s.vh, sel_c, width, frame_px);
+    }
+    s.last_label = None;
+    // 成品从整屏快照裁出后**立即释放快照**（用于裁剪的整屏资源及时回收）。
+    let Some(shot) = s.snapshot.take() else {
+        return false;
+    };
+    let cropped = Arc::new(shot.crop(region.x, region.y, region.width, region.height));
+    commit(hwnd, s, (0, 0, s.vw, s.vh));
+    s.last = Some(sel_c);
+    s.result_image = Some(cropped);
+    // 进入标注模式：不转鼠标穿透，冻结层继续接收鼠标用于标注。
+    s.region = region;
+    s.annot = AnnotSession::new_with_prefs(
+        Rect::new(0, 0, region.width, region.height),
+        dpi,
+        crate::config::get().annot_prefs(),
+    );
+    s.annot_base = DibSurface::new(region.width, region.height);
+    if s.annot_base.is_none() {
+        crate::diag::log(&format!(
+            "[overlay] 标注底图创建失败（{}×{}）：本次会话标注将不可见",
+            region.width, region.height
+        ));
+    }
+    if let Some(base) = &s.annot_base {
+        base.blit_from(s.surface_dc, sel_c.0, sel_c.1, sel_c.2, sel_c.3);
+    }
+    s.mode = OverlayMode::Annotating;
+    crate::diag::log(&format!(
+        "[overlay] 选区确认 {}×{} @ {},{}：已裁出成品、建立标注底图（进入标注模式）",
+        region.width, region.height, region.x, region.y
+    ));
+    PostQuitMessage(0);
+    true
 }
 
 // ─── 标注集成（见设计文档 1.2 / 4.1 / 5.5 / 5.6） ───────────────────
@@ -866,6 +1157,8 @@ fn tool_from_usize(v: usize) -> Tool {
         7 => Tool::Mosaic,
         8 => Tool::Highlight,
         9 => Tool::Text,
+        10 => Tool::Eraser,
+        11 => Tool::Watermark,
         _ => Tool::None,
     }
 }
@@ -884,6 +1177,24 @@ unsafe fn set_annot_cursor(kind: CursorKind) {
     if let Ok(c) = LoadCursorW(None, id) {
         SetCursor(c);
     }
+}
+
+/// 应用一次 Ctrl+滚轮尺寸调整：更新默认偏好、重绘，并用 Toast 实时显示当前值。
+///
+/// 工具条转发（[`WM_APP_ADJUST_SIZE`]）与冻结层自身收到滚轮时共用。
+unsafe fn adjust_annot_size(hwnd: HWND, s: &mut State, kind: SizeKind, delta: i32) {
+    let a = s.annot.adjust_size(kind, delta);
+    annot_apply(hwnd, s, a);
+    crate::toast::show(&format!(
+        "{} {}",
+        kind.label(),
+        s.annot.size_value(kind)
+    ));
+    crate::diag::log(&format!(
+        "[annot] adjust {} -> {}",
+        kind.label(),
+        s.annot.size_value(kind)
+    ));
 }
 
 /// 消费一次标注事件结果：光标、重绘、Esc 交还工具条，以及文字输入的焦点/IME 管理。
@@ -935,11 +1246,12 @@ unsafe fn sync_text_helper(hwnd: HWND, s: &mut State) {
 }
 
 /// 处理一次标注按键并把（可能变化的）工具同步给工具条。
-unsafe fn annot_key(hwnd: HWND, s: &mut State, vk: usize, ctrl: bool) {
-    let a = s.annot.on_key(vk, ctrl);
+unsafe fn annot_key(hwnd: HWND, s: &mut State, vk: usize, ctrl: bool, shift: bool) {
+    let a = s.annot.on_key(vk, ctrl, shift);
     let tool = s.annot.tool();
     annot_apply(hwnd, s, a);
     post_to_toolbar(WM_APP_TOOL_CHANGED, tool as usize, 0);
+    sync_style_to_panel(hwnd, s);
 }
 
 /// 向工具条窗口投递消息（用类名定位；找不到则忽略）。
@@ -951,6 +1263,604 @@ unsafe fn post_to_toolbar(msg: u32, wp: usize, lp: isize) {
         }
     }
 }
+
+// ─── 智能选区 / 截图辅助 ────────────────────────────────────────────
+
+const VK_TAB: usize = 0x09;
+const VK_RETURN: usize = 0x0D;
+const VK_C_: usize = 0x43;
+const VK_R_: usize = 0x52;
+const VK_W_: usize = 0x57;
+const VK_E_: usize = 0x45;
+
+/// Region 级别在"悬停"阶段不显示候选框；单击时才按窗口扩充。
+fn effective_level(level: PickLevel) -> PickLevel {
+    match level {
+        PickLevel::Region => PickLevel::Window,
+        other => other,
+    }
+}
+
+/// 临时取出引擎做探测（避免同时借用 `State` 的其它字段）。
+unsafe fn probe_at(
+    s: &mut State,
+    hwnd: HWND,
+    x: i32,
+    y: i32,
+    level: PickLevel,
+    expand: bool,
+) -> Option<PickTarget> {
+    if level == PickLevel::None {
+        return None;
+    }
+    let mut engine = s.pick_engine.take().unwrap_or_else(PickEngine::new);
+    let t = engine.probe(hwnd, x, y, level, s.pick_padding, expand);
+    s.pick_engine = Some(engine);
+    t
+}
+
+/// 鼠标悬停探测（节流）。结果写入 `s.pick.hover`（Region 级别也保存，供单击使用）。
+unsafe fn update_pick_hover(hwnd: HWND, s: &mut State, pt: POINT) {
+    if s.pick_level == PickLevel::None || s.pick_level == PickLevel::Region {
+        // Region 级别不在悬停时探测（避免默认配置下每帧临时改 overlay 样式造成闪烁）；
+        // 单击时由 finish_selection 探测并自动扩充。
+        s.pick.hover = None;
+        return;
+    }
+    let now = windows::Win32::System::SystemInformation::GetTickCount();
+    if let Some((lx, ly, lt)) = s.pick.last_probe {
+        if lx == pt.x && ly == pt.y && now.wrapping_sub(lt) < s.pick_probe_interval_ms {
+            return;
+        }
+    }
+    s.pick.last_probe = Some((pt.x, pt.y, now));
+    let level = effective_level(s.pick_level);
+    s.pick.hover = probe_at(s, hwnd, pt.x, pt.y, level, s.pick_auto_expand);
+}
+
+/// 擦除悬停辅助层（放大镜/辅助线/信息条/候选框），并清空光标与候选。
+unsafe fn clear_hover_layer(hwnd: HWND, s: &mut State) {
+    let mut erase: Vec<Rect4> = s.assist.last_dirty.drain(..).collect();
+    if let Some(r) = s.pick.last_drew.take() {
+        erase.push(r);
+    }
+    s.pick.hover = None;
+    s.assist.cursor = None;
+    s.pick.last_probe = None;
+    if erase.is_empty() {
+        return;
+    }
+    let dim = crate::config::get().ui_overlay_dim;
+    if let Some(shot) = s.snapshot.clone() {
+        for r in &erase {
+            restore_dim_rect(s.surface_bits, s.vw, s.vh, &shot, *r, dim);
+        }
+        if let Some(u) = union_all(&erase) {
+            commit(hwnd, s, u);
+        }
+    }
+}
+
+fn union_all(rects: &[Rect4]) -> Option<Rect4> {
+    let mut it = rects.iter().copied().filter(|r| r.2 > 0 && r.3 > 0);
+    let first = it.next()?;
+    Some(it.fold(first, |a, b| union_rect(a, b)))
+}
+
+/// 采样快照原始 BGRA 像素（越界返回 None）。
+fn sample_bgra(shot: &CapturedImage, x: i32, y: i32) -> Option<u32> {
+    let lx = x - shot.x;
+    let ly = y - shot.y;
+    if lx < 0 || ly < 0 || lx >= shot.width || ly >= shot.height {
+        return None;
+    }
+    let off = (ly as usize * shot.width.max(1) as usize + lx as usize) * 4;
+    if off + 4 > shot.data.len() {
+        return None;
+    }
+    Some(
+        (shot.data[off + 3] as u32) << 24
+            | (shot.data[off + 2] as u32) << 16
+            | (shot.data[off + 1] as u32) << 8
+            | shot.data[off] as u32,
+    )
+}
+
+/// 与背景对比度足够的 1px 辅助线颜色（亮背景黑线、暗背景白线）。
+fn contrast_px(shot: &CapturedImage, x: i32, y: i32) -> u32 {
+    let Some(px) = sample_bgra(shot, x, y) else {
+        return 0xFFFF_FFFF;
+    };
+    let r = (px >> 16) & 0xFF;
+    let g = (px >> 8) & 0xFF;
+    let b = px & 0xFF;
+    let luma = (r * 299 + g * 587 + b * 114) / 1000;
+    if luma > 140 {
+        0xFF00_0000 // 不透明黑
+    } else {
+        0xFFFF_FFFF // 不透明白
+    }
+}
+
+unsafe fn write_px(bits: *mut u32, vw: i32, vh: i32, x: i32, y: i32, px: u32) {
+    if x < 0 || y < 0 || x >= vw || y >= vh {
+        return;
+    }
+    *bits.add(y as usize * vw as usize + x as usize) = px;
+}
+
+/// 重绘悬停辅助层：先精确擦除上一帧，再画候选框/辅助线/放大镜/信息条。
+unsafe fn repaint_hover(hwnd: HWND, s: &mut State) {
+    let Some(shot) = s.snapshot.clone() else { return };
+    let cfg = crate::config::get();
+    let dpi = overlay_dpi();
+    let dim = cfg.ui_overlay_dim;
+
+    let mut erase: Vec<Rect4> = s.assist.last_dirty.drain(..).collect();
+    if let Some(r) = s.pick.last_drew.take() {
+        erase.push(r);
+    }
+    for r in &erase {
+        restore_dim_rect(s.surface_bits, s.vw, s.vh, &shot, *r, dim);
+    }
+    let mut dirty = erase.clone();
+
+    let Some(cursor) = s.assist.cursor else {
+        if let Some(u) = union_all(&dirty) {
+            commit(hwnd, s, u);
+        }
+        return;
+    };
+    let cursor_local = Pt::new(cursor.x - s.vx, cursor.y - s.vy);
+
+    // 1) 候选框（Region 级别只在单击时生效，不画悬停框）
+    if matches!(s.pick_level, PickLevel::Window | PickLevel::Element) {
+        if let Some(t) = s.pick.hover.clone() {
+            let frame = (
+                t.rect.x - s.vx,
+                t.rect.y - s.vy,
+                t.rect.w,
+                t.rect.h,
+            );
+            let label_rect = if s.pick_show_label {
+                draw_pick_label(s, frame, &t.label, dpi)
+            } else {
+                None
+            };
+            draw_pick_frame(s, frame);
+            let drew = label_rect.map(|l| union_rect(frame, l)).unwrap_or(frame);
+            s.pick.last_drew = Some(drew);
+            dirty.push(drew);
+        }
+    }
+
+    // 2) 辅助线（从光标向四边延伸）
+    if s.assist.enabled_aux {
+        let line = contrast_px(&shot, cursor.x, cursor.y);
+        let (lx, ly) = (cursor_local.x, cursor_local.y);
+        let mut push = |r: Rect4| {
+            if r.2 > 0 && r.3 > 0 {
+                dirty.push(r);
+            }
+        };
+        if ly > 0 {
+            fill(s.surface_bits, s.vw, s.vh, (lx, 0, 1, ly), line);
+            push((lx, 0, 1, ly));
+        }
+        if ly < s.vh {
+            let h = s.vh - ly;
+            fill(s.surface_bits, s.vw, s.vh, (lx, ly, 1, h), line);
+            push((lx, ly, 1, h));
+        }
+        if lx > 0 {
+            fill(s.surface_bits, s.vw, s.vh, (0, ly, lx, 1), line);
+            push((0, ly, lx, 1));
+        }
+        if lx < s.vw {
+            let w = s.vw - lx;
+            fill(s.surface_bits, s.vw, s.vh, (lx, ly, w, 1), line);
+            push((lx, ly, w, 1));
+        }
+        if s.assist.grid {
+            if let Some(sel) = grid_selection(s) {
+                for r in draw_grid(s, sel) {
+                    dirty.push(r);
+                }
+            }
+        }
+    }
+
+    // 3) 放大镜
+    if s.assist.enabled_magnifier {
+        if let Some(r) = draw_lens(s, &shot, cursor, dpi) {
+            dirty.push(r);
+        }
+    }
+
+    // 4) 信息条
+    if s.assist.enabled_info {
+        if let Some(r) = draw_info(s, &shot, cursor, dpi) {
+            dirty.push(r);
+        }
+    }
+
+    // 辅助层脏区（不含候选框：候选框单独存在 pick.last_drew）
+    s.assist.last_dirty = dirty
+        .iter()
+        .copied()
+        .filter(|r| Some(*r) != s.pick.last_drew)
+        .collect();
+    if let Some(u) = union_all(&dirty) {
+        commit(hwnd, s, u);
+    }
+}
+
+/// 选区九宫格（拖拽中才存在选区；悬停阶段无选区，返回 None）。
+fn grid_selection(s: &State) -> Option<Rect4> {
+    let cur = norm_rect(s.start, s.cur);
+    if cur.2 > 0 && cur.3 > 0 {
+        Some((cur.0 - s.vx, cur.1 - s.vy, cur.2, cur.3))
+    } else {
+        None
+    }
+}
+
+unsafe fn draw_grid(s: &State, sel: Rect4) -> Vec<Rect4> {
+    let x1 = sel.0 + sel.2 / 3;
+    let x2 = sel.0 + sel.2 * 2 / 3;
+    let y1 = sel.1 + sel.3 / 3;
+    let y2 = sel.1 + sel.3 * 2 / 3;
+    let px = 0x9999_9999; // 半透明白（预乘：alpha=0x99，通道=0x99）
+    let mut out = Vec::with_capacity(4);
+    fill(s.surface_bits, s.vw, s.vh, (x1, sel.1, 1, sel.3), px);
+    fill(s.surface_bits, s.vw, s.vh, (x2, sel.1, 1, sel.3), px);
+    fill(s.surface_bits, s.vw, s.vh, (sel.0, y1, sel.2, 1), px);
+    fill(s.surface_bits, s.vw, s.vh, (sel.0, y2, sel.2, 1), px);
+    out.push((x1, sel.1, 1, sel.3));
+    out.push((x2, sel.1, 1, sel.3));
+    out.push((sel.0, y1, sel.2, 1));
+    out.push((sel.0, y2, sel.2, 1));
+    out
+}
+
+/// 候选框虚线（2px 实、3px 空）+ 高对比色。
+unsafe fn draw_pick_frame(s: &State, frame: Rect4) {
+    let px = packed(Rgba::new(0x1E, 0x6F, 0xFF, 0xFF));
+    let mut x = frame.0;
+    while x < frame.0 + frame.2 {
+        let w = (frame.0 + frame.2 - x).min(2);
+        fill(s.surface_bits, s.vw, s.vh, (x, frame.1, w, 1), px);
+        fill(
+            s.surface_bits,
+            s.vw,
+            s.vh,
+            (x, frame.1 + frame.3 - 1, w, 1),
+            px,
+        );
+        x += 5;
+    }
+    let mut y = frame.1;
+    while y < frame.1 + frame.3 {
+        let h = (frame.1 + frame.3 - y).min(2);
+        fill(s.surface_bits, s.vw, s.vh, (frame.0, y, 1, h), px);
+        fill(
+            s.surface_bits,
+            s.vw,
+            s.vh,
+            (frame.0 + frame.2 - 1, y, 1, h),
+            px,
+        );
+        y += 5;
+    }
+}
+
+/// 候选标签（填深底 + 白字），返回标签矩形。
+unsafe fn draw_pick_label(s: &State, frame: Rect4, label: &str, dpi: i32) -> Option<Rect4> {
+    let px = util::scaled(crate::config::get().ui_overlay_label_px, dpi);
+    let w = label_w(label, px);
+    let h = (px as f32 * 1.4).ceil() as i32;
+    let mut x = frame.0;
+    let mut y = frame.1 + frame.3 + 4;
+    if y + h > s.vh {
+        y = (frame.1 - h - 4).max(0);
+    }
+    if x + w > s.vw {
+        x = s.vw - w;
+    }
+    x = x.max(0);
+    y = y.max(0);
+    let r = (x, y, w, h);
+    fill(s.surface_bits, s.vw, s.vh, r, 0xFF22_2222);
+    draw_text_on_surface(s, r, label, px, Rgba::new(0xFF, 0xFF, 0xFF, 0xFF));
+    Some(r)
+}
+
+/// 在表面矩形内绘制一行白字（GDI+ + alpha 防御）。
+unsafe fn draw_text_on_surface(s: &State, r: Rect4, text: &str, px: i32, color: Rgba) {
+    let g = s.label_g;
+    if g.is_null() {
+        return;
+    }
+    crate::annot::render_gdiplus::draw_label_string(
+        g,
+        (r.0 + 4) as f32,
+        (r.1 + 2) as f32,
+        text,
+        px as f32,
+        color,
+    );
+    let _ = GdiFlush();
+    if let Some(cr) = clip_rect((r.0 - 2, r.1 - 2, r.2 + 4, r.3 + 4), s.vw, s.vh) {
+        crate::annot::session::alpha_fix(s.surface_bits, s.vw, s.vh, Rect::new(cr.0, cr.1, cr.2, cr.3));
+    }
+}
+
+/// 放大镜（最近邻放大 + 边框 + 十字准星）；返回脏区。
+unsafe fn draw_lens(s: &State, shot: &CapturedImage, cursor: POINT, _dpi: i32) -> Option<Rect4> {
+    let screen = Rect::new(s.vx, s.vy, s.vw, s.vh);
+    let lens = assist::lens_rect(Pt::new(cursor.x, cursor.y), s.assist.lens_size, screen);
+    let local = (lens.x - s.vx, lens.y - s.vy, lens.w, lens.h);
+    if local.2 <= 0 || local.3 <= 0 {
+        return None;
+    }
+    let zoom = s.assist.lens_zoom.max(1);
+    let src_w = (lens.w / zoom).max(1);
+    let src_h = (lens.h / zoom).max(1);
+    let sx0 = cursor.x - src_w / 2;
+    let sy0 = cursor.y - src_h / 2;
+    for dy in 0..lens.h {
+        let sy = sy0 + dy / zoom;
+        for dx in 0..lens.w {
+            let sx = sx0 + dx / zoom;
+            let px = sample_bgra(shot, sx, sy).unwrap_or(0xFF20_2020);
+            write_px(s.surface_bits, s.vw, s.vh, local.0 + dx, local.1 + dy, px);
+        }
+    }
+    // 边框（外深内亮，任意背景都可辨认）
+    let dark = 0xFF00_0000;
+    let light = 0xFFFF_FFFF;
+    fill(s.surface_bits, s.vw, s.vh, (local.0, local.1, local.2, 1), dark);
+    fill(s.surface_bits, s.vw, s.vh, (local.0, local.1 + local.3 - 1, local.2, 1), dark);
+    fill(s.surface_bits, s.vw, s.vh, (local.0, local.1, 1, local.3), dark);
+    fill(s.surface_bits, s.vw, s.vh, (local.0 + local.2 - 1, local.1, 1, local.3), dark);
+    fill(s.surface_bits, s.vw, s.vh, (local.0 + 1, local.1 + 1, local.2 - 2, 1), light);
+    fill(s.surface_bits, s.vw, s.vh, (local.0 + 1, local.1 + local.3 - 2, local.2 - 2, 1), light);
+    // 十字准星（光标像素在镜头中的局部位置）
+    let c = Pt::new(cursor.x - lens.x, cursor.y - lens.y);
+    let cross = contrast_px(shot, cursor.x, cursor.y);
+    fill(s.surface_bits, s.vw, s.vh, (local.0 + 1, local.1 + c.y, local.2 - 2, 1), cross);
+    fill(s.surface_bits, s.vw, s.vh, (local.0 + c.x, local.1 + 1, 1, local.3 - 2), cross);
+    // 中心像素外框（5×5）
+    let bx = local.0 + c.x - 2;
+    let by = local.1 + c.y - 2;
+    fill(s.surface_bits, s.vw, s.vh, (bx, by, 5, 1), cross);
+    fill(s.surface_bits, s.vw, s.vh, (bx, by + 4, 5, 1), cross);
+    fill(s.surface_bits, s.vw, s.vh, (bx, by, 1, 5), cross);
+    fill(s.surface_bits, s.vw, s.vh, (bx + 4, by, 1, 5), cross);
+    clip_rect((local.0 - 4, local.1 - 4, local.2 + 8, local.3 + 8), s.vw, s.vh)
+}
+
+/// 信息条（尺寸/坐标/颜色），返回脏区。
+unsafe fn draw_info(s: &mut State, shot: &CapturedImage, cursor: POINT, dpi: i32) -> Option<Rect4> {
+    let color = assist::color_at(shot, cursor.x, cursor.y);
+    let sel = None;
+    s.assist.info = assist::info_text(sel, Pt::new(cursor.x, cursor.y), color, s.assist.format);
+    let px = util::scaled(crate::config::get().ui_overlay_label_px, dpi);
+    let w = label_w(&s.assist.info, px);
+    let h = (px as f32 * 1.4).ceil() as i32;
+    let lx = cursor.x - s.vx + 14;
+    let ly = cursor.y - s.vy + 14;
+    let x = lx.clamp(0, (s.vw - w).max(0));
+    let y = ly.clamp(0, (s.vh - h).max(0));
+    let r = (x, y, w, h);
+    fill(s.surface_bits, s.vw, s.vh, r, 0xFF22_2222);
+    let text = s.assist.info.clone();
+    draw_text_on_surface(s, r, &text, px, Rgba::new(0xFF, 0xFF, 0xFF, 0xFF));
+    Some(r)
+}
+
+/// 选区阶段的键盘操作：拾取级别切换 / 父子切换 / Enter 提交 / C 取色。
+unsafe fn handle_selecting_key(hwnd: HWND, s: &mut State, vk: usize, shift: bool) {
+    match vk {
+        VK_TAB => {
+            let Some(hover) = s.pick.hover.clone() else { return };
+            let mut engine = s.pick_engine.take().unwrap_or_else(PickEngine::new);
+            let t = if shift {
+                engine.parent(&hover)
+            } else if let Some(c) = s.assist.cursor {
+                engine.child(&hover, c.x, c.y)
+            } else {
+                None
+            };
+            s.pick_engine = Some(engine);
+            if let Some(t) = t {
+                crate::diag::log(&format!("[pick] tab -> {} rect={:?}", t.label, t.rect));
+                s.pick.hover = Some(t);
+                repaint_hover(hwnd, s);
+            }
+        }
+        VK_RETURN => {
+            let Some(t) = s.pick.hover.clone() else { return };
+            let region = clamp_region(
+                (t.rect.x, t.rect.y, t.rect.w, t.rect.h),
+                s.vx,
+                s.vy,
+                s.vw,
+                s.vh,
+            );
+            if begin_annotating(hwnd, region) {
+                crate::diag::log(&format!(
+                    "[pick] enter commit {}×{} @ {},{}",
+                    region.width, region.height, region.x, region.y
+                ));
+            }
+        }
+        VK_R_ => set_pick_level(hwnd, s, PickLevel::Region),
+        VK_W_ => set_pick_level(hwnd, s, PickLevel::Window),
+        VK_E_ => set_pick_level(hwnd, s, PickLevel::Element),
+        VK_C_ => {
+            let Some(cursor) = s.assist.cursor else { return };
+            let Some(shot) = s.snapshot.clone() else { return };
+            if shift {
+                s.assist.format = s.assist.format.next();
+                repaint_hover(hwnd, s);
+                crate::diag::log(&format!("[assist] color format -> {}", s.assist.format.label()));
+                return;
+            }
+            if let Some(c) = assist::color_at(&shot, cursor.x, cursor.y) {
+                let text = assist::format_color(c, s.assist.format);
+                match crate::clipboard::copy_text(&text) {
+                    Ok(()) => {
+                        crate::diag::log(&format!("[assist] copy color {text}"));
+                        crate::toast::show(&format!("已复制颜色 {text}"));
+                    }
+                    Err(e) => crate::diag::log(&format!("[assist] 复制颜色失败: {e}")),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+unsafe fn set_pick_level(hwnd: HWND, s: &mut State, level: PickLevel) {
+    s.pick_level = level;
+    s.pick.hover = None;
+    s.pick.last_probe = None;
+    repaint_hover(hwnd, s);
+    crate::diag::log(&format!("[pick] level={}", level.label()));
+}
+
+// ─── 颜色面板消息 ───────────────────────────────────────────────────
+
+fn rgba_from_lp(v: isize) -> Rgba {
+    let v = v as u32;
+    Rgba::new(
+        ((v >> 16) & 0xFF) as u8,
+        ((v >> 8) & 0xFF) as u8,
+        (v & 0xFF) as u8,
+        0xFF,
+    )
+}
+
+fn color_lp(c: Rgba) -> isize {
+    (((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32) as isize
+}
+
+unsafe fn apply_style_message(
+    sess: &mut AnnotSession,
+    field: StyleField,
+    lp: isize,
+) -> annot::Action {
+    use crate::annot::controller::StylePatch;
+    match field {
+        StyleField::Clear => sess.clear_all(),
+        StyleField::Color => {
+            let c = rgba_from_lp(lp);
+            sess.apply_style(StylePatch {
+                stroke_color: Some(c),
+                text_color: Some(c),
+                badge: Some(crate::annot::style::BadgeStyle {
+                    fill: c,
+                    text: Rgba::new(0xFF, 0xFF, 0xFF, 0xFF),
+                    outline: Some(Rgba::new(0xFF, 0xFF, 0xFF, 0xFF)),
+                }),
+                ..Default::default()
+            })
+        }
+        StyleField::StrokeColor => sess.apply_style(StylePatch {
+            stroke_color: Some(rgba_from_lp(lp)),
+            ..Default::default()
+        }),
+        StyleField::StrokeWidth => sess.apply_style(StylePatch {
+            stroke_width: Some((lp as i32).max(1)),
+            ..Default::default()
+        }),
+        StyleField::TextColor => sess.apply_style(StylePatch {
+            text_color: Some(rgba_from_lp(lp)),
+            ..Default::default()
+        }),
+        StyleField::TextSize => sess.apply_style(StylePatch {
+            text_size: Some((lp as i32).max(4)),
+            ..Default::default()
+        }),
+        StyleField::TextBold => sess.apply_style(StylePatch {
+            text_bold: Some(lp != 0),
+            ..Default::default()
+        }),
+        StyleField::TextItalic => sess.apply_style(StylePatch {
+            text_italic: Some(lp != 0),
+            ..Default::default()
+        }),
+        StyleField::PenKind => sess.apply_style(StylePatch {
+            pen_kind: Some(match lp {
+                1 => PenKind::Soft,
+                2 => PenKind::Fade,
+                _ => PenKind::Solid,
+            }),
+            ..Default::default()
+        }),
+        StyleField::MosaicMode => sess.apply_style(StylePatch {
+            mosaic_mode: Some(match lp {
+                1 => MosaicMode::Blur,
+                _ => MosaicMode::Pixelate,
+            }),
+            ..Default::default()
+        }),
+        StyleField::HighlightMode => sess.apply_style(StylePatch {
+            highlight_mode: Some(match lp {
+                1 => HighlightMode::Spotlight,
+                _ => HighlightMode::Marker,
+            }),
+            ..Default::default()
+        }),
+        StyleField::TextFrame => sess.apply_style(StylePatch {
+            text_frame: Some(match lp {
+                1 => TextFrame::Bubble,
+                2 => TextFrame::Burst,
+                _ => TextFrame::None,
+            }),
+            ..Default::default()
+        }),
+        StyleField::BadgeColor => sess.apply_style(StylePatch {
+            badge: Some(crate::annot::style::BadgeStyle {
+                fill: rgba_from_lp(lp),
+                text: Rgba::new(0xFF, 0xFF, 0xFF, 0xFF),
+                outline: Some(Rgba::new(0xFF, 0xFF, 0xFF, 0xFF)),
+            }),
+            ..Default::default()
+        }),
+    }
+}
+
+/// 把当前选中项/默认偏好的样式同步给颜色面板（找不到面板则忽略）。
+unsafe fn sync_style_to_panel(_overlay: HWND, s: &State) {
+    let name = to_wide(STYLE_PANEL_CLASS);
+    let Ok(panel) = FindWindowW(PCWSTR::from_raw(name.as_ptr()), PCWSTR::null()) else {
+        return;
+    };
+    if panel.is_invalid() {
+        return;
+    }
+    let prefs = s.annot.prefs();
+    let color = match s.annot.selected_shape() {
+        Some(Shape::Rect { style, .. })
+        | Some(Shape::Ellipse { style, .. })
+        | Some(Shape::Line { style, .. })
+        | Some(Shape::Arrow { style, .. }) => style.color,
+        Some(Shape::Pen { style, .. }) => style.color,
+        Some(Shape::Text { style, .. }) | Some(Shape::Watermark { style, .. }) => style.color,
+        Some(Shape::Highlight { color, .. }) => *color,
+        Some(Shape::StepNo { style, .. }) => style.fill,
+        Some(Shape::Mosaic { .. }) | None => prefs.stroke_color,
+    };
+    let _ = PostMessageW(
+        panel,
+        WM_APP_STYLE_SYNC,
+        WPARAM(StyleField::Color as usize),
+        LPARAM(color_lp(color)),
+    );
+}
+
 
 /// 局部脏区裁剪到选区；完全在外返回 None。
 fn clip_local(r: Rect, sel: Rect) -> Option<Rect> {

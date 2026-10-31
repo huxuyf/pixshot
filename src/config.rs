@@ -176,6 +176,52 @@ pub struct Config {
     pub handle_stroke: Rgba,
     /// 选区虚线框颜色。
     pub chrome_color: Rgba,
+    /// 橡皮擦除命中容差（逻辑像素）。
+    pub eraser_tol: i32,
+    /// 水印默认角度（-90..90）。
+    pub watermark_angle: i32,
+    /// 水印默认透明度（0..255）。
+    pub watermark_opacity: u8,
+    /// 水印是否平铺。
+    pub watermark_tile: bool,
+    /// 水印平铺间距（逻辑像素）。
+    pub watermark_gap: i32,
+    /// 是否启用标注颜色面板。
+    pub style_panel: bool,
+    /// 颜色面板预设色（8 色：红 / 绿 / 蓝 / 青 / 品红 / 黄 / 黑 / 白）。
+    pub style_palette: [Rgba; 8],
+
+    // ── [pick] 智能选区 ────────────────────────────────────────
+    /// 拾取级别：none / region / window / element。
+    pub pick_level: crate::pick::PickLevel,
+    /// 候选框额外外扩（逻辑像素）。
+    pub pick_padding: i32,
+    /// 客户区矩形自动扩充到窗口矩形。
+    pub pick_auto_expand: bool,
+    /// 探测节流（毫秒，不得低于 16）。
+    pub pick_probe_interval_ms: u32,
+    /// 是否在候选框下方显示标题标签。
+    pub pick_show_label: bool,
+    /// 元素级最大上探深度。
+    pub pick_max_depth: u32,
+
+    // ── [assist] 截图辅助 ──────────────────────────────────────
+    /// 放大镜开关。
+    pub assist_magnifier: bool,
+    /// 放大镜边长（逻辑像素）。
+    pub assist_magnifier_size: i32,
+    /// 放大倍数。
+    pub assist_magnifier_zoom: i32,
+    /// 辅助线开关。
+    pub assist_aux_lines: bool,
+    /// 选区内九宫格。
+    pub assist_aux_grid: bool,
+    /// 信息条开关。
+    pub assist_show_info: bool,
+    /// 取色文本格式。
+    pub assist_color_format: crate::assist::ColorFormat,
+    /// 标注阶段是否保留辅助层。
+    pub assist_in_annot: bool,
 
     // ── [ui] 界面尺寸与配色 ─────────────────────────────────────
     /// 工具栏图标按钮边长（逻辑像素）。
@@ -268,6 +314,18 @@ pub struct Config {
     pub pin_zoom_step: f32,
     /// 首次显示时贴合屏幕的比例（相对工作区）。
     pub pin_fit_ratio: f32,
+    /// 新贴图默认不透明度（alpha 26..255，即 10%..100%）。
+    pub pin_opacity: u8,
+    /// 新贴图默认锁定位置。
+    pub pin_locked: bool,
+    /// 新贴图默认显示阴影。
+    pub pin_shadow: bool,
+    /// 新贴图默认置顶。
+    pub pin_topmost: bool,
+    /// 边缘缩放热区（逻辑像素）。
+    pub pin_edge_hit: i32,
+    /// 缩放后窗口至少保留的可见像素。
+    pub pin_min_visible_px: i32,
 
     // ── [textimg] 文本贴图渲染 ──────────────────────────────────
     /// 文本贴图字体族。
@@ -369,6 +427,19 @@ impl OcrPunctuation {
 // 默认值单源于 `annot::style` 的历史常量，保证行为不变。
 const WHITE: Rgba = Rgba::new(0xFF, 0xFF, 0xFF, 0xFF);
 
+/// 颜色面板默认 8 色：红 / 绿 / 蓝 / 青 / 品红 / 黄 / 黑 / 白（顺序固定）。
+const DEF_STYLE_PALETTE: [Rgba; 8] = [
+    Rgba::new(0xFF, 0x00, 0x00, 0xFF), // 红
+    Rgba::new(0x00, 0xFF, 0x00, 0xFF), // 绿
+    Rgba::new(0x00, 0x00, 0xFF, 0xFF), // 蓝
+    Rgba::new(0x00, 0xFF, 0xFF, 0xFF), // 青
+    Rgba::new(0xFF, 0x00, 0xFF, 0xFF), // 品红
+    Rgba::new(0xFF, 0xFF, 0x00, 0xFF), // 黄
+    Rgba::new(0x00, 0x00, 0x00, 0xFF), // 黑
+    Rgba::new(0xFF, 0xFF, 0xFF, 0xFF), // 白
+];
+
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -429,6 +500,29 @@ impl Default for Config {
             handle_fill: WHITE,
             handle_stroke: Rgba::new(0x55, 0x55, 0x55, 0xFF),
             chrome_color: Rgba::new(0x88, 0x88, 0x88, 0xFF),
+            eraser_tol: 6,
+            watermark_angle: -30,
+            watermark_opacity: 64,
+            watermark_tile: true,
+            watermark_gap: 240,
+            style_panel: true,
+            style_palette: DEF_STYLE_PALETTE,
+            // [pick]
+            pick_level: crate::pick::PickLevel::Region,
+            pick_padding: 0,
+            pick_auto_expand: true,
+            pick_probe_interval_ms: 40,
+            pick_show_label: true,
+            pick_max_depth: 12,
+            // [assist]
+            assist_magnifier: true,
+            assist_magnifier_size: 121,
+            assist_magnifier_zoom: 4,
+            assist_aux_lines: true,
+            assist_aux_grid: false,
+            assist_show_info: true,
+            assist_color_format: crate::assist::ColorFormat::HexRgb,
+            assist_in_annot: false,
             // [ui]
             ui_toolbar_btn_size: 32,
             ui_toolbar_gap: 2,
@@ -475,6 +569,12 @@ impl Default for Config {
             pin_shadow_peak: 0.55,
             pin_zoom_step: 1.1,
             pin_fit_ratio: 0.85,
+            pin_opacity: 255,
+            pin_locked: false,
+            pin_shadow: true,
+            pin_topmost: true,
+            pin_edge_hit: 6,
+            pin_min_visible_px: 24,
             // [textimg]
             textimg_font_family: "Microsoft YaHei UI".into(),
             textimg_font_px: 20,
@@ -541,6 +641,11 @@ impl Config {
             arrow_width_ratio: self.arrow_width_ratio,
             arrow_len_min: self.arrow_len_min,
             arrow_len_max: self.arrow_len_max,
+            eraser_tol: self.eraser_tol,
+            watermark_angle: self.watermark_angle,
+            watermark_opacity: self.watermark_opacity,
+            watermark_tile: self.watermark_tile,
+            watermark_gap: self.watermark_gap,
         }
     }
 }
@@ -753,6 +858,47 @@ pub fn render(c: &Config) -> String {
     s.push_str(&format!("handle_fill = {}\n", fmt_color(c.handle_fill)));
     s.push_str(&format!("handle_stroke = {}\n", fmt_color(c.handle_stroke)));
     s.push_str(&format!("chrome_color = {}\n", fmt_color(c.chrome_color)));
+    s.push_str("# 橡皮命中容差（逻辑像素）/ 水印角度 / 透明度(0-255) / 平铺 / 平铺间距\n");
+    s.push_str(&format!("eraser_tol = {}\n", c.eraser_tol));
+    s.push_str(&format!("watermark_angle = {}\n", c.watermark_angle));
+    s.push_str(&format!("watermark_opacity = {}\n", c.watermark_opacity));
+    s.push_str(&format!("watermark_tile = {}\n", b(c.watermark_tile)));
+    s.push_str(&format!("watermark_gap = {}\n", c.watermark_gap));
+    s.push_str("# 颜色面板开关 / 预设色（逗号分隔，最多 8 个 RRGGBB）\n");
+    s.push_str(&format!("style_panel = {}\n", b(c.style_panel)));
+    s.push_str(&format!(
+        "style_panel_palette = {}\n",
+        c.style_palette
+            .iter()
+            .map(|x| fmt_color(*x))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+
+    s.push_str("\n[pick]\n");
+    s.push_str("# 智能选区：none / region（单击自动扩充）/ window / element\n");
+    s.push_str(&format!("pick_level = {}\n", c.pick_level.label()));
+    s.push_str("# 候选框外扩（逻辑像素）/ 客户区自动扩充为窗口矩形 / 显示标签\n");
+    s.push_str(&format!("pick_padding = {}\n", c.pick_padding));
+    s.push_str(&format!("pick_auto_expand = {}\n", b(c.pick_auto_expand)));
+    s.push_str(&format!("pick_show_label = {}\n", b(c.pick_show_label)));
+    s.push_str("# 探测节流（毫秒，>=16）/ 元素级最大深度\n");
+    s.push_str(&format!("pick_probe_interval_ms = {}\n", c.pick_probe_interval_ms));
+    s.push_str(&format!("pick_max_depth = {}\n", c.pick_max_depth));
+
+    s.push_str("\n[assist]\n");
+    s.push_str("# 放大镜开关 / 边长（逻辑像素）/ 放大倍数\n");
+    s.push_str(&format!("assist_magnifier = {}\n", b(c.assist_magnifier)));
+    s.push_str(&format!("assist_magnifier_size = {}\n", c.assist_magnifier_size));
+    s.push_str(&format!("assist_magnifier_zoom = {}\n", c.assist_magnifier_zoom));
+    s.push_str("# 辅助线开关 / 选区内九宫格 / 信息条\n");
+    s.push_str(&format!("assist_aux_lines = {}\n", b(c.assist_aux_lines)));
+    s.push_str(&format!("assist_aux_grid = {}\n", b(c.assist_aux_grid)));
+    s.push_str(&format!("assist_show_info = {}\n", b(c.assist_show_info)));
+    s.push_str("# 取色格式：hex_rgb / hex_rgba / rgb / hsl / hsv\n");
+    s.push_str(&format!("assist_color_format = {}\n", c.assist_color_format.label()));
+    s.push_str("# 标注阶段是否保留辅助层\n");
+    s.push_str(&format!("assist_in_annot = {}\n", b(c.assist_in_annot)));
 
     s.push_str("\n[ui]\n");
     s.push_str("# 工具栏（逻辑像素）：按钮边长 / 间距 / 上下内边距 / 左右内边距 / 圆角\n");
@@ -809,6 +955,14 @@ pub fn render(c: &Config) -> String {
     s.push_str(&format!("shadow_peak = {:.2}\n", c.pin_shadow_peak));
     s.push_str(&format!("zoom_step = {:.2}\n", c.pin_zoom_step));
     s.push_str(&format!("fit_ratio = {:.2}\n", c.pin_fit_ratio));
+    s.push_str("# 新贴图默认：不透明度(26-255，即 10%-100%) / 锁定 / 阴影 / 置顶\n");
+    s.push_str(&format!("opacity = {}\n", c.pin_opacity));
+    s.push_str(&format!("locked = {}\n", b(c.pin_locked)));
+    s.push_str(&format!("shadow = {}\n", b(c.pin_shadow)));
+    s.push_str(&format!("topmost = {}\n", b(c.pin_topmost)));
+    s.push_str("# 边缘缩放热区（逻辑像素）/ 缩放后至少保留的可见像素\n");
+    s.push_str(&format!("edge_hit = {}\n", c.pin_edge_hit));
+    s.push_str(&format!("min_visible_px = {}\n", c.pin_min_visible_px));
 
     s.push_str("\n[textimg]\n");
     s.push_str("# 文本贴图渲染：字体族 / 字号(px) / 页边距 / 最大宽度 / 行距倍数 / 前景色 / 背景色\n");
@@ -985,6 +1139,41 @@ pub fn parse_detailed(text: &str) -> (Config, Vec<String>) {
                 c.handle_stroke = parse_color_or(val, c.handle_stroke, "handle_stroke", &mut warnings)
             }
             "chrome_color" => c.chrome_color = parse_color_or(val, c.chrome_color, "chrome_color", &mut warnings),
+            "eraser_tol" => c.eraser_tol = parse_i32_or(val, 0, 200, c.eraser_tol, "eraser_tol", &mut warnings),
+            "watermark_angle" => c.watermark_angle = parse_i32_or(val, -90, 90, c.watermark_angle, "watermark_angle", &mut warnings),
+            "watermark_opacity" => c.watermark_opacity = parse_i32_or(val, 0, 255, c.watermark_opacity as i32, "watermark_opacity", &mut warnings) as u8,
+            "watermark_tile" => c.watermark_tile = parse_bool(val).unwrap_or(true),
+            "watermark_gap" => c.watermark_gap = parse_i32_or(val, 80, 2000, c.watermark_gap, "watermark_gap", &mut warnings),
+            "style_panel" => c.style_panel = parse_bool(val).unwrap_or(true),
+            "style_panel_palette" => {
+                for (i, item) in val.split(',').take(8).enumerate() {
+                    if let Some(col) = parse_color(item) {
+                        c.style_palette[i] = col;
+                    }
+                }
+            }
+            // [pick]
+            "pick_level" => match crate::pick::PickLevel::parse(val) {
+                Some(v) => c.pick_level = v,
+                None => warnings.push(format!("无法识别的 pick_level {val:?}，沿用默认 region")),
+            },
+            "pick_padding" => c.pick_padding = parse_i32_or(val, 0, 200, c.pick_padding, "pick_padding", &mut warnings),
+            "pick_auto_expand" => c.pick_auto_expand = parse_bool(val).unwrap_or(true),
+            "pick_probe_interval_ms" => c.pick_probe_interval_ms = parse_u32_or(val, 16, 2000, c.pick_probe_interval_ms, "pick_probe_interval_ms", &mut warnings),
+            "pick_show_label" => c.pick_show_label = parse_bool(val).unwrap_or(true),
+            "pick_max_depth" => c.pick_max_depth = parse_u32_or(val, 1, 64, c.pick_max_depth, "pick_max_depth", &mut warnings),
+            // [assist]
+            "assist_magnifier" => c.assist_magnifier = parse_bool(val).unwrap_or(true),
+            "assist_magnifier_size" => c.assist_magnifier_size = parse_i32_or(val, 24, 600, c.assist_magnifier_size, "assist_magnifier_size", &mut warnings),
+            "assist_magnifier_zoom" => c.assist_magnifier_zoom = parse_i32_or(val, 1, 16, c.assist_magnifier_zoom, "assist_magnifier_zoom", &mut warnings),
+            "assist_aux_lines" => c.assist_aux_lines = parse_bool(val).unwrap_or(true),
+            "assist_aux_grid" => c.assist_aux_grid = parse_bool(val).unwrap_or(false),
+            "assist_show_info" => c.assist_show_info = parse_bool(val).unwrap_or(true),
+            "assist_color_format" => match crate::assist::ColorFormat::parse(val) {
+                Some(v) => c.assist_color_format = v,
+                None => warnings.push(format!("无法识别的 assist_color_format {val:?}，沿用默认 hex_rgb")),
+            },
+            "assist_in_annot" => c.assist_in_annot = parse_bool(val).unwrap_or(false),
             // badge_outline：空 = 无外圈
             "badge_outline" => {
                 if val.is_empty() {
@@ -1065,6 +1254,12 @@ pub fn parse_detailed(text: &str) -> (Config, Vec<String>) {
             "shadow_peak" => c.pin_shadow_peak = parse_f32_or(val, 0.0, 1.0, c.pin_shadow_peak, "shadow_peak", &mut warnings),
             "zoom_step" => c.pin_zoom_step = parse_f32_or(val, 1.001, 5.0, c.pin_zoom_step, "zoom_step", &mut warnings),
             "fit_ratio" => c.pin_fit_ratio = parse_f32_or(val, 0.05, 1.0, c.pin_fit_ratio, "fit_ratio", &mut warnings),
+            "opacity" => c.pin_opacity = parse_i32_or(val, 26, 255, c.pin_opacity as i32, "opacity", &mut warnings) as u8,
+            "locked" => c.pin_locked = parse_bool(val).unwrap_or(false),
+            "shadow" => c.pin_shadow = parse_bool(val).unwrap_or(true),
+            "topmost" => c.pin_topmost = parse_bool(val).unwrap_or(true),
+            "edge_hit" => c.pin_edge_hit = parse_i32_or(val, 2, 40, c.pin_edge_hit, "edge_hit", &mut warnings),
+            "min_visible_px" => c.pin_min_visible_px = parse_i32_or(val, 8, 200, c.pin_min_visible_px, "min_visible_px", &mut warnings),
             // [textimg]
             "font_family" => {
                 if !val.is_empty() {
@@ -1369,6 +1564,99 @@ mod tests {
         assert!(parse("capture_cursor = YES\n").capture_cursor);
         assert!(!parse("capture_cursor = false\n").capture_cursor);
         assert!(!parse("capture_cursor = 随便\n").capture_cursor); // 非法值回退 false
+    }
+
+    #[test]
+    fn parse_pick_assist_and_pin_extensions() {
+        let c = parse(
+            "[pick]\n\
+             pick_level = element\n\
+             pick_padding = 12\n\
+             pick_auto_expand = false\n\
+             pick_probe_interval_ms = 100\n\
+             pick_show_label = false\n\
+             pick_max_depth = 20\n\
+             [assist]\n\
+             assist_magnifier = false\n\
+             assist_magnifier_size = 200\n\
+             assist_magnifier_zoom = 8\n\
+             assist_aux_lines = false\n\
+             assist_aux_grid = true\n\
+             assist_show_info = false\n\
+             assist_color_format = hsl\n\
+             assist_in_annot = true\n\
+             [pin]\n\
+             opacity = 128\n\
+             locked = true\n\
+             shadow = false\n\
+             topmost = false\n\
+             edge_hit = 10\n\
+             min_visible_px = 40\n",
+        );
+        assert_eq!(c.pick_level, crate::pick::PickLevel::Element);
+        assert_eq!(c.pick_padding, 12);
+        assert!(!c.pick_auto_expand);
+        assert_eq!(c.pick_probe_interval_ms, 100);
+        assert!(!c.pick_show_label);
+        assert_eq!(c.pick_max_depth, 20);
+        assert!(!c.assist_magnifier);
+        assert_eq!(c.assist_magnifier_size, 200);
+        assert_eq!(c.assist_magnifier_zoom, 8);
+        assert!(!c.assist_aux_lines);
+        assert!(c.assist_aux_grid);
+        assert!(!c.assist_show_info);
+        assert_eq!(c.assist_color_format, crate::assist::ColorFormat::Hsl);
+        assert!(c.assist_in_annot);
+        assert_eq!(c.pin_opacity, 128);
+        assert!(c.pin_locked && !c.pin_shadow && !c.pin_topmost);
+        assert_eq!(c.pin_edge_hit, 10);
+        assert_eq!(c.pin_min_visible_px, 40);
+
+        // 非法拾取级别回退默认 region
+        assert_eq!(
+            parse("pick_level = bogus\n").pick_level,
+            crate::pick::PickLevel::Region
+        );
+        // 非法色标项不污染其它色块
+        let p = parse("style_panel_palette = zzzz,00ff00\n").style_palette;
+        assert_eq!(p[0], DEF_STYLE_PALETTE[0]);
+        assert_eq!(p[1], Rgba::new(0, 0xFF, 0, 0xFF));
+    }
+
+    /// 颜色面板固定 8 色，顺序为 红/绿/蓝/青/品红/黄/黑/白。
+    #[test]
+    fn style_palette_is_eight_colors_in_fixed_order() {
+        let p = Config::default().style_palette;
+        assert_eq!(p.len(), 8);
+        assert_eq!(p[0], Rgba::new(0xFF, 0x00, 0x00, 0xFF), "红");
+        assert_eq!(p[1], Rgba::new(0x00, 0xFF, 0x00, 0xFF), "绿");
+        assert_eq!(p[2], Rgba::new(0x00, 0x00, 0xFF, 0xFF), "蓝");
+        assert_eq!(p[3], Rgba::new(0x00, 0xFF, 0xFF, 0xFF), "青");
+        assert_eq!(p[4], Rgba::new(0xFF, 0x00, 0xFF, 0xFF), "品红");
+        assert_eq!(p[5], Rgba::new(0xFF, 0xFF, 0x00, 0xFF), "黄");
+        assert_eq!(p[6], Rgba::new(0x00, 0x00, 0x00, 0xFF), "黑");
+        assert_eq!(p[7], Rgba::new(0xFF, 0xFF, 0xFF, 0xFF), "白");
+    }
+
+    /// 新增段/键必须参与 render → parse 幂等。
+    #[test]
+    fn new_sections_roundtrip() {
+        let mut c = Config::default();
+        c.pick_level = crate::pick::PickLevel::Window;
+        c.pick_padding = 7;
+        c.assist_magnifier = false;
+        c.assist_color_format = crate::assist::ColorFormat::Rgb;
+        c.pin_opacity = 128;
+        c.eraser_tol = 9;
+        c.watermark_opacity = 90;
+        let back = parse(&render(&c));
+        assert_eq!(back.pick_level, c.pick_level);
+        assert_eq!(back.pick_padding, c.pick_padding);
+        assert_eq!(back.assist_magnifier, c.assist_magnifier);
+        assert_eq!(back.assist_color_format, c.assist_color_format);
+        assert_eq!(back.pin_opacity, c.pin_opacity);
+        assert_eq!(back.eraser_tol, c.eraser_tol);
+        assert_eq!(back.watermark_opacity, c.watermark_opacity);
     }
 
     /// 分节写法（`[section]` + 叶子键）与旧扁平键名（别名）都应被识别。

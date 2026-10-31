@@ -7,6 +7,9 @@
 //! 生命周期：由工具条创建（[`Tip::new`]）、随工具条销毁（[`Tip::destroy`]）。
 //! 显示时机由调用方（工具条的按钮子类化过程）控制 —— 悬停延时后 [`Tip::show`]，
 //! 离开/点击时 [`Tip::hide`]。
+//!
+//! **全局单例**：同一时刻只显示最新一条提示。切换按钮时旧气泡立即隐藏；
+//! [`Tip::show`] 还会隐藏其它同类窗口，避免旧工具条/异常路径残留的气泡叠加。
 
 use crate::theme;
 use crate::util::{self, raw, register_class_w};
@@ -51,6 +54,19 @@ pub struct Tip {
 unsafe fn data_of(hwnd: HWND) -> Option<&'static mut TipData> {
     let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     (p != 0).then(|| &mut *(p as *mut TipData))
+}
+
+/// 隐藏除 `keep` 外的所有同大类气泡窗口，确保任意时刻只显示最新 tip。
+unsafe fn hide_other_tips(keep: HWND) {
+    let cls = util::to_wide(CLASS);
+    let cls_ptr = PCWSTR::from_raw(cls.as_ptr());
+    let mut h = FindWindowW(cls_ptr, PCWSTR::null()).ok();
+    while let Some(cur) = h {
+        if cur != keep {
+            let _ = ShowWindow(cur, SW_HIDE);
+        }
+        h = FindWindowExW(HWND::default(), cur, cls_ptr, PCWSTR::null()).ok();
+    }
 }
 
 impl Tip {
@@ -140,7 +156,13 @@ impl Tip {
             ((tr.right - tr.left).max(1), (tr.bottom - tr.top).max(1))
         };
         let (lw, lh) = measure(&d.label);
-        let (sw, sh) = measure(&d.suffix);
+        // 空后缀不能送入 DrawTextW：`Vec::new().as_ptr()` 是悬垂指针，
+        // `cchText = -1` 会让 GDI 一直读到非法地址（访问冲突 → 进程直接退出）。
+        let (sw, sh) = if d.suffix.is_empty() {
+            (0, 0)
+        } else {
+            measure(&d.suffix)
+        };
         SelectObject(hdc, old_font);
         let _ = ReleaseDC(self.hwnd, hdc);
 
@@ -164,6 +186,8 @@ impl Tip {
         x = x.clamp(mi.left, (mi.right - w).max(mi.left));
         y = y.clamp(mi.top, (mi.bottom - h).max(mi.top));
 
+        // 全局单例：隐藏其它尚未消失的旧气泡，只保留当前窗口。
+        hide_other_tips(self.hwnd);
         let _ = SetWindowPos(
             self.hwnd,
             HWND_TOPMOST,

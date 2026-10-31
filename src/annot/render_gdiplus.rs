@@ -15,6 +15,7 @@ use windows::Win32::Graphics::GdiPlus::{
     GdipDeleteStringFormat, GdipDrawEllipseI, GdipDrawLineI, GdipDrawLines, GdipDrawRectangleI,
     GdipDrawString, GdipFillEllipseI, GdipFillPolygonI, GdipFillRectangleI,
     GdipGetGenericFontFamilySansSerif, GdipMeasureString, GdipResetWorldTransform,
+    GdipRestoreGraphics, GdipRotateWorldTransform, GdipSaveGraphics,
     GdipSetClipRectI, GdipSetPenDashStyle, GdipSetPenLineCap197819, GdipSetPenLineJoin,
     GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdipSetStringFormatAlign,
     GdipSetStringFormatLineAlign, GdipSetTextRenderingHint, GdipTranslateWorldTransform,
@@ -187,9 +188,88 @@ pub unsafe fn draw_shape(g: *mut GpGraphics, shape: &Shape, prefs: &AnnotPrefs, 
             draw_text_frame(g, *bbox, *frame, style, env);
             draw_text(g, *origin, text, style, env);
         }
+        Shape::Watermark {
+            bbox,
+            text,
+            style,
+            wm,
+        } => draw_watermark(g, bbox, text, style, wm, env),
         // 马赛克/高亮不在此绘制：由 session 的 CPU 像素算子完成（见 session::draw_one）
         Shape::Mosaic { .. } | Shape::Highlight { .. } => {}
     }
+}
+
+/// 水印：按 `wm` 平铺/居中，旋转后以半透明文字绘制（最多 64 个单元，避免大屏开销）。
+unsafe fn draw_watermark(
+    g: *mut GpGraphics,
+    bbox: &Rect,
+    text: &str,
+    style: &TextStyle,
+    wm: &super::style::WatermarkStyle,
+    env: &RenderEnv,
+) {
+    if text.trim().is_empty() || bbox.w <= 0 || bbox.h <= 0 {
+        return;
+    }
+    let (tw, th) = super::shape::text_est_size(text, style.font_px);
+    let mut color = style.color;
+    color.a = (color.a as u32 * wm.opacity as u32 / 255) as u8;
+    let mut state = 0u32;
+    let _ = GdipSaveGraphics(g, &mut state);
+    let mut drawn = 0;
+    let gap = wm.gap.max(80);
+    if wm.tile {
+        let mut cy = bbox.y + gap / 2;
+        while cy < bbox.bottom() && drawn < 64 {
+            let mut cx = bbox.x + gap / 2;
+            while cx < bbox.right() && drawn < 64 {
+                draw_watermark_cell(g, cx, cy, tw, th, text, style, color, wm.angle_deg, env);
+                drawn += 1;
+                cx += gap;
+            }
+            cy += gap;
+        }
+    } else {
+        draw_watermark_cell(
+            g,
+            bbox.x + bbox.w / 2,
+            bbox.y + bbox.h / 2,
+            tw,
+            th,
+            text,
+            style,
+            color,
+            wm.angle_deg,
+            env,
+        );
+    }
+    let _ = GdipRestoreGraphics(g, state);
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_watermark_cell(
+    g: *mut GpGraphics,
+    cx: i32,
+    cy: i32,
+    tw: i32,
+    th: i32,
+    text: &str,
+    style: &TextStyle,
+    color: Rgba,
+    angle: i32,
+    env: &RenderEnv,
+) {
+    let mut state = 0u32;
+    let _ = GdipSaveGraphics(g, &mut state);
+    let _ = GdipTranslateWorldTransform(g, cx as f32, cy as f32, MatrixOrderPrepend);
+    let _ = GdipRotateWorldTransform(g, angle as f32, MatrixOrderPrepend);
+    let origin = Pt::new(-tw / 2, -th / 2);
+    let tinted = TextStyle {
+        color,
+        ..style.clone()
+    };
+    draw_text(g, origin, text, &tinted, env);
+    let _ = GdipRestoreGraphics(g, state);
 }
 
 /// 自由画笔：硬笔一笔整条折线；软笔按点距渐细逐段绘制；渐隐笔沿轨迹升透明度。
@@ -637,7 +717,7 @@ pub unsafe fn draw_chrome(g: *mut GpGraphics, shape: &Shape, dpi: i32, prefs: &A
         }
         // 文字不参与缩放（`hit_test::hit_handle` 恒 None）——只画虚线框，
         // 不画可拖控制柄（画了也拖不动，误导用户）。
-        Shape::Text { bbox, .. } => {
+        Shape::Text { bbox, .. } | Shape::Watermark { bbox, .. } => {
             let box_ = bbox.inflate(s(2));
             let p = make_dashed_pen(dash, 1);
             if !p.is_null() {

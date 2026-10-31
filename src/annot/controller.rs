@@ -10,9 +10,12 @@ use super::doc::AnnotDoc;
 use super::geometry::{norm_rect, rect_union, union_opt, Pt, Rect};
 use super::hit_test::{self, Handle};
 use super::shape::{arrow_head_len, pen_bounds, text_est_size, Shape};
-use super::style::{AnnotPrefs, PenStyle, StrokeStyle, TextStyle};
+use super::style::{
+    AnnotPrefs, BadgeStyle, HighlightMode, MosaicMode, PenKind, PenStyle, Rgba, StrokeStyle,
+    TextFrame, TextStyle, WatermarkStyle,
+};
 
-/// 工具种类。
+/// 工具种类。判别值 1..9 保持稳定；新工具追加在末尾。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     None,
@@ -25,6 +28,74 @@ pub enum Tool {
     Mosaic,
     Highlight,
     Text,
+    /// 对象橡皮：拖过即删，松手合并为一条撤销记录。
+    Eraser,
+    /// 文字水印：复用文字输入链路，提交为整选区水印。
+    Watermark,
+}
+
+/// 文字输入类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextKind {
+    Normal,
+    Watermark,
+}
+
+/// Ctrl+滚轮可调整的标注尺寸类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeKind {
+    /// 线宽（矩形/箭头/椭圆/线段/画笔）。
+    StrokeWidth,
+    /// 字号（文字/水印）。
+    TextSize,
+    /// 步骤序号半径。
+    StepRadius,
+    /// 橡皮命中容差。
+    EraserTol,
+}
+
+impl SizeKind {
+    pub fn from_u32(v: u32) -> Option<Self> {
+        Some(match v {
+            1 => Self::StrokeWidth,
+            2 => Self::TextSize,
+            3 => Self::StepRadius,
+            4 => Self::EraserTol,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StrokeWidth => "线宽",
+            Self::TextSize => "字号",
+            Self::StepRadius => "序号半径",
+            Self::EraserTol => "橡皮容差",
+        }
+    }
+
+    /// 消息协议编码（与 [`Self::from_u32`] 对应）。
+    pub fn code(self) -> u32 {
+        match self {
+            Self::StrokeWidth => 1,
+            Self::TextSize => 2,
+            Self::StepRadius => 3,
+            Self::EraserTol => 4,
+        }
+    }
+
+    /// 工具对应的可调尺寸；无尺寸概念的工具（马赛克/高亮/无）返回 `None`。
+    pub fn for_tool(tool: Tool) -> Option<Self> {
+        match tool {
+            Tool::Rect | Tool::Arrow | Tool::Ellipse | Tool::Line | Tool::Pen => {
+                Some(Self::StrokeWidth)
+            }
+            Tool::Text | Tool::Watermark => Some(Self::TextSize),
+            Tool::StepNo => Some(Self::StepRadius),
+            Tool::Eraser => Some(Self::EraserTol),
+            Tool::None | Tool::Mosaic | Tool::Highlight => None,
+        }
+    }
 }
 
 /// 交互模式。
@@ -66,7 +137,29 @@ pub enum Mode {
     Typing {
         anchor: Pt,
         text: String,
+        kind: TextKind,
     },
+    /// 橡皮拖动中：`ids` 为预览删除集合（松手才落一条命令）。
+    Erasing {
+        ids: Vec<u64>,
+        last: Pt,
+    },
+}
+
+/// 样式补丁（UI 无关；面板 → 控制器）。
+#[derive(Debug, Clone, Default)]
+pub struct StylePatch {
+    pub stroke_color: Option<Rgba>,
+    pub stroke_width: Option<i32>,
+    pub text_color: Option<Rgba>,
+    pub text_size: Option<i32>,
+    pub text_bold: Option<bool>,
+    pub text_italic: Option<bool>,
+    pub pen_kind: Option<PenKind>,
+    pub mosaic_mode: Option<MosaicMode>,
+    pub highlight_mode: Option<HighlightMode>,
+    pub text_frame: Option<TextFrame>,
+    pub badge: Option<BadgeStyle>,
 }
 
 /// 光标种类（映射到系统 `IDC_*`）。
@@ -122,6 +215,9 @@ const VK_T: usize = 0x54;
 const VK_E: usize = 0x45;
 const VK_L: usize = 0x4C;
 const VK_P: usize = 0x50;
+/// 橡皮 `X` / 水印 `M`（避开已占用的 E/L/P/B/H/T）。
+const VK_X: usize = 0x58;
+const VK_M: usize = 0x4D;
 
 /// 标注会话（逻辑层）。
 pub struct AnnotSession {
@@ -175,12 +271,21 @@ impl AnnotSession {
     /// 输入中的 `(锚点, 正文, 文字样式)`：供光标绘制与工具栏查询。
     pub fn typing_state(&self) -> Option<(Pt, String, TextStyle)> {
         match &self.mode {
-            Mode::Typing { anchor, text } => Some((*anchor, text.clone(), self.text_style())),
+            Mode::Typing { anchor, text, .. } => Some((*anchor, text.clone(), self.text_style())),
             _ => None,
         }
     }
 
-    /// 是否需要鼠标捕获（绘制/拖动/缩放期间，见 5.1 的 SetCapture）。
+    /// 当前输入类型（普通文字 / 水印）。
+    #[allow(dead_code)]
+    pub fn typing_kind(&self) -> Option<TextKind> {
+        match &self.mode {
+            Mode::Typing { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// 是否需要鼠标捕获（绘制/拖动/缩放/橡皮期间，见 5.1 的 SetCapture）。
     pub fn capturing(&self) -> bool {
         matches!(
             self.mode,
@@ -188,20 +293,41 @@ impl AnnotSession {
                 | Mode::Freehand { .. }
                 | Mode::Moving { .. }
                 | Mode::Resizing { .. }
+                | Mode::Erasing { .. }
         )
     }
 
-    /// 渲染主循环需跳过的形状 id：拖动/缩放中的「旧位置」提交副本（其瞬态由
-    /// chrome/预览分支绘制），以及**选中态**形状（由 chrome 分支连同控制柄统一
-    /// 绘制）——主循环若不跳过，选中形状会画两遍，文字抗锯齿边缘与渐隐笔的
-    /// alpha 会被重复混合而变深。
-    pub fn render_skip_id(&self) -> Option<u64> {
+    /// 当前选中项 id（Selected / Moving / Resizing）。
+    pub fn selected_id(&self) -> Option<u64> {
         match &self.mode {
-            Mode::Moving { id, .. } | Mode::Resizing { id, .. } | Mode::Selected { id } => {
-                Some(*id)
-            }
+            Mode::Selected { id } | Mode::Moving { id, .. } | Mode::Resizing { id, .. } => Some(*id),
             _ => None,
         }
+    }
+
+    /// 当前选中项形状（只读）。
+    pub fn selected_shape(&self) -> Option<&Shape> {
+        self.selected_id().and_then(|id| self.doc.find(id))
+    }
+
+    /// 渲染主循环需跳过的形状 id 集合。
+    ///
+    /// - 拖动/缩放中的「旧位置」提交副本与**选中态**形状（由 chrome/预览分支绘制）；
+    /// - 橡皮拖过但尚未落命令的形状（预览删除）。
+    pub fn render_skip_ids(&self) -> Vec<u64> {
+        match &self.mode {
+            Mode::Moving { id, .. } | Mode::Resizing { id, .. } | Mode::Selected { id } => {
+                vec![*id]
+            }
+            Mode::Erasing { ids, .. } => ids.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// 兼容旧调用点：单个跳过 id。
+    #[allow(dead_code)]
+    pub fn render_skip_id(&self) -> Option<u64> {
+        self.render_skip_ids().into_iter().next()
     }
 
     /// 移动中：被拖形状 id 与预览位移（渲染层据此让挂线文字的**预览**跟随，
@@ -225,7 +351,7 @@ impl AnnotSession {
         match &self.mode {
             Mode::Drawing { tool, anchor, cur } => Some(self.new_shape(*tool, *anchor, *cur)),
             Mode::Freehand { pts } => Some(self.new_pen(pts.clone())),
-            Mode::Typing { anchor, text } => {
+            Mode::Typing { anchor, text, .. } => {
                 Some(self.new_text_shape(*anchor, text.clone(), None))
             }
             Mode::Moving { orig, grab, cur, .. } => {
@@ -292,6 +418,16 @@ impl AnnotSession {
                 self.mode = Mode::Typing {
                     anchor: p,
                     text: String::new(),
+                    kind: TextKind::Normal,
+                };
+                return self.action(before, CursorKind::IBeam);
+            }
+            // 水印：同样复用文字输入，提交时生成整选区水印
+            Tool::Watermark => {
+                self.mode = Mode::Typing {
+                    anchor: p,
+                    text: String::new(),
+                    kind: TextKind::Watermark,
                 };
                 return self.action(before, CursorKind::IBeam);
             }
@@ -299,6 +435,21 @@ impl AnnotSession {
             Tool::Pen => {
                 self.mode = Mode::Freehand { pts: vec![p] };
                 return self.action(before, CursorKind::Cross);
+            }
+            // 橡皮：按下即收集命中并进入预览删除
+            Tool::Eraser => {
+                let mut ids = Vec::new();
+                self.collect_erase_hits(p, &mut ids);
+                self.mode = Mode::Erasing {
+                    ids: ids.clone(),
+                    last: p,
+                };
+                let dirty = self.eraser_dirty(&ids);
+                return Action {
+                    redraw: union_opt(before, dirty),
+                    cursor: Some(CursorKind::Arrow),
+                    esc_passthrough: false,
+                };
             }
             Tool::None => {}
             _ => {
@@ -361,6 +512,50 @@ impl AnnotSession {
             return Action::default();
         }
         let before = self.transient_bbox();
+        // 橡皮：沿 (last, p) 插值采样，收集命中 id（预览删除，不落命令）。
+        if matches!(self.mode, Mode::Erasing { .. }) {
+            let tol = self.eraser_tol();
+            let last = match &self.mode {
+                Mode::Erasing { last, .. } => *last,
+                _ => p,
+            };
+            let mut samples = Vec::new();
+            let dx = (p.x - last.x).abs();
+            let dy = (p.y - last.y).abs();
+            let n = (dx.max(dy) / (tol / 2).max(1)).max(1);
+            for i in 1..=n {
+                samples.push(Pt::new(
+                    last.x + (p.x - last.x) * i / n,
+                    last.y + (p.y - last.y) * i / n,
+                ));
+            }
+            let mut found: Vec<u64> = Vec::new();
+            for q in samples {
+                for a in self.doc.shapes().iter().rev() {
+                    if hit_test::hit_shape(&a.shape, q, tol) && !found.contains(&a.id) {
+                        found.push(a.id);
+                    }
+                }
+            }
+            if let Mode::Erasing { ids, last } = &mut self.mode {
+                for id in found {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                *last = p;
+            }
+            let ids = match &self.mode {
+                Mode::Erasing { ids, .. } => ids.clone(),
+                _ => Vec::new(),
+            };
+            let dirty = self.eraser_dirty(&ids);
+            return Action {
+                redraw: union_opt(before, dirty),
+                cursor: Some(CursorKind::Arrow),
+                esc_passthrough: false,
+            };
+        }
         let step = self.s(self.prefs.pen_min_step).max(1);
         match &mut self.mode {
             Mode::Drawing { cur, .. } | Mode::Moving { cur, .. } | Mode::Resizing { cur, .. } => {
@@ -418,6 +613,12 @@ impl AnnotSession {
                 if self.pen_is_committable(&shape) {
                     extra = Some(shape.bbox());
                     self.doc.add(shape);
+                }
+            }
+            Mode::Erasing { ids, .. } => {
+                // 一次拖动 = 一条 DeleteGroup 撤销记录
+                if let Some(d) = self.doc.delete_many(&ids) {
+                    extra = Some(d);
                 }
             }
             Mode::Moving { id, grab, orig, .. } => {
@@ -484,7 +685,7 @@ impl AnnotSession {
         }
     }
 
-    pub fn on_key(&mut self, vk: usize, ctrl: bool) -> Action {
+    pub fn on_key(&mut self, vk: usize, ctrl: bool, shift: bool) -> Action {
         let before = self.transient_bbox();
 
         // 输入中：编辑键（换行/退格/正文）经 `on_char`；这里只处理 Esc
@@ -498,6 +699,17 @@ impl AnnotSession {
                 return a;
             }
             return Action::default();
+        }
+
+        // Ctrl+Shift+Delete：清空全部标注（一条撤销记录）
+        if ctrl && shift && vk == VK_DELETE {
+            let d = self.doc.clear_all();
+            self.mode = Mode::Idle;
+            return Action {
+                redraw: union_opt(before, d),
+                cursor: Some(CursorKind::Arrow),
+                esc_passthrough: false,
+            };
         }
 
         // Ctrl+Z / Ctrl+Y：撤销重做（模式不变，见 5.1）。
@@ -574,6 +786,8 @@ impl AnnotSession {
             VK_B => self.set_tool(Tool::Mosaic),
             VK_H => self.set_tool(Tool::Highlight),
             VK_T => self.set_tool(Tool::Text),
+            VK_X => self.set_tool(Tool::Eraser),
+            VK_M => self.set_tool(Tool::Watermark),
             _ => Action::default(),
         }
     }
@@ -610,7 +824,7 @@ impl AnnotSession {
         if !matches!(self.mode, Mode::Typing { .. }) {
             return Action::default();
         }
-        let Mode::Typing { anchor, text } = std::mem::replace(&mut self.mode, Mode::Idle) else {
+        let Mode::Typing { anchor, text, kind } = std::mem::replace(&mut self.mode, Mode::Idle) else {
             return Action::default();
         };
         if text.trim().is_empty() {
@@ -618,6 +832,16 @@ impl AnnotSession {
             return Action {
                 redraw: None,
                 cursor: Some(self.cursor_at_fallback()),
+                esc_passthrough: false,
+            };
+        }
+        if kind == TextKind::Watermark {
+            let shape = self.new_watermark_shape(text);
+            let dirty = shape.dirty_bbox();
+            self.doc.add(shape);
+            return Action {
+                redraw: Some(dirty),
+                cursor: Some(CursorKind::Cross),
                 esc_passthrough: false,
             };
         }
@@ -682,6 +906,7 @@ impl AnnotSession {
     pub fn cursor_at(&self, p: Pt) -> CursorKind {
         match &self.mode {
             Mode::Drawing { .. } | Mode::Freehand { .. } => CursorKind::Cross,
+            Mode::Erasing { .. } => CursorKind::Arrow,
             Mode::Typing { .. } => CursorKind::IBeam,
             Mode::Resizing { handle, .. } => cursor_for_handle(*handle),
             Mode::Moving { .. } => CursorKind::SizeAll,
@@ -822,6 +1047,14 @@ impl AnnotSession {
                 mode: self.prefs.highlight_mode,
             },
             Tool::Text => self.new_text_shape(anchor, String::new(), None),
+            Tool::Watermark | Tool::Eraser => Shape::Rect {
+                bbox: norm_rect(anchor, cur),
+                style: StrokeStyle {
+                    color: self.prefs.stroke_color,
+                    width: self.s(self.prefs.stroke_width),
+                },
+                fill: None,
+            },
             Tool::None => Shape::Rect {
                 bbox: norm_rect(anchor, cur),
                 style: StrokeStyle {
@@ -869,6 +1102,125 @@ impl AnnotSession {
         }
     }
 
+    /// 水印形状：包围盒恒为整个选区（平铺/居中由渲染层按 `wm.tile` 决定）。
+    fn new_watermark_shape(&self, text: String) -> Shape {
+        let style = self.text_style();
+        let wm = WatermarkStyle {
+            angle_deg: self.prefs.watermark_angle,
+            opacity: self.prefs.watermark_opacity,
+            tile: self.prefs.watermark_tile,
+            gap: self.prefs.watermark_gap,
+        }
+        .clamped(self.dpi);
+        Shape::Watermark {
+            bbox: self.bounds,
+            text,
+            style,
+            wm,
+        }
+    }
+
+    /// 应用样式补丁：作用于选中项（有则 restyle），否则更新默认偏好。
+    pub fn apply_style(&mut self, patch: StylePatch) -> Action {
+        let before = self.transient_bbox();
+        if let Some(id) = self.selected_id() {
+            if let Some(cur) = self.doc.find(id).cloned() {
+                let new = restyle_shape(&cur, &patch, self.dpi);
+                if new != cur {
+                    if let Some(d) = self.doc.restyle(id, new) {
+                        let cursor = self.cursor_at_fallback();
+                        return Action {
+                            redraw: union_opt(union_opt(before, self.transient_bbox()), Some(d)),
+                            cursor: Some(cursor),
+                            esc_passthrough: false,
+                        };
+                    }
+                }
+            }
+        }
+        self.prefs = apply_prefs(self.prefs, &patch);
+        let cursor = self.cursor_at_fallback();
+        self.action(before, cursor)
+    }
+
+    /// 直接设置默认偏好（颜色面板同步/配置下发）。
+    #[allow(dead_code)]
+    pub fn set_prefs(&mut self, prefs: AnnotPrefs) -> Action {
+        let before = self.transient_bbox();
+        self.prefs = prefs;
+        let cursor = self.cursor_at_fallback();
+        self.action(before, cursor)
+    }
+
+    /// Ctrl+滚轮调整标注默认尺寸（线宽/字号/序号半径/橡皮容差）。
+    pub fn adjust_size(&mut self, kind: SizeKind, delta: i32) -> Action {
+        let before = self.transient_bbox();
+        match kind {
+            SizeKind::StrokeWidth => {
+                self.prefs.stroke_width = (self.prefs.stroke_width + delta).clamp(1, 200);
+            }
+            SizeKind::TextSize => {
+                self.prefs.text_size = (self.prefs.text_size + delta).clamp(4, 400);
+            }
+            SizeKind::StepRadius => {
+                self.prefs.step_radius = (self.prefs.step_radius + delta).clamp(2, 200);
+            }
+            SizeKind::EraserTol => {
+                self.prefs.eraser_tol = (self.prefs.eraser_tol + delta).clamp(0, 200);
+            }
+        }
+        let cursor = self.cursor_at_fallback();
+        self.action(before, cursor)
+    }
+
+    /// 当前尺寸值（供工具条提示）。
+    pub fn size_value(&self, kind: SizeKind) -> i32 {
+        match kind {
+            SizeKind::StrokeWidth => self.prefs.stroke_width,
+            SizeKind::TextSize => self.prefs.text_size,
+            SizeKind::StepRadius => self.prefs.step_radius,
+            SizeKind::EraserTol => self.prefs.eraser_tol,
+        }
+    }
+
+    /// 清空全部（一条撤销记录）。Esc 语义不变。
+    pub fn clear_all(&mut self) -> Action {
+        let before = self.transient_bbox();
+        self.mode = Mode::Idle;
+        let d = self.doc.clear_all();
+        Action {
+            redraw: union_opt(before, d),
+            cursor: Some(CursorKind::Arrow),
+            esc_passthrough: false,
+        }
+    }
+
+    fn eraser_tol(&self) -> i32 {
+        self.s(self.prefs.eraser_tol).max(1)
+    }
+
+    /// 收集 `p` 处命中的标注 id（倒序 z 序，去重）。
+    fn collect_erase_hits(&self, p: Pt, ids: &mut Vec<u64>) {
+        let tol = self.eraser_tol();
+        for a in self.doc.shapes().iter().rev() {
+            if hit_test::hit_shape(&a.shape, p, tol) && !ids.contains(&a.id) {
+                ids.push(a.id);
+            }
+        }
+    }
+
+    /// 橡皮预览脏区（被擦形状 bbox 并集 + 外扩余量）。
+    fn eraser_dirty(&self, ids: &[u64]) -> Option<Rect> {
+        let mut dirty: Option<Rect> = None;
+        for id in ids {
+            if let Some(s) = self.doc.find(*id) {
+                let r = s.bbox().inflate(self.chrome_ext());
+                dirty = union_opt(dirty, Some(r));
+            }
+        }
+        dirty
+    }
+
     /// 在落点附近寻找可挂线的线段/箭头，返回其 id（取最近的一条）。
     fn find_attach(&self, p: Pt) -> Option<u64> {
         let tol = self.s(self.prefs.attach_tol).max(1) as f32;
@@ -906,6 +1258,7 @@ impl AnnotSession {
         let min = self.min_size();
         match tool {
             Tool::StepNo | Tool::Text | Tool::Pen => true,
+            Tool::Eraser | Tool::Watermark => false,
             Tool::Arrow | Tool::Line => {
                 let dx = (cur.x - anchor.x) as f32;
                 let dy = (cur.y - anchor.y) as f32;
@@ -945,6 +1298,7 @@ impl AnnotSession {
             Mode::Freehand { pts } => {
                 Some(pen_bounds(pts).inflate((self.s(self.prefs.stroke_width) / 2).max(1)))
             }
+            Mode::Erasing { ids, .. } => self.eraser_dirty(ids),
             // 文字预览用保守脏区（真实字形可超出估算 bbox）
             _ => self.preview_shape().map(|s| s.dirty_bbox()),
         };
@@ -980,6 +1334,7 @@ impl AnnotSession {
     fn cursor_at_fallback(&self) -> CursorKind {
         match &self.mode {
             Mode::Drawing { .. } | Mode::Freehand { .. } => CursorKind::Cross,
+            Mode::Erasing { .. } => CursorKind::Arrow,
             Mode::Typing { .. } => CursorKind::IBeam,
             Mode::Resizing { handle, .. } => cursor_for_handle(*handle),
             Mode::Moving { .. } | Mode::Selected { .. } => CursorKind::SizeAll,
@@ -992,6 +1347,161 @@ impl AnnotSession {
             }
         }
     }
+}
+
+/// 样式补丁应用到单个形状（**绝不**解绑挂线文字）。
+/// 注意：补丁里的 `stroke_width` / `text_size` 来自颜色面板的**当前实际值**
+///（选中形状时是物理像素，无选中时是逻辑像素偏好），因此这里不再二次缩放。
+fn restyle_shape(cur: &Shape, p: &StylePatch, _dpi: i32) -> Shape {
+    let s = |v: i32| v;
+    match cur {
+        Shape::Rect { bbox, style, fill } => Shape::Rect {
+            bbox: *bbox,
+            style: StrokeStyle {
+                color: p.stroke_color.unwrap_or(style.color),
+                width: p.stroke_width.map(s).unwrap_or(style.width),
+            },
+            fill: *fill,
+        },
+        Shape::Ellipse { bbox, style } => Shape::Ellipse {
+            bbox: *bbox,
+            style: StrokeStyle {
+                color: p.stroke_color.unwrap_or(style.color),
+                width: p.stroke_width.map(s).unwrap_or(style.width),
+            },
+        },
+        Shape::Line { from, to, style } => Shape::Line {
+            from: *from,
+            to: *to,
+            style: StrokeStyle {
+                color: p.stroke_color.unwrap_or(style.color),
+                width: p.stroke_width.map(s).unwrap_or(style.width),
+            },
+        },
+        Shape::Arrow {
+            from,
+            to,
+            style,
+            head_len,
+        } => Shape::Arrow {
+            from: *from,
+            to: *to,
+            style: StrokeStyle {
+                color: p.stroke_color.unwrap_or(style.color),
+                width: p.stroke_width.map(s).unwrap_or(style.width),
+            },
+            head_len: *head_len,
+        },
+        Shape::Pen { pts, style } => Shape::Pen {
+            pts: pts.clone(),
+            style: PenStyle {
+                color: p.stroke_color.unwrap_or(style.color),
+                width: p.stroke_width.map(s).unwrap_or(style.width),
+                kind: p.pen_kind.unwrap_or(style.kind),
+            },
+        },
+        Shape::Mosaic { bbox, mode } => Shape::Mosaic {
+            bbox: *bbox,
+            mode: p.mosaic_mode.unwrap_or(*mode),
+        },
+        Shape::Highlight { bbox, color, mode } => Shape::Highlight {
+            bbox: *bbox,
+            color: p.stroke_color.unwrap_or(*color),
+            mode: p.highlight_mode.unwrap_or(*mode),
+        },
+        Shape::StepNo {
+            center,
+            radius,
+            number,
+            style,
+        } => Shape::StepNo {
+            center: *center,
+            radius: *radius,
+            number: *number,
+            style: p.badge.unwrap_or(*style),
+        },
+        // 文字：保留 origin 旁的挂线关系；改字号时以原 bbox 中心重排，避免脱离线段。
+        Shape::Text {
+            origin: _,
+            text,
+            bbox,
+            style,
+            frame,
+            attach,
+        } => {
+            let mut st = TextStyle {
+                color: p.text_color.unwrap_or(style.color),
+                font_px: p.text_size.map(s).unwrap_or(style.font_px),
+                bold: p.text_bold.unwrap_or(style.bold),
+                italic: p.text_italic.unwrap_or(style.italic),
+            };
+            st.font_px = st.font_px.max(1);
+            let (w, h) = text_est_size(text, st.font_px);
+            let c = bbox.center();
+            Shape::Text {
+                origin: Pt::new(c.x - w.max(2) / 2, c.y - h.max(8) / 2),
+                text: text.clone(),
+                bbox: Rect::new(c.x - w.max(2) / 2, c.y - h.max(8) / 2, w.max(2), h.max(8)),
+                style: st,
+                frame: p.text_frame.unwrap_or(*frame),
+                attach: *attach,
+            }
+        }
+        Shape::Watermark {
+            bbox,
+            text,
+            style,
+            wm,
+        } => Shape::Watermark {
+            bbox: *bbox,
+            text: text.clone(),
+            style: TextStyle {
+                color: p.text_color.unwrap_or(style.color),
+                font_px: p.text_size.map(s).unwrap_or(style.font_px).max(1),
+                bold: p.text_bold.unwrap_or(style.bold),
+                italic: p.text_italic.unwrap_or(style.italic),
+            },
+            wm: *wm,
+        },
+    }
+}
+
+/// 无选中项时，把补丁写入默认偏好（影响后续新建标注）。
+fn apply_prefs(mut prefs: AnnotPrefs, p: &StylePatch) -> AnnotPrefs {
+    if let Some(v) = p.stroke_color {
+        prefs.stroke_color = v;
+    }
+    if let Some(v) = p.stroke_width {
+        prefs.stroke_width = v.max(1);
+    }
+    if let Some(v) = p.text_color {
+        prefs.text_color = v;
+    }
+    if let Some(v) = p.text_size {
+        prefs.text_size = v.max(4);
+    }
+    if let Some(v) = p.text_bold {
+        prefs.text_bold = v;
+    }
+    if let Some(v) = p.text_italic {
+        prefs.text_italic = v;
+    }
+    if let Some(v) = p.pen_kind {
+        prefs.pen_kind = v;
+    }
+    if let Some(v) = p.mosaic_mode {
+        prefs.mosaic_mode = v;
+    }
+    if let Some(v) = p.highlight_mode {
+        prefs.highlight_mode = v;
+    }
+    if let Some(v) = p.text_frame {
+        prefs.text_frame = v;
+    }
+    if let Some(v) = p.badge {
+        prefs.badge = v;
+    }
+    prefs
 }
 
 fn sign(v: i32) -> i32 {
@@ -1084,11 +1594,11 @@ mod tests {
         assert_eq!(s.doc.len(), 1);
         assert!(a.redraw.is_some());
         // 撤销
-        let a = s.on_key(VK_Z, true);
+        let a = s.on_key(VK_Z, true, false);
         assert_eq!(s.doc.len(), 0);
         assert!(a.redraw.is_some());
         // 重做
-        s.on_key(VK_Y, true);
+        s.on_key(VK_Y, true, false);
         assert_eq!(s.doc.len(), 1);
     }
 
@@ -1148,10 +1658,10 @@ mod tests {
         }
 
         // Delete 删除
-        s.on_key(VK_DELETE, false);
+        s.on_key(VK_DELETE, false, false);
         assert!(s.doc.is_empty());
         // 撤销恢复
-        s.on_key(VK_Z, true);
+        s.on_key(VK_Z, true, false);
         assert_eq!(s.doc.len(), 1);
     }
 
@@ -1202,14 +1712,14 @@ mod tests {
     fn esc_passthrough_only_when_nothing_to_cancel() {
         let mut s = sess();
         // 空会话 → Esc 交还工具条
-        assert!(s.on_key(VK_ESCAPE, false).esc_passthrough);
+        assert!(s.on_key(VK_ESCAPE, false, false).esc_passthrough);
         // 工具激活 → 第一次 Esc 回 None，不 passthrough
         s.set_tool(Tool::Rect);
-        let a = s.on_key(VK_ESCAPE, false);
+        let a = s.on_key(VK_ESCAPE, false, false);
         assert!(!a.esc_passthrough);
         assert_eq!(s.tool(), Tool::None);
         // 再次 Esc → passthrough
-        assert!(s.on_key(VK_ESCAPE, false).esc_passthrough);
+        assert!(s.on_key(VK_ESCAPE, false, false).esc_passthrough);
     }
 
     #[test]
@@ -1218,7 +1728,7 @@ mod tests {
         s.set_tool(Tool::Arrow);
         s.on_l_down(Pt::new(10, 10), false);
         s.on_mouse_move(Pt::new(80, 80), false);
-        let a = s.on_key(VK_ESCAPE, false);
+        let a = s.on_key(VK_ESCAPE, false, false);
         assert!(!a.esc_passthrough);
         assert!(matches!(s.mode, Mode::Idle));
         assert_eq!(s.doc.len(), 0);
@@ -1228,9 +1738,9 @@ mod tests {
     #[test]
     fn toolbar_tool_key_toggles() {
         let mut s = sess();
-        s.on_key(VK_R, false);
+        s.on_key(VK_R, false, false);
         assert_eq!(s.tool(), Tool::Rect);
-        s.on_key(VK_R, false);
+        s.on_key(VK_R, false, false);
         assert_eq!(s.tool(), Tool::None);
     }
 
@@ -1245,7 +1755,7 @@ mod tests {
     #[test]
     fn mosaic_draw_commit_and_undo() {
         let mut s = sess();
-        s.on_key(VK_B, false);
+        s.on_key(VK_B, false, false);
         assert_eq!(s.tool(), Tool::Mosaic);
         s.on_l_down(Pt::new(10, 10), false);
         s.on_mouse_move(Pt::new(60, 40), false);
@@ -1253,7 +1763,7 @@ mod tests {
         assert_eq!(s.doc.len(), 1);
         assert!(matches!(s.doc.shapes()[0].shape, Shape::Mosaic { .. }));
         assert!(a.redraw.is_some());
-        s.on_key(VK_Z, true);
+        s.on_key(VK_Z, true, false);
         assert_eq!(s.doc.len(), 0);
     }
 
@@ -1309,7 +1819,7 @@ mod tests {
         assert!(s.typing());
         assert_eq!(s.doc.len(), 0, "输入中不落入文档");
         // Esc = 完成（非空）
-        let a = s.on_key(VK_ESCAPE, false);
+        let a = s.on_key(VK_ESCAPE, false, false);
         assert!(!s.typing());
         assert_eq!(s.doc.len(), 1);
         assert!(!a.esc_passthrough, "输入中 Esc 不关闭会话");
@@ -1321,7 +1831,7 @@ mod tests {
             _ => panic!("应为文字"),
         }
         // 整体撤销
-        s.on_key(VK_Z, true);
+        s.on_key(VK_Z, true, false);
         assert_eq!(s.doc.len(), 0);
     }
 
@@ -1335,7 +1845,7 @@ mod tests {
         s.on_char('\r'); // Enter 换行
         s.on_char('c');
         s.on_char('\u{8}'); // 退格
-        s.on_key(VK_ESCAPE, false);
+        s.on_key(VK_ESCAPE, false, false);
         match &s.doc.shapes()[0].shape {
             Shape::Text { text, .. } => assert_eq!(text, "ab\n"),
             other => panic!("应为文字，得到 {other:?}"),
@@ -1344,7 +1854,7 @@ mod tests {
         // （Esc 完成第一处文字后工具仍是 Text，直接再次落点开始第二处输入）
         s.on_l_down(Pt::new(9, 9), false);
         s.on_l_up(Pt::new(9, 9), false);
-        let a = s.on_key(VK_ESCAPE, false);
+        let a = s.on_key(VK_ESCAPE, false, false);
         assert!(!s.typing());
         assert_eq!(s.doc.len(), 1, "空文字不产生标注");
         assert!(!a.esc_passthrough);
@@ -1362,7 +1872,7 @@ mod tests {
         assert_eq!(s.doc.len(), 1);
         assert!(s.typing());
         match &s.mode {
-            Mode::Typing { anchor, text } => {
+            Mode::Typing { anchor, text, .. } => {
                 assert_eq!(*anchor, Pt::new(100, 50));
                 assert!(text.is_empty());
             }
@@ -1388,11 +1898,11 @@ mod tests {
         s.on_l_down(Pt::new(10, 10), false);
         s.on_char('a');
         // Ctrl+Z 在输入中忽略（正文编辑只经 on_char）
-        s.on_key(VK_Z, true);
+        s.on_key(VK_Z, true, false);
         assert!(s.typing());
         assert_eq!(s.doc.len(), 0);
         // 工具键在输入中同样忽略（由工具条放行给正文输入）
-        s.on_key(VK_B, false);
+        s.on_key(VK_B, false, false);
         assert!(s.typing());
         assert_eq!(s.tool(), Tool::Text);
     }
@@ -1410,28 +1920,28 @@ mod tests {
     fn ellipse_and_line_commit() {
         let mut s = sess();
         // 椭圆
-        s.on_key(VK_E, false);
+        s.on_key(VK_E, false, false);
         assert_eq!(s.tool(), Tool::Ellipse);
         s.on_l_down(Pt::new(10, 10), false);
         s.on_mouse_move(Pt::new(60, 40), false);
         s.on_l_up(Pt::new(60, 40), false);
         assert!(matches!(s.doc.shapes()[0].shape, Shape::Ellipse { .. }));
         // 线段
-        s.on_key(VK_L, false);
+        s.on_key(VK_L, false, false);
         assert_eq!(s.tool(), Tool::Line);
         s.on_l_down(Pt::new(10, 80), false);
         s.on_l_up(Pt::new(90, 80), false);
         assert!(matches!(s.doc.shapes()[1].shape, Shape::Line { .. }));
         // 撤销两步
-        s.on_key(VK_Z, true);
-        s.on_key(VK_Z, true);
+        s.on_key(VK_Z, true, false);
+        s.on_key(VK_Z, true, false);
         assert!(s.doc.is_empty());
     }
 
     #[test]
     fn pen_accumulates_and_commits() {
         let mut s = sess();
-        s.on_key(VK_P, false);
+        s.on_key(VK_P, false, false);
         assert_eq!(s.tool(), Tool::Pen);
         s.on_l_down(Pt::new(10, 10), false);
         for p in [(20, 15), (30, 25), (40, 20)] {
@@ -1443,7 +1953,7 @@ mod tests {
             other => panic!("应为画笔，得到 {other:?}"),
         }
         // 整体撤销
-        s.on_key(VK_Z, true);
+        s.on_key(VK_Z, true, false);
         assert!(s.doc.is_empty());
     }
 
@@ -1481,7 +1991,7 @@ mod tests {
         s.set_tool(Tool::Text);
         s.on_l_down(Pt::new(50, 45), false);
         s.on_char('x');
-        s.on_key(VK_ESCAPE, false);
+        s.on_key(VK_ESCAPE, false, false);
         match s.doc.shapes()[1].shape {
             Shape::Text { attach, bbox, .. } => {
                 assert_eq!(attach, Some(lid), "应挂到线段");
@@ -1500,10 +2010,146 @@ mod tests {
         s.set_tool(Tool::Text);
         s.on_l_down(Pt::new(50, 200), false); // 远离线段
         s.on_char('x');
-        s.on_key(VK_ESCAPE, false);
+        s.on_key(VK_ESCAPE, false, false);
         match s.doc.shapes()[1].shape {
             Shape::Text { attach, .. } => assert_eq!(attach, None, "远处不应挂线"),
             ref other => panic!("应为文字，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eraser_deletes_multiple_in_one_undo_record() {
+        let mut s = sess();
+        s.set_tool(Tool::Rect);
+        s.on_l_down(Pt::new(10, 10), false);
+        s.on_l_up(Pt::new(60, 40), false);
+        s.on_l_down(Pt::new(100, 10), false);
+        s.on_l_up(Pt::new(150, 40), false);
+        assert_eq!(s.doc.len(), 2);
+        s.set_tool(Tool::Eraser);
+        // 从左到右横穿两个矩形
+        s.on_l_down(Pt::new(20, 20), false);
+        s.on_mouse_move(Pt::new(80, 20), false);
+        s.on_mouse_move(Pt::new(140, 20), false);
+        s.on_l_up(Pt::new(160, 20), false);
+        assert_eq!(s.doc.len(), 0, "橡皮应删除两个矩形");
+        s.on_key(VK_Z, true, false);
+        assert_eq!(s.doc.len(), 2, "一次撤销恢复全部（橡皮只占一条记录）");
+    }
+
+    #[test]
+    fn watermark_commits_to_full_bounds() {
+        let mut s = sess();
+        s.set_tool(Tool::Watermark);
+        s.on_l_down(Pt::new(10, 10), false);
+        s.on_char('水');
+        s.on_char('印');
+        s.on_key(VK_ESCAPE, false, false);
+        let Shape::Watermark { bbox, text, wm, .. } = &s.doc.shapes()[0].shape else {
+            panic!("应为水印");
+        };
+        assert_eq!(*bbox, Rect::new(0, 0, 400, 300), "水印覆盖整个选区");
+        assert_eq!(text, "水印");
+        assert_eq!(wm.angle_deg, -30);
+        assert!(wm.opacity > 0);
+        s.on_key(VK_Z, true, false);
+        assert!(s.doc.is_empty());
+    }
+
+    #[test]
+    fn apply_style_to_selected_rect() {
+        let mut s = sess();
+        s.set_tool(Tool::Rect);
+        s.on_l_down(Pt::new(10, 10), false);
+        s.on_l_up(Pt::new(60, 40), false);
+        let id = s.doc.shapes()[0].id;
+        s.set_tool(Tool::Rect); // -> None
+        s.on_l_down(Pt::new(30, 20), false);
+        s.on_l_up(Pt::new(30, 20), false);
+        assert_eq!(s.selected_id(), Some(id));
+        let a = s.apply_style(StylePatch {
+            stroke_width: Some(8),
+            ..Default::default()
+        });
+        assert!(a.redraw.is_some());
+        match s.doc.find(id).unwrap() {
+            Shape::Rect { style, .. } => assert_eq!(style.width, 8, "96 DPI 下 8 逻辑像素 = 8 物理像素"),
+            other => panic!("应为矩形，得到 {other:?}"),
+        }
+        s.on_key(VK_Z, true, false);
+        match s.doc.find(id).unwrap() {
+            Shape::Rect { style, .. } => assert_eq!(style.width, 3, "撤销恢复样式"),
+            other => panic!("应为矩形，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_style_without_selection_updates_prefs() {
+        let mut s = sess();
+        s.apply_style(StylePatch {
+            stroke_width: Some(6),
+            ..Default::default()
+        });
+        s.set_tool(Tool::Rect);
+        s.on_l_down(Pt::new(0, 0), false);
+        s.on_l_up(Pt::new(40, 30), false);
+        match s.doc.find(s.doc.shapes()[0].id).unwrap() {
+            Shape::Rect { style, .. } => assert_eq!(style.width, 6),
+            other => panic!("应为矩形，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_wheel_size_adjustments_clamp() {
+        let mut s = sess();
+        s.adjust_size(SizeKind::StrokeWidth, 1);
+        s.adjust_size(SizeKind::TextSize, 1);
+        s.adjust_size(SizeKind::StepRadius, 1);
+        s.adjust_size(SizeKind::EraserTol, 1);
+        assert_eq!(s.size_value(SizeKind::StrokeWidth), 4);
+        assert_eq!(s.size_value(SizeKind::TextSize), 17);
+        assert_eq!(s.size_value(SizeKind::StepRadius), 15);
+        assert_eq!(s.size_value(SizeKind::EraserTol), 7);
+        // 下限钳制
+        for _ in 0..20 {
+            s.adjust_size(SizeKind::StrokeWidth, -1);
+            s.adjust_size(SizeKind::TextSize, -1);
+            s.adjust_size(SizeKind::StepRadius, -1);
+            s.adjust_size(SizeKind::EraserTol, -1);
+        }
+        assert_eq!(s.size_value(SizeKind::StrokeWidth), 1);
+        assert_eq!(s.size_value(SizeKind::TextSize), 4);
+        assert_eq!(s.size_value(SizeKind::StepRadius), 2);
+        assert_eq!(s.size_value(SizeKind::EraserTol), 0);
+    }
+
+    #[test]
+    fn size_kind_maps_every_tool() {
+        for tool in [
+            Tool::Rect,
+            Tool::Arrow,
+            Tool::Ellipse,
+            Tool::Line,
+            Tool::Pen,
+        ] {
+            assert_eq!(SizeKind::for_tool(tool), Some(SizeKind::StrokeWidth));
+        }
+        for tool in [Tool::Text, Tool::Watermark] {
+            assert_eq!(SizeKind::for_tool(tool), Some(SizeKind::TextSize));
+        }
+        assert_eq!(SizeKind::for_tool(Tool::StepNo), Some(SizeKind::StepRadius));
+        assert_eq!(SizeKind::for_tool(Tool::Eraser), Some(SizeKind::EraserTol));
+        assert_eq!(SizeKind::for_tool(Tool::Mosaic), None);
+        assert_eq!(SizeKind::for_tool(Tool::Highlight), None);
+        assert_eq!(SizeKind::for_tool(Tool::None), None);
+        // 编码与反解一一对应
+        for k in [
+            SizeKind::StrokeWidth,
+            SizeKind::TextSize,
+            SizeKind::StepRadius,
+            SizeKind::EraserTol,
+        ] {
+            assert_eq!(SizeKind::from_u32(k.code()), Some(k));
         }
     }
 }
